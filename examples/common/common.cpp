@@ -85,6 +85,29 @@ static std::string vec_to_string(const std::vector<T>& v) {
     return oss.str();
 }
 
+static const char* dpmpp_sde_solver_name(enum dpmpp_sde_solver_t solver) {
+    switch (solver) {
+        case DPMPP_SDE_SOLVER_MIDPOINT:
+            return "midpoint";
+        case DPMPP_SDE_SOLVER_HEUN:
+            return "heun";
+        default:
+            return "default";
+    }
+}
+
+static bool parse_dpmpp_sde_solver(const std::string& value, enum dpmpp_sde_solver_t& solver) {
+    if (value == "midpoint") {
+        solver = DPMPP_SDE_SOLVER_MIDPOINT;
+        return true;
+    }
+    if (value == "heun") {
+        solver = DPMPP_SDE_SOLVER_HEUN;
+        return true;
+    }
+    return false;
+}
+
 static std::string vec_str_to_string(const std::vector<std::string>& v) {
     std::ostringstream oss;
     oss << "[";
@@ -855,8 +878,16 @@ ArgOptions SDGenerationParams::get_options() {
          &sample_params.guidance.slg.layer_end},
         {"",
          "--eta",
-         "noise multiplier (default: 0 for ddim_trailing, tcd, res_multistep and res_2s; 1 for euler_a and dpm++2s_a)",
+         "noise multiplier (default: 0 for ddim_trailing, tcd, res_multistep and res_2s; 1 for euler_a, dpm++2s_a, and dpmpp_*_sde)",
          &sample_params.eta},
+        {"",
+         "--s-noise",
+         "DPM++ SDE noise scale (default: 1.0)",
+         &sample_params.s_noise},
+        {"",
+         "--dpmpp-sde-r",
+         "DPM++ SDE midpoint ratio for dpmpp_sde (default: 0.5)",
+         &sample_params.dpmpp_sde_r},
         {"",
          "--flow-shift",
          "shift value for Flow models like SD3.x or WAN (default: auto)",
@@ -887,8 +918,12 @@ ArgOptions SDGenerationParams::get_options() {
          &high_noise_sample_params.guidance.slg.layer_end},
         {"",
          "--high-noise-eta",
-         "(high noise) noise multiplier (default: 0 for ddim_trailing, tcd, res_multistep and res_2s; 1 for euler_a and dpm++2s_a)",
+         "(high noise) noise multiplier (default: 0 for ddim_trailing, tcd, res_multistep and res_2s; 1 for euler_a, dpm++2s_a, and dpmpp_*_sde)",
          &high_noise_sample_params.eta},
+        {"",
+         "--high-noise-s-noise",
+         "(high noise) DPM++ SDE noise scale (default: 1.0)",
+         &high_noise_sample_params.s_noise},
         {"",
          "--strength",
          "strength for noising/unnoising (default: 0.75)",
@@ -983,6 +1018,18 @@ ArgOptions SDGenerationParams::get_options() {
         if (sample_params.scheduler == SCHEDULER_COUNT) {
             LOG_ERROR("error: invalid scheduler %s",
                       arg);
+            return -1;
+        }
+        return 1;
+    };
+
+    auto on_dpmpp_sde_solver_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        std::string arg = argv[index];
+        if (!parse_dpmpp_sde_solver(arg, sample_params.dpmpp_sde_solver)) {
+            LOG_ERROR("error: invalid DPM++ SDE solver %s, expected midpoint or heun", arg.c_str());
             return -1;
         }
         return 1;
@@ -1185,14 +1232,18 @@ ArgOptions SDGenerationParams::get_options() {
          on_seed_arg},
         {"",
          "--sampling-method",
-         "sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s] "
+         "sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s, dpmpp_sde, dpmpp_sde_gpu, dpmpp_2m_sde, dpmpp_2m_sde_gpu, dpmpp_2m_sde_heun, dpmpp_2m_sde_heun_gpu, dpmpp_3m_sde, dpmpp_3m_sde_gpu] "
          "(default: euler for Flux/SD3/Wan, euler_a otherwise)",
          on_sample_method_arg},
         {"",
          "--high-noise-sampling-method",
-         "(high noise) sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s]"
+         "(high noise) sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s, dpmpp_sde, dpmpp_sde_gpu, dpmpp_2m_sde, dpmpp_2m_sde_gpu, dpmpp_2m_sde_heun, dpmpp_2m_sde_heun_gpu, dpmpp_3m_sde, dpmpp_3m_sde_gpu]"
          " default: euler for Flux/SD3/Wan, euler_a otherwise",
          on_high_noise_sample_method_arg},
+        {"",
+         "--dpmpp-sde-solver",
+         "DPM++ 2M SDE solver, one of [midpoint, heun]. dpmpp_2m_sde defaults to midpoint; dpmpp_2m_sde_heun defaults to heun",
+         on_dpmpp_sde_solver_arg},
         {"",
          "--scheduler",
          "denoiser sigma scheduler, one of [discrete, karras, exponential, ays, gits, smoothstep, sgm_uniform, simple, kl_optimal, lcm, bong_tangent], default: discrete",
@@ -1496,6 +1547,18 @@ bool SDGenerationParams::from_json_str(
         }
         if (sample_json.contains("eta") && sample_json["eta"].is_number()) {
             target_params.eta = sample_json["eta"];
+        }
+        if (sample_json.contains("s_noise") && sample_json["s_noise"].is_number()) {
+            target_params.s_noise = sample_json["s_noise"];
+        }
+        if (sample_json.contains("dpmpp_sde_r") && sample_json["dpmpp_sde_r"].is_number()) {
+            target_params.dpmpp_sde_r = sample_json["dpmpp_sde_r"];
+        }
+        if (sample_json.contains("dpmpp_sde_solver") && sample_json["dpmpp_sde_solver"].is_string()) {
+            enum dpmpp_sde_solver_t tmp = DPMPP_SDE_SOLVER_COUNT;
+            if (parse_dpmpp_sde_solver(sample_json["dpmpp_sde_solver"].get<std::string>(), tmp)) {
+                target_params.dpmpp_sde_solver = tmp;
+            }
         }
         if (sample_json.contains("shifted_timestep") && sample_json["shifted_timestep"].is_number_integer()) {
             target_params.shifted_timestep = sample_json["shifted_timestep"];
@@ -1819,6 +1882,24 @@ bool SDGenerationParams::resolve(const std::string& lora_model_dir, bool strict)
 }
 
 bool SDGenerationParams::validate(SDMode mode) {
+    auto validate_sample_params = [](const sd_sample_params_t& params, const char* label) -> bool {
+        if (params.s_noise < 0.f) {
+            LOG_ERROR("error: %s s_noise must be non-negative", label);
+            return false;
+        }
+        if (params.dpmpp_sde_r <= 0.f) {
+            LOG_ERROR("error: %s dpmpp_sde_r must be greater than 0", label);
+            return false;
+        }
+        if (params.dpmpp_sde_solver != DPMPP_SDE_SOLVER_COUNT &&
+            params.dpmpp_sde_solver != DPMPP_SDE_SOLVER_MIDPOINT &&
+            params.dpmpp_sde_solver != DPMPP_SDE_SOLVER_HEUN) {
+            LOG_ERROR("error: %s dpmpp_sde_solver must be midpoint or heun", label);
+            return false;
+        }
+        return true;
+    };
+
     if (batch_count <= 0) {
         LOG_ERROR("error: batch_count must be greater than 0");
         return false;
@@ -1836,6 +1917,11 @@ bool SDGenerationParams::validate(SDMode mode) {
 
     if (sample_params.guidance.txt_cfg < 0.f) {
         LOG_ERROR("error: cfg_scale must be positive");
+        return false;
+    }
+
+    if (!validate_sample_params(sample_params, "sample_params") ||
+        !validate_sample_params(high_noise_sample_params, "high_noise_sample_params")) {
         return false;
     }
 
@@ -2120,6 +2206,9 @@ std::string get_image_params(const SDContextParams& ctx_params, const SDGenerati
     }
     parameter_string += "Guidance: " + std::to_string(gen_params.sample_params.guidance.distilled_guidance) + ", ";
     parameter_string += "Eta: " + std::to_string(gen_params.sample_params.eta) + ", ";
+    parameter_string += "S noise: " + std::to_string(gen_params.sample_params.s_noise) + ", ";
+    parameter_string += "DPM++ SDE r: " + std::to_string(gen_params.sample_params.dpmpp_sde_r) + ", ";
+    parameter_string += "DPM++ SDE solver: " + std::string(dpmpp_sde_solver_name(gen_params.sample_params.dpmpp_sde_solver)) + ", ";
     parameter_string += "Seed: " + std::to_string(seed) + ", ";
     parameter_string += "Size: " + std::to_string(gen_params.get_resolved_width()) + "x" + std::to_string(gen_params.get_resolved_height()) + ", ";
     parameter_string += "Model: " + sd_basename(ctx_params.model_path) + ", ";

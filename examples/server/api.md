@@ -415,6 +415,9 @@ Nested fields currently returned:
 | `defaults.sample_params.sample_method` | `string` |
 | `defaults.sample_params.sample_steps` | `integer` |
 | `defaults.sample_params.eta` | `number \| null` |
+| `defaults.sample_params.s_noise` | `number \| null` |
+| `defaults.sample_params.dpmpp_sde_r` | `number \| null` |
+| `defaults.sample_params.dpmpp_sde_solver` | `string` |
 | `defaults.sample_params.shifted_timestep` | `integer` |
 | `defaults.sample_params.flow_shift` | `number \| null` |
 | `defaults.sample_params.guidance` | `object` |
@@ -552,6 +555,9 @@ Example:
     "sample_method": "euler_a",
     "sample_steps": 28,
     "eta": 1.0,
+    "s_noise": 1.0,
+    "dpmpp_sde_r": 0.5,
+    "dpmpp_sde_solver": "midpoint",
     "shifted_timestep": 0,
     "custom_sigmas": [],
     "flow_shift": 0.0,
@@ -658,6 +664,9 @@ Sampling fields:
 | `sample_params.sample_method` | `string` |
 | `sample_params.sample_steps` | `integer` |
 | `sample_params.eta` | `number` |
+| `sample_params.s_noise` | `number` |
+| `sample_params.dpmpp_sde_r` | `number` |
+| `sample_params.dpmpp_sde_solver` | `string` |
 | `sample_params.shifted_timestep` | `integer` |
 | `sample_params.custom_sigmas` | `array<number>` |
 | `sample_params.flow_shift` | `number` |
@@ -695,6 +704,9 @@ If a user has not explicitly provided one of these fields, the client should omi
 - `sample_params.scheduler`
 - `sample_params.sample_method`
 - `sample_params.eta`
+- `sample_params.s_noise`
+- `sample_params.dpmpp_sde_r`
+- `sample_params.dpmpp_sde_solver`
 - `sample_params.flow_shift`
 - `sample_params.guidance.img_cfg`
 

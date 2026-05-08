@@ -69,6 +69,14 @@ const char* sampling_methods_str[] = {
     "TCD",
     "Res Multistep",
     "Res 2s",
+    "DPM++ SDE",
+    "DPM++ SDE GPU",
+    "DPM++ 2M SDE",
+    "DPM++ 2M SDE GPU",
+    "DPM++ 2M SDE Heun",
+    "DPM++ 2M SDE Heun GPU",
+    "DPM++ 3M SDE",
+    "DPM++ 3M SDE GPU",
 };
 
 /*================================================== Helper Functions ================================================*/
@@ -1591,6 +1599,9 @@ public:
                              float control_strength,
                              const sd_guidance_params_t& guidance,
                              float eta,
+                             float s_noise,
+                             float dpmpp_sde_r,
+                             dpmpp_sde_solver_t dpmpp_sde_solver,
                              int shifted_timestep,
                              sample_method_t method,
                              bool is_flow_denoiser,
@@ -1792,7 +1803,16 @@ public:
             return denoised;
         };
 
-        auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser);
+        auto x0_opt = sample_k_diffusion(method,
+                                         denoise,
+                                         x_t,
+                                         sigmas,
+                                         sampler_rng,
+                                         eta,
+                                         s_noise,
+                                         dpmpp_sde_r,
+                                         dpmpp_sde_solver,
+                                         is_flow_denoiser);
         if (x0_opt.empty()) {
             LOG_ERROR("Diffusion model sampling failed");
             if (control_net) {
@@ -1975,6 +1995,14 @@ const char* sample_method_to_str[] = {
     "tcd",
     "res_multistep",
     "res_2s",
+    "dpmpp_sde",
+    "dpmpp_sde_gpu",
+    "dpmpp_2m_sde",
+    "dpmpp_2m_sde_gpu",
+    "dpmpp_2m_sde_heun",
+    "dpmpp_2m_sde_heun_gpu",
+    "dpmpp_3m_sde",
+    "dpmpp_3m_sde_gpu",
 };
 
 const char* sd_sample_method_name(enum sample_method_t sample_method) {
@@ -1990,7 +2018,31 @@ enum sample_method_t str_to_sample_method(const char* str) {
             return (enum sample_method_t)i;
         }
     }
+    if (!strcmp(str, "dpm++sde")) {
+        return DPMPP_SDE_SAMPLE_METHOD;
+    }
+    if (!strcmp(str, "dpm++2m_sde")) {
+        return DPMPP2M_SDE_SAMPLE_METHOD;
+    }
+    if (!strcmp(str, "dpm++2m_sde_heun")) {
+        return DPMPP2M_SDE_HEUN_SAMPLE_METHOD;
+    }
+    if (!strcmp(str, "dpm++3m_sde")) {
+        return DPMPP3M_SDE_SAMPLE_METHOD;
+    }
     return SAMPLE_METHOD_COUNT;
+}
+
+const char* dpmpp_sde_solver_to_str[] = {
+    "midpoint",
+    "heun",
+};
+
+static const char* dpmpp_sde_solver_name(enum dpmpp_sde_solver_t solver) {
+    if (solver < DPMPP_SDE_SOLVER_COUNT) {
+        return dpmpp_sde_solver_to_str[solver];
+    }
+    return "default";
 }
 
 const char* scheduler_to_str[] = {
@@ -2232,6 +2284,9 @@ void sd_sample_params_init(sd_sample_params_t* sample_params) {
     sample_params->sample_method               = SAMPLE_METHOD_COUNT;
     sample_params->sample_steps                = 20;
     sample_params->eta                         = INFINITY;
+    sample_params->s_noise                     = 1.0f;
+    sample_params->dpmpp_sde_r                 = 0.5f;
+    sample_params->dpmpp_sde_solver            = DPMPP_SDE_SOLVER_COUNT;
     sample_params->custom_sigmas               = nullptr;
     sample_params->custom_sigmas_count         = 0;
     sample_params->flow_shift                  = INFINITY;
@@ -2255,6 +2310,9 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
              "sample_method: %s, "
              "sample_steps: %d, "
              "eta: %.2f, "
+             "s_noise: %.2f, "
+             "dpmpp_sde_r: %.2f, "
+             "dpmpp_sde_solver: %s, "
              "shifted_timestep: %d, "
              "flow_shift: %.2f)",
              sample_params->guidance.txt_cfg,
@@ -2270,6 +2328,9 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
              sd_sample_method_name(sample_params->sample_method),
              sample_params->sample_steps,
              sample_params->eta,
+             sample_params->s_noise,
+             sample_params->dpmpp_sde_r,
+             dpmpp_sde_solver_name(sample_params->dpmpp_sde_solver),
              sample_params->shifted_timestep,
              sample_params->flow_shift);
 
@@ -2457,12 +2518,34 @@ static float resolve_eta(sd_ctx_t* sd_ctx,
                 return 0.0f;
             case EULER_A_SAMPLE_METHOD:
             case DPMPP2S_A_SAMPLE_METHOD:
+            case DPMPP_SDE_SAMPLE_METHOD:
+            case DPMPP_SDE_GPU_SAMPLE_METHOD:
+            case DPMPP2M_SDE_SAMPLE_METHOD:
+            case DPMPP2M_SDE_GPU_SAMPLE_METHOD:
+            case DPMPP2M_SDE_HEUN_SAMPLE_METHOD:
+            case DPMPP2M_SDE_HEUN_GPU_SAMPLE_METHOD:
+            case DPMPP3M_SDE_SAMPLE_METHOD:
+            case DPMPP3M_SDE_GPU_SAMPLE_METHOD:
                 return 1.0f;
             default:;
         }
         return 0.0f;
     }
     return eta;
+}
+
+static enum dpmpp_sde_solver_t resolve_dpmpp_sde_solver(enum sample_method_t sample_method,
+                                                         enum dpmpp_sde_solver_t solver) {
+    if (solver != DPMPP_SDE_SOLVER_COUNT) {
+        return solver;
+    }
+    switch (sample_method) {
+        case DPMPP2M_SDE_HEUN_SAMPLE_METHOD:
+        case DPMPP2M_SDE_HEUN_GPU_SAMPLE_METHOD:
+            return DPMPP_SDE_SOLVER_HEUN;
+        default:
+            return DPMPP_SDE_SOLVER_MIDPOINT;
+    }
 }
 
 struct GenerationRequest {
@@ -2615,6 +2698,11 @@ struct SamplePlan {
     enum sample_method_t high_noise_sample_method = SAMPLE_METHOD_COUNT;
     float eta                                     = 0.f;
     float high_noise_eta                          = 0.f;
+    float s_noise                                 = 1.f;
+    float high_noise_s_noise                      = 1.f;
+    float dpmpp_sde_r                             = 0.5f;
+    enum dpmpp_sde_solver_t dpmpp_sde_solver      = DPMPP_SDE_SOLVER_MIDPOINT;
+    enum dpmpp_sde_solver_t high_noise_dpmpp_sde_solver = DPMPP_SDE_SOLVER_MIDPOINT;
     int sample_steps                              = 0;
     int high_noise_sample_steps                   = 0;
     int total_steps                               = 0;
@@ -2627,6 +2715,9 @@ struct SamplePlan {
                const GenerationRequest& request) {
         sample_method = sd_img_gen_params->sample_params.sample_method;
         eta           = sd_img_gen_params->sample_params.eta;
+        s_noise       = sd_img_gen_params->sample_params.s_noise;
+        dpmpp_sde_r   = sd_img_gen_params->sample_params.dpmpp_sde_r;
+        dpmpp_sde_solver = sd_img_gen_params->sample_params.dpmpp_sde_solver;
         sample_steps  = sd_img_gen_params->sample_params.sample_steps;
         resolve(sd_ctx, &request, &sd_img_gen_params->sample_params);
     }
@@ -2636,11 +2727,15 @@ struct SamplePlan {
                const GenerationRequest& request) {
         sample_method = sd_vid_gen_params->sample_params.sample_method;
         eta           = sd_vid_gen_params->sample_params.eta;
+        s_noise       = sd_vid_gen_params->sample_params.s_noise;
+        dpmpp_sde_solver = sd_vid_gen_params->sample_params.dpmpp_sde_solver;
         sample_steps  = sd_vid_gen_params->sample_params.sample_steps;
         if (sd_ctx->sd->high_noise_diffusion_model) {
             high_noise_sample_steps  = sd_vid_gen_params->high_noise_sample_params.sample_steps;
             high_noise_sample_method = sd_vid_gen_params->high_noise_sample_params.sample_method;
             high_noise_eta           = sd_vid_gen_params->high_noise_sample_params.eta;
+            high_noise_s_noise       = sd_vid_gen_params->high_noise_sample_params.s_noise;
+            high_noise_dpmpp_sde_solver = sd_vid_gen_params->high_noise_sample_params.dpmpp_sde_solver;
         }
         moe_boundary = sd_vid_gen_params->moe_boundary;
         resolve(sd_ctx, &request, &sd_vid_gen_params->sample_params);
@@ -2677,6 +2772,7 @@ struct SamplePlan {
         }
 
         eta = resolve_eta(sd_ctx, eta, sample_method);
+        dpmpp_sde_solver = resolve_dpmpp_sde_solver(sample_method, dpmpp_sde_solver);
 
         if (high_noise_sample_steps < 0) {
             for (size_t i = 0; i < sigmas.size(); ++i) {
@@ -2693,6 +2789,7 @@ struct SamplePlan {
             high_noise_sample_method = resolve_sample_method(sd_ctx,
                                                              high_noise_sample_method);
             high_noise_eta           = resolve_eta(sd_ctx, high_noise_eta, high_noise_sample_method);
+            high_noise_dpmpp_sde_solver = resolve_dpmpp_sde_solver(high_noise_sample_method, high_noise_dpmpp_sde_solver);
             LOG_INFO("sampling(high noise) using %s method", sampling_methods_str[high_noise_sample_method]);
         }
 
@@ -3235,6 +3332,9 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                                                    request.control_strength,
                                                    request.guidance,
                                                    plan.eta,
+                                                   plan.s_noise,
+                                                   plan.dpmpp_sde_r,
+                                                   plan.dpmpp_sde_solver,
                                                    request.shifted_timestep,
                                                    plan.sample_method,
                                                    sd_ctx->sd->is_flow_denoiser(),
@@ -3379,6 +3479,9 @@ SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
                                                         request.control_strength,
                                                         request.guidance,
                                                         plan.eta,
+                                                        plan.s_noise,
+                                                        plan.dpmpp_sde_r,
+                                                        plan.dpmpp_sde_solver,
                                                         request.shifted_timestep,
                                                         plan.sample_method,
                                                         sd_ctx->sd->is_flow_denoiser(),
@@ -3817,6 +3920,9 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
                                                            0.f,
                                                            request.high_noise_guidance,
                                                            plan.high_noise_eta,
+                                                           plan.high_noise_s_noise,
+                                                           plan.dpmpp_sde_r,
+                                                           plan.high_noise_dpmpp_sde_solver,
                                                            request.shifted_timestep,
                                                            plan.high_noise_sample_method,
                                                            sd_ctx->sd->is_flow_denoiser(),
@@ -3859,6 +3965,9 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
                                                         0.f,
                                                         sd_vid_gen_params->sample_params.guidance,
                                                         plan.eta,
+                                                        plan.s_noise,
+                                                        plan.dpmpp_sde_r,
+                                                        plan.dpmpp_sde_solver,
                                                         sd_vid_gen_params->sample_params.shifted_timestep,
                                                         plan.sample_method,
                                                         sd_ctx->sd->is_flow_denoiser(),

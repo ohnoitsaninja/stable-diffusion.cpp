@@ -50,7 +50,21 @@ enum sample_method_t {
     TCD_SAMPLE_METHOD,
     RES_MULTISTEP_SAMPLE_METHOD,
     RES_2S_SAMPLE_METHOD,
+    DPMPP_SDE_SAMPLE_METHOD,
+    DPMPP_SDE_GPU_SAMPLE_METHOD,
+    DPMPP2M_SDE_SAMPLE_METHOD,
+    DPMPP2M_SDE_GPU_SAMPLE_METHOD,
+    DPMPP2M_SDE_HEUN_SAMPLE_METHOD,
+    DPMPP2M_SDE_HEUN_GPU_SAMPLE_METHOD,
+    DPMPP3M_SDE_SAMPLE_METHOD,
+    DPMPP3M_SDE_GPU_SAMPLE_METHOD,
     SAMPLE_METHOD_COUNT
+};
+
+enum dpmpp_sde_solver_t {
+    DPMPP_SDE_SOLVER_MIDPOINT,
+    DPMPP_SDE_SOLVER_HEUN,
+    DPMPP_SDE_SOLVER_COUNT
 };
 
 enum scheduler_t {
@@ -240,6 +254,9 @@ typedef struct {
     enum sample_method_t sample_method;
     int sample_steps;
     float eta;
+    float s_noise;
+    float dpmpp_sde_r;
+    enum dpmpp_sde_solver_t dpmpp_sde_solver;
     int shifted_timestep;
     float* custom_sigmas;
     int custom_sigmas_count;

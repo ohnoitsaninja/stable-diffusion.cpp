@@ -1037,6 +1037,243 @@ static sd::Tensor<float> sample_dpmpp_2m_v2(denoise_cb_t model,
     return x;
 }
 
+static float dpmpp_sigma_to_half_log_snr(float sigma) {
+    return -std::log(std::max(sigma, 1e-20f));
+}
+
+static float dpmpp_half_log_snr_to_sigma(float lambda) {
+    return std::exp(-lambda);
+}
+
+static float dpmpp_expm1_neg(float x) {
+    return std::expm1(-x);
+}
+
+static float dpmpp_phi2(float h_eta) {
+    if (std::fabs(h_eta) < 1e-6f) {
+        return 0.5f * h_eta - (h_eta * h_eta) / 6.0f;
+    }
+    return dpmpp_expm1_neg(h_eta) / h_eta + 1.0f;
+}
+
+static float dpmpp_phi3(float h_eta) {
+    if (std::fabs(h_eta) < 1e-6f) {
+        return -h_eta / 6.0f + (h_eta * h_eta) / 24.0f;
+    }
+    return dpmpp_phi2(h_eta) / h_eta - 0.5f;
+}
+
+static float dpmpp_sde_noise_scale(float h, float eta, float s_noise, float sigma_next) {
+    if (eta <= 0.0f || s_noise <= 0.0f || sigma_next <= 0.0f) {
+        return 0.0f;
+    }
+    const float variance = -std::expm1(-2.0f * h * eta);
+    return sigma_next * std::sqrt(std::max(variance, 0.0f)) * s_noise;
+}
+
+static sd::Tensor<float> sample_dpmpp_sde(denoise_cb_t model,
+                                          sd::Tensor<float> x,
+                                          const std::vector<float>& sigmas,
+                                          std::shared_ptr<RNG> rng,
+                                          float eta,
+                                          float s_noise,
+                                          float r) {
+    if (sigmas.size() <= 1) {
+        return x;
+    }
+    if (r <= 0.0f || !std::isfinite(r)) {
+        LOG_ERROR("dpmpp_sde r must be greater than 0");
+        return {};
+    }
+
+    const int steps = static_cast<int>(sigmas.size()) - 1;
+    for (int i = 0; i < steps; i++) {
+        auto denoised_opt = model(x, sigmas[i], -(i + 1));
+        if (denoised_opt.empty()) {
+            return {};
+        }
+        sd::Tensor<float> denoised = std::move(denoised_opt);
+
+        if (sigmas[i + 1] == 0.0f) {
+            x = denoised;
+            continue;
+        }
+
+        const float lambda_s   = dpmpp_sigma_to_half_log_snr(sigmas[i]);
+        const float lambda_t   = dpmpp_sigma_to_half_log_snr(sigmas[i + 1]);
+        const float h          = lambda_t - lambda_s;
+        const float lambda_s_1 = lambda_s + r * h;
+        const float fac        = 1.0f / (2.0f * r);
+        const float sigma_s_1  = dpmpp_half_log_snr_to_sigma(lambda_s_1);
+        const float alpha_s    = sigmas[i] * std::exp(lambda_s);
+        const float alpha_s_1  = sigma_s_1 * std::exp(lambda_s_1);
+        const float alpha_t    = sigmas[i + 1] * std::exp(lambda_t);
+
+        auto [sigma_down_1, sigma_up_1] = get_ancestral_step(std::exp(-lambda_s),
+                                                             std::exp(-lambda_s_1),
+                                                             eta);
+        if (sigma_down_1 <= 0.0f || !std::isfinite(sigma_down_1)) {
+            LOG_ERROR("dpmpp_sde produced invalid intermediate sigma");
+            return {};
+        }
+        const float lambda_s_1_adjusted = -std::log(sigma_down_1);
+        const float h_adjusted_1        = lambda_s_1_adjusted - lambda_s;
+        sd::Tensor<float> x_2           = (alpha_s_1 / alpha_s) * std::exp(-h_adjusted_1) * x -
+                                alpha_s_1 * std::expm1(-h_adjusted_1) * denoised;
+        if (eta > 0.0f && s_noise > 0.0f && sigma_up_1 > 0.0f) {
+            x_2 += alpha_s_1 * sd::Tensor<float>::randn_like(x, rng) * (s_noise * sigma_up_1);
+        }
+
+        auto denoised_2_opt = model(x_2, sigma_s_1, i + 1);
+        if (denoised_2_opt.empty()) {
+            return {};
+        }
+        sd::Tensor<float> denoised_2 = std::move(denoised_2_opt);
+
+        auto [sigma_down_t, sigma_up_t] = get_ancestral_step(std::exp(-lambda_s),
+                                                             std::exp(-lambda_t),
+                                                             eta);
+        if (sigma_down_t <= 0.0f || !std::isfinite(sigma_down_t)) {
+            LOG_ERROR("dpmpp_sde produced invalid target sigma");
+            return {};
+        }
+        const float lambda_t_adjusted = -std::log(sigma_down_t);
+        const float h_adjusted_t      = lambda_t_adjusted - lambda_s;
+        sd::Tensor<float> denoised_d  = (1.0f - fac) * denoised + fac * denoised_2;
+        x                             = (alpha_t / alpha_s) * std::exp(-h_adjusted_t) * x -
+            alpha_t * std::expm1(-h_adjusted_t) * denoised_d;
+        if (eta > 0.0f && s_noise > 0.0f && sigma_up_t > 0.0f) {
+            x += alpha_t * sd::Tensor<float>::randn_like(x, rng) * (s_noise * sigma_up_t);
+        }
+    }
+    return x;
+}
+
+static sd::Tensor<float> sample_dpmpp_2m_sde(denoise_cb_t model,
+                                             sd::Tensor<float> x,
+                                             const std::vector<float>& sigmas,
+                                             std::shared_ptr<RNG> rng,
+                                             float eta,
+                                             float s_noise,
+                                             dpmpp_sde_solver_t solver_type) {
+    if (solver_type != DPMPP_SDE_SOLVER_MIDPOINT && solver_type != DPMPP_SDE_SOLVER_HEUN) {
+        LOG_ERROR("dpmpp_2m_sde solver_type must be midpoint or heun");
+        return {};
+    }
+
+    sd::Tensor<float> old_denoised;
+    bool have_old_denoised = false;
+    float h_last           = 0.0f;
+
+    const int steps = static_cast<int>(sigmas.size()) - 1;
+    for (int i = 0; i < steps; i++) {
+        auto denoised_opt = model(x, sigmas[i], i + 1);
+        if (denoised_opt.empty()) {
+            return {};
+        }
+        sd::Tensor<float> denoised = std::move(denoised_opt);
+
+        if (sigmas[i + 1] == 0.0f) {
+            x = denoised;
+        } else {
+            const float lambda_s = dpmpp_sigma_to_half_log_snr(sigmas[i]);
+            const float lambda_t = dpmpp_sigma_to_half_log_snr(sigmas[i + 1]);
+            const float h        = lambda_t - lambda_s;
+            const float h_eta    = h * (eta + 1.0f);
+            const float alpha_t  = sigmas[i + 1] * std::exp(lambda_t);
+
+            x = (sigmas[i + 1] / sigmas[i]) * std::exp(-h * eta) * x +
+                alpha_t * (-std::expm1(-h_eta)) * denoised;
+
+            if (have_old_denoised && h != 0.0f && h_last != 0.0f) {
+                const float r = h_last / h;
+                if (solver_type == DPMPP_SDE_SOLVER_HEUN) {
+                    x += alpha_t * dpmpp_phi2(h_eta) * (1.0f / r) * (denoised - old_denoised);
+                } else {
+                    x += 0.5f * alpha_t * (-std::expm1(-h_eta)) * (1.0f / r) * (denoised - old_denoised);
+                }
+            }
+
+            const float noise_scale = dpmpp_sde_noise_scale(h, eta, s_noise, sigmas[i + 1]);
+            if (noise_scale > 0.0f) {
+                x += sd::Tensor<float>::randn_like(x, rng) * noise_scale;
+            }
+
+            h_last = h;
+        }
+
+        old_denoised      = denoised;
+        have_old_denoised = true;
+    }
+    return x;
+}
+
+static sd::Tensor<float> sample_dpmpp_3m_sde(denoise_cb_t model,
+                                             sd::Tensor<float> x,
+                                             const std::vector<float>& sigmas,
+                                             std::shared_ptr<RNG> rng,
+                                             float eta,
+                                             float s_noise) {
+    sd::Tensor<float> denoised_1;
+    sd::Tensor<float> denoised_2;
+    bool have_denoised_1 = false;
+    bool have_denoised_2 = false;
+    float h_1            = 0.0f;
+    float h_2            = 0.0f;
+
+    const int steps = static_cast<int>(sigmas.size()) - 1;
+    for (int i = 0; i < steps; i++) {
+        auto denoised_opt = model(x, sigmas[i], i + 1);
+        if (denoised_opt.empty()) {
+            return {};
+        }
+        sd::Tensor<float> denoised = std::move(denoised_opt);
+
+        if (sigmas[i + 1] == 0.0f) {
+            x = denoised;
+        } else {
+            const float lambda_s = dpmpp_sigma_to_half_log_snr(sigmas[i]);
+            const float lambda_t = dpmpp_sigma_to_half_log_snr(sigmas[i + 1]);
+            const float h        = lambda_t - lambda_s;
+            const float h_eta    = h * (eta + 1.0f);
+            const float alpha_t  = sigmas[i + 1] * std::exp(lambda_t);
+
+            x = (sigmas[i + 1] / sigmas[i]) * std::exp(-h * eta) * x +
+                alpha_t * (-std::expm1(-h_eta)) * denoised;
+
+            if (have_denoised_2 && h != 0.0f && h_1 != 0.0f && h_2 != 0.0f) {
+                const float r0 = h_1 / h;
+                const float r1 = h_2 / h;
+                if (r0 + r1 != 0.0f) {
+                    sd::Tensor<float> d1_0 = (denoised - denoised_1) / r0;
+                    sd::Tensor<float> d1_1 = (denoised_1 - denoised_2) / r1;
+                    sd::Tensor<float> d1   = d1_0 + (d1_0 - d1_1) * (r0 / (r0 + r1));
+                    sd::Tensor<float> d2   = (d1_0 - d1_1) / (r0 + r1);
+                    x += (alpha_t * dpmpp_phi2(h_eta)) * d1 - (alpha_t * dpmpp_phi3(h_eta)) * d2;
+                }
+            } else if (have_denoised_1 && h != 0.0f && h_1 != 0.0f) {
+                const float r            = h_1 / h;
+                sd::Tensor<float> d      = (denoised - denoised_1) / r;
+                x += (alpha_t * dpmpp_phi2(h_eta)) * d;
+            }
+
+            const float noise_scale = dpmpp_sde_noise_scale(h, eta, s_noise, sigmas[i + 1]);
+            if (noise_scale > 0.0f) {
+                x += sd::Tensor<float>::randn_like(x, rng) * noise_scale;
+            }
+
+            h_2 = h_1;
+            h_1 = h;
+        }
+
+        denoised_2      = denoised_1;
+        denoised_1      = denoised;
+        have_denoised_2 = have_denoised_1;
+        have_denoised_1 = true;
+    }
+    return x;
+}
+
 static sd::Tensor<float> sample_lcm(denoise_cb_t model,
                                     sd::Tensor<float> x,
                                     const std::vector<float>& sigmas,
@@ -1417,6 +1654,9 @@ static sd::Tensor<float> sample_k_diffusion(sample_method_t method,
                                             std::vector<float> sigmas,
                                             std::shared_ptr<RNG> rng,
                                             float eta,
+                                            float s_noise,
+                                            float dpmpp_sde_r,
+                                            dpmpp_sde_solver_t dpmpp_sde_solver,
                                             bool is_flow_denoiser) {
     switch (method) {
         case EULER_A_SAMPLE_METHOD:
@@ -1436,6 +1676,17 @@ static sd::Tensor<float> sample_k_diffusion(sample_method_t method,
             return sample_dpmpp_2m(model, std::move(x), sigmas);
         case DPMPP2Mv2_SAMPLE_METHOD:
             return sample_dpmpp_2m_v2(model, std::move(x), sigmas);
+        case DPMPP_SDE_SAMPLE_METHOD:
+        case DPMPP_SDE_GPU_SAMPLE_METHOD:
+            return sample_dpmpp_sde(model, std::move(x), sigmas, rng, eta, s_noise, dpmpp_sde_r);
+        case DPMPP2M_SDE_SAMPLE_METHOD:
+        case DPMPP2M_SDE_GPU_SAMPLE_METHOD:
+        case DPMPP2M_SDE_HEUN_SAMPLE_METHOD:
+        case DPMPP2M_SDE_HEUN_GPU_SAMPLE_METHOD:
+            return sample_dpmpp_2m_sde(model, std::move(x), sigmas, rng, eta, s_noise, dpmpp_sde_solver);
+        case DPMPP3M_SDE_SAMPLE_METHOD:
+        case DPMPP3M_SDE_GPU_SAMPLE_METHOD:
+            return sample_dpmpp_3m_sde(model, std::move(x), sigmas, rng, eta, s_noise);
         case LCM_SAMPLE_METHOD:
             return sample_lcm(model, std::move(x), sigmas, rng);
         case IPNDM_SAMPLE_METHOD:
