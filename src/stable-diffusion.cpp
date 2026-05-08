@@ -3104,6 +3104,77 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
     return result_images;
 }
 
+struct sd_latent_private_t {
+    sd::Tensor<float> tensor;
+};
+
+static const sd::Tensor<float>* sd_latent_tensor(const sd_latent_t* latent) {
+    if (latent == nullptr || latent->opaque == nullptr) {
+        return nullptr;
+    }
+    const auto* private_latent = static_cast<const sd_latent_private_t*>(latent->opaque);
+    if (private_latent->tensor.empty()) {
+        return nullptr;
+    }
+    return &private_latent->tensor;
+}
+
+static sd_latent_t* make_sd_latent(sd::Tensor<float>&& tensor) {
+    if (tensor.empty()) {
+        return nullptr;
+    }
+
+    sd_latent_t* latent = static_cast<sd_latent_t*>(calloc(1, sizeof(sd_latent_t)));
+    if (latent == nullptr) {
+        return nullptr;
+    }
+
+    sd_latent_private_t* private_latent = nullptr;
+    try {
+        private_latent = new sd_latent_private_t{std::move(tensor)};
+    } catch (...) {
+        free(latent);
+        return nullptr;
+    }
+
+    const auto& shape      = private_latent->tensor.shape();
+    latent->width          = shape.size() > 0 ? static_cast<uint32_t>(shape[0]) : 0;
+    latent->height         = shape.size() > 1 ? static_cast<uint32_t>(shape[1]) : 0;
+    latent->channel        = shape.size() == 5 ? static_cast<uint32_t>(shape[3])
+                                               : (shape.size() > 2 ? static_cast<uint32_t>(shape[2]) : 0);
+    latent->element_count  = static_cast<uint64_t>(private_latent->tensor.numel());
+    latent->opaque         = private_latent;
+    return latent;
+}
+
+static bool validate_init_latent_shape(sd_ctx_t* sd_ctx,
+                                       const GenerationRequest& request,
+                                       const sd::Tensor<float>& init_latent) {
+    sd::Tensor<float> expected = sd_ctx->sd->generate_init_latent(request.width, request.height);
+    if (expected.shape() == init_latent.shape()) {
+        return true;
+    }
+    LOG_ERROR("init latent shape does not match request: expected %s, got %s",
+              sd::tensor_shape_to_string(expected.shape()).c_str(),
+              sd::tensor_shape_to_string(init_latent.shape()).c_str());
+    return false;
+}
+
+static void apply_latent_strength_to_plan(const GenerationRequest& request, SamplePlan* plan) {
+    if (plan == nullptr || request.strength >= 1.f || plan->sample_steps <= 0 || plan->sigmas.empty()) {
+        return;
+    }
+    size_t t_enc = static_cast<size_t>(plan->sample_steps * request.strength);
+    if (t_enc == static_cast<size_t>(plan->sample_steps)) {
+        t_enc--;
+    }
+    LOG_INFO("target t_enc is %zu steps", t_enc);
+    std::vector<float> sigma_sched;
+    sigma_sched.assign(plan->sigmas.begin() + plan->sample_steps - t_enc - 1, plan->sigmas.end());
+    plan->sigmas       = std::move(sigma_sched);
+    plan->sample_steps = static_cast<int>(plan->sigmas.size() - 1);
+}
+
 SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params) {
     if (sd_ctx == nullptr || sd_img_gen_params == nullptr) {
         return nullptr;
@@ -3209,6 +3280,228 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     int64_t t1 = ggml_time_ms();
     LOG_INFO("generate_image completed in %.2fs", (t1 - t0) * 1.0f / 1000);
     return result;
+}
+
+SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
+                                    const sd_image_t* image,
+                                    const sd_tiling_params_t* vae_tiling_params) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image == nullptr || image->data == nullptr) {
+        return nullptr;
+    }
+    if (vae_tiling_params != nullptr) {
+        sd_ctx->sd->vae_tiling_params = *vae_tiling_params;
+    }
+
+    sd::Tensor<float> image_tensor = sd_image_to_tensor(*image);
+    sd::Tensor<float> latent       = sd_ctx->sd->encode_first_stage(image_tensor);
+    if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
+        sd_ctx->sd->first_stage_model->free_params_buffer();
+    }
+    if (latent.empty()) {
+        LOG_ERROR("sd_encode_image failed");
+        return nullptr;
+    }
+    return make_sd_latent(std::move(latent));
+}
+
+SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
+                                     const sd_img_gen_params_t* sd_img_gen_params,
+                                     const sd_latent_t* init_latent) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr) {
+        return nullptr;
+    }
+
+    int64_t t0                    = ggml_time_ms();
+    sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
+    GenerationRequest request(sd_ctx, sd_img_gen_params);
+    if (request.batch_count != 1) {
+        LOG_ERROR("sd_sample_latent currently supports batch_count=1, got %d", request.batch_count);
+        return nullptr;
+    }
+    LOG_INFO("sd_sample_latent %dx%d", request.width, request.height);
+
+    sd_ctx->sd->rng->manual_seed(request.seed);
+    sd_ctx->sd->sampler_rng->manual_seed(request.seed);
+    sd_ctx->sd->set_flow_shift(sd_img_gen_params->sample_params.flow_shift);
+    sd_ctx->sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count);
+
+    ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
+
+    SamplePlan plan(sd_ctx, sd_img_gen_params, request);
+    auto latents_opt = prepare_image_generation_latents(sd_ctx,
+                                                        sd_img_gen_params,
+                                                        &request,
+                                                        &plan);
+    if (!latents_opt.has_value()) {
+        return nullptr;
+    }
+    ImageGenerationLatents latents = std::move(*latents_opt);
+
+    const sd::Tensor<float>* init_tensor = sd_latent_tensor(init_latent);
+    if (init_latent != nullptr && init_tensor == nullptr) {
+        LOG_ERROR("sd_sample_latent received an invalid init latent");
+        return nullptr;
+    }
+    if (init_tensor != nullptr) {
+        if (!validate_init_latent_shape(sd_ctx, request, *init_tensor)) {
+            return nullptr;
+        }
+        latents.init_latent = *init_tensor;
+        apply_latent_strength_to_plan(request, &plan);
+    }
+
+    auto embeds_opt = prepare_image_generation_embeds(sd_ctx,
+                                                      sd_img_gen_params,
+                                                      &request,
+                                                      &plan,
+                                                      &latents);
+    if (!embeds_opt.has_value()) {
+        return nullptr;
+    }
+    ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+
+    int64_t sampling_start = ggml_time_ms();
+    LOG_INFO("generating latent image - seed %" PRId64, request.seed);
+
+    sd_ctx->sd->rng->manual_seed(request.seed);
+    sd_ctx->sd->sampler_rng->manual_seed(request.seed);
+    sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd_ctx->sd->rng);
+
+    sd::Tensor<float> final_latent = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
+                                                        true,
+                                                        latents.init_latent,
+                                                        std::move(noise),
+                                                        embeds.cond,
+                                                        embeds.uncond,
+                                                        embeds.img_cond,
+                                                        embeds.id_cond,
+                                                        latents.control_image,
+                                                        request.control_strength,
+                                                        request.guidance,
+                                                        plan.eta,
+                                                        request.shifted_timestep,
+                                                        plan.sample_method,
+                                                        sd_ctx->sd->is_flow_denoiser(),
+                                                        plan.sigmas,
+                                                        plan.start_merge_step,
+                                                        latents.ref_latents,
+                                                        request.increase_ref_index,
+                                                        latents.denoise_mask,
+                                                        sd::Tensor<float>(),
+                                                        1.f,
+                                                        request.cache_params);
+    int64_t sampling_end = ggml_time_ms();
+    if (sd_ctx->sd->free_params_immediately) {
+        sd_ctx->sd->diffusion_model->free_params_buffer();
+    }
+    if (final_latent.empty()) {
+        LOG_ERROR("latent sampling failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+        return nullptr;
+    }
+    LOG_INFO("latent sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+
+    sd_ctx->sd->lora_stat();
+
+    int64_t t1 = ggml_time_ms();
+    LOG_INFO("sd_sample_latent completed in %.2fs", (t1 - t0) * 1.0f / 1000);
+    return make_sd_latent(std::move(final_latent));
+}
+
+SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
+                                    const sd_latent_t* latent,
+                                    const sd_tiling_params_t* vae_tiling_params) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return nullptr;
+    }
+    const sd::Tensor<float>* tensor = sd_latent_tensor(latent);
+    if (tensor == nullptr) {
+        LOG_ERROR("sd_decode_latent received an invalid latent");
+        return nullptr;
+    }
+    if (vae_tiling_params != nullptr) {
+        sd_ctx->sd->vae_tiling_params = *vae_tiling_params;
+    }
+
+    int64_t t0              = ggml_time_ms();
+    sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(*tensor);
+    int64_t t1              = ggml_time_ms();
+    if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
+        sd_ctx->sd->first_stage_model->free_params_buffer();
+    }
+    if (image.empty()) {
+        LOG_ERROR("sd_decode_latent failed after %.2fs", (t1 - t0) * 1.0f / 1000);
+        return nullptr;
+    }
+    LOG_INFO("sd_decode_latent completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+
+    sd_image_t output = tensor_to_sd_image(image);
+    sd_image_t* result = static_cast<sd_image_t*>(calloc(1, sizeof(sd_image_t)));
+    if (result == nullptr) {
+        free(output.data);
+        return nullptr;
+    }
+    *result = output;
+    return result;
+}
+
+SD_API bool sd_release_clip_model_params(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+
+    auto release_runner = [](auto& runner) {
+        if (runner) {
+            runner->free_params_buffer();
+        }
+    };
+
+    release_runner(sd_ctx->sd->cond_stage_model);
+    release_runner(sd_ctx->sd->clip_vision);
+    release_runner(sd_ctx->sd->pmid_model);
+    release_runner(sd_ctx->sd->pmid_lora);
+    for (auto& lora : sd_ctx->sd->cond_stage_lora_models) {
+        release_runner(lora);
+    }
+    return true;
+}
+
+SD_API bool sd_release_diffusion_model_params(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+
+    auto release_runner = [](auto& runner) {
+        if (runner) {
+            runner->free_params_buffer();
+        }
+    };
+
+    release_runner(sd_ctx->sd->diffusion_model);
+    release_runner(sd_ctx->sd->high_noise_diffusion_model);
+    release_runner(sd_ctx->sd->control_net);
+    for (auto& lora : sd_ctx->sd->diffusion_lora_models) {
+        release_runner(lora);
+    }
+    return true;
+}
+
+SD_API void free_sd_latent(sd_latent_t* latent) {
+    if (latent == nullptr) {
+        return;
+    }
+    auto* private_latent = static_cast<sd_latent_private_t*>(latent->opaque);
+    delete private_latent;
+    latent->opaque = nullptr;
+    free(latent);
+}
+
+SD_API void free_sd_image(sd_image_t* image) {
+    if (image == nullptr) {
+        return;
+    }
+    free(image->data);
+    image->data = nullptr;
+    free(image);
 }
 
 static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd_ctx_t* sd_ctx,

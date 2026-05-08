@@ -211,6 +211,14 @@ typedef struct {
     uint8_t* data;
 } sd_image_t;
 
+typedef struct sd_latent_t {
+    uint32_t width;
+    uint32_t height;
+    uint32_t channel;
+    uint64_t element_count;
+    void* opaque;
+} sd_latent_t;
+
 typedef struct {
     int* layers;
     size_t layer_count;
@@ -380,6 +388,19 @@ SD_API enum scheduler_t sd_get_default_scheduler(const sd_ctx_t* sd_ctx, enum sa
 SD_API void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params);
 SD_API char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params);
 SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params);
+SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
+                                    const sd_image_t* image,
+                                    const sd_tiling_params_t* vae_tiling_params);
+SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
+                                     const sd_img_gen_params_t* sd_img_gen_params,
+                                     const sd_latent_t* init_latent);
+SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
+                                    const sd_latent_t* latent,
+                                    const sd_tiling_params_t* vae_tiling_params);
+SD_API bool sd_release_clip_model_params(sd_ctx_t* sd_ctx);
+SD_API bool sd_release_diffusion_model_params(sd_ctx_t* sd_ctx);
+SD_API void free_sd_latent(sd_latent_t* latent);
+SD_API void free_sd_image(sd_image_t* image);
 
 SD_API void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params);
 SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* sd_vid_gen_params, int* num_frames_out);
