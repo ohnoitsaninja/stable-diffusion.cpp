@@ -525,13 +525,42 @@ sd_image_t tensor_to_sd_image(const sd::Tensor<float>& tensor, int frame_index) 
     uint8_t* data = (uint8_t*)malloc(static_cast<size_t>(width * height * channel));
     GGML_ASSERT(data != nullptr);
 
-    for (int iw = 0; iw < width; ++iw) {
+    const float* src = tensor.data();
+    const size_t plane = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const auto to_u8 = [](float value) -> uint8_t {
+        value = std::clamp(value, 0.0f, 1.0f);
+        return static_cast<uint8_t>(value * 255.0f + 0.5f);
+    };
+
+    if (shape.size() == 5) {
+        const size_t frame_count = static_cast<size_t>(shape[2]);
+        GGML_ASSERT(frame_index >= 0 && static_cast<size_t>(frame_index) < frame_count);
+        const size_t frame_offset = static_cast<size_t>(frame_index) * plane;
         for (int ih = 0; ih < height; ++ih) {
-            for (int ic = 0; ic < channel; ++ic) {
-                float value                            = shape.size() == 5 ? tensor.index(iw, ih, frame_index, ic, 0)
-                                                                           : tensor.index(iw, ih, ic, frame_index);
-                value                                  = std::clamp(value, 0.0f, 1.0f);
-                data[(ih * width + iw) * channel + ic] = static_cast<uint8_t>(std::round(value * 255.0f));
+            const size_t row_base = static_cast<size_t>(ih) * static_cast<size_t>(width);
+            for (int iw = 0; iw < width; ++iw) {
+                const size_t pixel_index = row_base + static_cast<size_t>(iw);
+                const size_t dst_base = pixel_index * static_cast<size_t>(channel);
+                const size_t src_base = frame_offset + pixel_index;
+                for (int ic = 0; ic < channel; ++ic) {
+                    data[dst_base + static_cast<size_t>(ic)] =
+                        to_u8(src[src_base + static_cast<size_t>(ic) * plane * frame_count]);
+                }
+            }
+        }
+    } else {
+        GGML_ASSERT(frame_index >= 0 && static_cast<size_t>(frame_index) < static_cast<size_t>(shape[3]));
+        const size_t frame_offset = static_cast<size_t>(frame_index) * plane * static_cast<size_t>(channel);
+        for (int ih = 0; ih < height; ++ih) {
+            const size_t row_base = static_cast<size_t>(ih) * static_cast<size_t>(width);
+            for (int iw = 0; iw < width; ++iw) {
+                const size_t pixel_index = row_base + static_cast<size_t>(iw);
+                const size_t dst_base = pixel_index * static_cast<size_t>(channel);
+                const size_t src_base = frame_offset + pixel_index;
+                for (int ic = 0; ic < channel; ++ic) {
+                    data[dst_base + static_cast<size_t>(ic)] =
+                        to_u8(src[src_base + static_cast<size_t>(ic) * plane]);
+                }
             }
         }
     }
@@ -551,10 +580,21 @@ sd::Tensor<float> sd_image_to_tensor(sd_image_t image,
                                                  static_cast<int64_t>(image.height),
                                                  static_cast<int64_t>(image.channel),
                                                  1});
-    for (uint32_t iw = 0; iw < image.width; ++iw) {
-        for (uint32_t ih = 0; ih < image.height; ++ih) {
+    const uint8_t* src = image.data;
+    float* dst = tensor.data();
+    const size_t width = static_cast<size_t>(image.width);
+    const size_t height = static_cast<size_t>(image.height);
+    const size_t channel = static_cast<size_t>(image.channel);
+    const size_t plane = width * height;
+    const float scale_factor = scale ? 1.0f / 255.0f : 1.0f;
+    for (uint32_t ih = 0; ih < image.height; ++ih) {
+        const size_t row_base = static_cast<size_t>(ih) * width;
+        for (uint32_t iw = 0; iw < image.width; ++iw) {
+            const size_t pixel_index = row_base + static_cast<size_t>(iw);
+            const size_t src_base = pixel_index * channel;
             for (uint32_t ic = 0; ic < image.channel; ++ic) {
-                tensor.index(iw, ih, ic, 0) = sd_image_get_f32(image, iw, ih, ic, scale);
+                dst[pixel_index + static_cast<size_t>(ic) * plane] =
+                    static_cast<float>(src[src_base + static_cast<size_t>(ic)]) * scale_factor;
             }
         }
     }
