@@ -347,6 +347,7 @@ enum sd_gpu_resource_flags_t {
     SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT = 1u << 2,
     SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD = 1u << 3,
     SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_DOWNLOAD = 1u << 4,
+    SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT = 1u << 5,
 };
 
 typedef struct sd_gpu_device_info_t {
@@ -394,6 +395,8 @@ typedef struct sd_gpu_capabilities_t {
     bool supports_gpu_latent_input;
     bool supports_sampler_gpu_latent_output;
     bool supports_vae_gpu_latent_input;
+    bool supports_vae_encode_gpu_latent_output;
+    bool supports_vae_encode_gpu_latent_bridge_output;
     bool supports_gpu_image_output;
     bool supports_gpu_image_to_rgba8;
     bool supports_gpu_download;
@@ -403,7 +406,7 @@ typedef struct sd_gpu_capabilities_t {
     bool supports_cuda_pointer_borrow;
     bool supports_cuda_ipc_export;
     bool supports_external_memory_interop;
-    uint32_t reserved[11];
+    uint32_t reserved[9];
 } sd_gpu_capabilities_t;
 
 typedef struct sd_download_options_t {

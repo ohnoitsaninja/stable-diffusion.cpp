@@ -3251,8 +3251,30 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
     return result_images;
 }
 
+enum class sd_latent_source_t {
+    unknown,
+    vae_encode,
+    sampler,
+    gpu_download,
+};
+
+static const char* sd_latent_source_name(sd_latent_source_t source) {
+    switch (source) {
+        case sd_latent_source_t::vae_encode:
+            return "vae_encode";
+        case sd_latent_source_t::sampler:
+            return "sampler";
+        case sd_latent_source_t::gpu_download:
+            return "gpu_download";
+        case sd_latent_source_t::unknown:
+        default:
+            return "unknown";
+    }
+}
+
 struct sd_latent_private_t {
     sd::Tensor<float> tensor;
+    sd_latent_source_t source = sd_latent_source_t::unknown;
 };
 
 static const sd::Tensor<float>* sd_latent_tensor(const sd_latent_t* latent) {
@@ -3266,7 +3288,16 @@ static const sd::Tensor<float>* sd_latent_tensor(const sd_latent_t* latent) {
     return &private_latent->tensor;
 }
 
-static sd_latent_t* make_sd_latent(sd::Tensor<float>&& tensor) {
+static sd_latent_source_t sd_latent_source(const sd_latent_t* latent) {
+    if (latent == nullptr || latent->opaque == nullptr) {
+        return sd_latent_source_t::unknown;
+    }
+    const auto* private_latent = static_cast<const sd_latent_private_t*>(latent->opaque);
+    return private_latent->source;
+}
+
+static sd_latent_t* make_sd_latent(sd::Tensor<float>&& tensor,
+                                   sd_latent_source_t source = sd_latent_source_t::unknown) {
     if (tensor.empty()) {
         return nullptr;
     }
@@ -3278,7 +3309,7 @@ static sd_latent_t* make_sd_latent(sd::Tensor<float>&& tensor) {
 
     sd_latent_private_t* private_latent = nullptr;
     try {
-        private_latent = new sd_latent_private_t{std::move(tensor)};
+        private_latent = new sd_latent_private_t{std::move(tensor), source};
     } catch (...) {
         free(latent);
         return nullptr;
@@ -3924,7 +3955,7 @@ SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
         LOG_ERROR("sd_encode_image failed");
         return nullptr;
     }
-    return make_sd_latent(std::move(latent));
+    return make_sd_latent(std::move(latent), sd_latent_source_t::vae_encode);
 }
 
 SD_API void sd_vae_run_options_init(sd_vae_run_options_t* options) {
@@ -4020,7 +4051,7 @@ SD_API sd_latent_t* sd_encode_image_normal(sd_ctx_t* sd_ctx,
     }
     int64_t t1 = ggml_time_ms();
     LOG_INFO("sd_encode_image_normal completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
-    return make_sd_latent(std::move(latent));
+    return make_sd_latent(std::move(latent), sd_latent_source_t::vae_encode);
 }
 
 SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
@@ -4133,7 +4164,7 @@ SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
 
     int64_t t1 = ggml_time_ms();
     LOG_INFO("sd_sample_latent completed in %.2fs", (t1 - t0) * 1.0f / 1000);
-    return make_sd_latent(std::move(final_latent));
+    return make_sd_latent(std::move(final_latent), sd_latent_source_t::sampler);
 }
 
 SD_API bool sd_sample_latent_gpu(sd_ctx_t* sd_ctx,
@@ -4240,71 +4271,25 @@ SD_API bool sd_decode_latent_normal_gpu(sd_ctx_t* sd_ctx,
         LOG_ERROR("sd_decode_latent_normal_gpu received an invalid latent");
         return false;
     }
-
-    sd_vae_run_options_t effective = effective_vae_options(options);
-    sd_vae_exec_mode_t resolved_mode = SD_VAE_EXEC_AUTO;
-    bool used_taesd = false;
-    if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
+    const sd_latent_source_t source = sd_latent_source(latent);
+    if (source == sd_latent_source_t::vae_encode) {
+        LOG_ERROR("sd_decode_latent_normal_gpu refuses VAE-encoded latent source=%s; encoded-latent GPU handoff is disabled after CUDA memcheck found an unsafe decode path",
+                  sd_latent_source_name(source));
         return false;
     }
-    if (resolved_mode != SD_VAE_EXEC_COMFY_NORMAL) {
-        LOG_ERROR("sd_decode_latent_normal_gpu currently requires COMFY_NORMAL");
+    if (trace_gpu_handles_enabled()) {
+        LOG_INFO("[GPU] CPU latent decode upload source=%s elements=%" PRIu64,
+                 sd_latent_source_name(source),
+                 latent->element_count);
+    }
+    sd_gpu_handle_t gpu_latent = 0;
+    if (!sd_cpu_latent_upload(sd_ctx, latent, &gpu_latent, nullptr)) {
+        LOG_ERROR("sd_decode_latent_normal_gpu failed to upload CPU latent");
         return false;
     }
-    ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
-
-    int64_t t0 = ggml_time_ms();
-    sd::Tensor<float> vae_latent = sd_ctx->sd->first_stage_model->diffusion_to_vae_latents(*tensor);
-    auto gpu_image = sd_ctx->sd->first_stage_model->decode_to_backend_resource(sd_ctx->sd->n_threads,
-                                                                               vae_latent,
-                                                                               sd_ctx->sd->vae_tiling_params,
-                                                                               sd_ctx->sd->circular_x,
-                                                                               sd_ctx->sd->circular_y);
-    int64_t t1 = ggml_time_ms();
-    sd_vae_memory_report_t graph_report = sd_ctx->sd->first_stage_model->get_last_graph_report();
-    sd_vae_memory_report_t full_report;
-    sd_vae_memory_report_init(&full_report);
-    copy_vae_report(&full_report, graph_report, effective, resolved_mode, false, used_taesd);
-    log_vae_report("decode", full_report);
-    if (report != nullptr) {
-        *report = full_report;
-    }
-    if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
-        sd_ctx->sd->first_stage_model->free_params_buffer();
-    }
-    if (vae_report_large_im2col_disallowed(graph_report, effective)) {
-        LOG_ERROR("sd_decode_latent_normal refused oversized IM2COL tensor: largest=%" PRIu64 " threshold=%" PRIu64,
-                  graph_report.largest_tensor_bytes,
-                  effective.im2col_warn_bytes);
-        return false;
-    }
-    if (vae_report_comfy_guard_failed(full_report, resolved_mode)) {
-        return false;
-    }
-    if (StableDiffusionGGML::env_flag_enabled("SDCPP_STRICT_GPU_RESIDENT") &&
-        (!full_report.device_resident_stages || full_report.stage_boundary_host_copies != 0)) {
-        LOG_ERROR("sd_decode_latent_normal_gpu strict GPU resident check failed: device_resident=%s host_copies=%u",
-                  full_report.device_resident_stages ? "true" : "false",
-                  full_report.stage_boundary_host_copies);
-        return false;
-    }
-    if (gpu_image == nullptr || gpu_image->empty()) {
-        LOG_ERROR("sd_decode_latent_normal_gpu failed after %.2fs", (t1 - t0) * 1.0f / 1000);
-        return false;
-    }
-    sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
-                                                      std::move(gpu_image),
-                                                      SD_GPU_RESOURCE_IMAGE,
-                                                      SD_LAYOUT_WHCN_GGML,
-                                                      SD_GPU_RESOURCE_FLAG_VAE_DECODE_OUTPUT | SD_GPU_RESOURCE_FLAG_REQUIRES_VAE_OUTPUT_SCALE,
-                                                      "vae_decode_rgb_f32");
-    if (handle == 0) {
-        LOG_ERROR("sd_decode_latent_normal_gpu failed to register GPU image handle");
-        return false;
-    }
-    *out_gpu_image = handle;
-    LOG_INFO("sd_decode_latent_normal_gpu completed, taking %.2fs handle=%" PRIu64, (t1 - t0) * 1.0f / 1000, handle);
-    return true;
+    bool ok = sd_decode_gpu_latent_normal_gpu(sd_ctx, gpu_latent, options, out_gpu_image, report);
+    sd_gpu_handle_release(sd_ctx, gpu_latent);
+    return ok;
 }
 
 SD_API sd_image_t* sd_decode_latent_normal(sd_ctx_t* sd_ctx,
@@ -4427,6 +4412,8 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_gpu_latent_input = true;
     capabilities->supports_sampler_gpu_latent_output = false;
     capabilities->supports_vae_gpu_latent_input = true;
+    capabilities->supports_vae_encode_gpu_latent_output = false;
+    capabilities->supports_vae_encode_gpu_latent_bridge_output = false;
     capabilities->supports_gpu_image_output = true;
     capabilities->supports_gpu_image_to_rgba8 = false;
     capabilities->supports_gpu_download = true;
@@ -4555,7 +4542,13 @@ SD_API sd_latent_t* sd_gpu_latent_download(sd_ctx_t* sd_ctx,
     if (trace_gpu_handles_enabled()) {
         LOG_INFO("[GPU] latent download id=%" PRIu64 " elements=%" PRId64, gpu_latent, latent.numel());
     }
-    return make_sd_latent(std::move(latent));
+    sd_latent_source_t source = sd_latent_source_t::gpu_download;
+    if ((resource->flags & SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT) != 0) {
+        source = sd_latent_source_t::vae_encode;
+    } else if ((resource->flags & SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT) != 0) {
+        source = sd_latent_source_t::sampler;
+    }
+    return make_sd_latent(std::move(latent), source);
 }
 
 SD_API bool sd_cpu_latent_upload(sd_ctx_t* sd_ctx,
@@ -4573,12 +4566,18 @@ SD_API bool sd_cpu_latent_upload(sd_ctx_t* sd_ctx,
     if (tensor == nullptr) {
         return false;
     }
+    const sd_latent_source_t source = sd_latent_source(cpu_latent);
+    if (source == sd_latent_source_t::vae_encode) {
+        LOG_ERROR("sd_cpu_latent_upload refuses VAE-encoded latent GPU handoff; encoded-latent GPU decode is capability-gated off in this build");
+        return false;
+    }
     auto resource = sd_upload_tensor_to_backend_resource(sd_ctx, *tensor, "uploaded_latent_f32");
     sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
                                                       std::move(resource),
                                                       SD_GPU_RESOURCE_LATENT,
                                                       SD_LAYOUT_WHCN_GGML,
-                                                      SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD,
+                                                      SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD |
+                                                          (source == sd_latent_source_t::sampler ? SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT : 0u),
                                                       "uploaded_latent_f32");
     if (handle == 0) {
         return false;
@@ -4620,31 +4619,17 @@ SD_API bool sd_encode_image_normal_gpu(sd_ctx_t* sd_ctx,
                                        const sd_vae_run_options_t* options,
                                        sd_gpu_handle_t* out_gpu_latent,
                                        sd_vae_memory_report_t* report) {
+    SD_UNUSED(sd_ctx);
+    SD_UNUSED(image);
+    SD_UNUSED(options);
+    if (report != nullptr) {
+        sd_vae_memory_report_init(report);
+    }
     if (out_gpu_latent != nullptr) {
         *out_gpu_latent = 0;
     }
-    if (sd_ctx == nullptr || out_gpu_latent == nullptr) {
-        return false;
-    }
-    sd_latent_t* latent = sd_encode_image_normal(sd_ctx, image, options, report);
-    const sd::Tensor<float>* tensor = sd_latent_tensor(latent);
-    if (tensor == nullptr) {
-        free_sd_latent(latent);
-        return false;
-    }
-    auto resource = sd_upload_tensor_to_backend_resource(sd_ctx, *tensor, "vae_encode_latent_f32");
-    free_sd_latent(latent);
-    sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
-                                                      std::move(resource),
-                                                      SD_GPU_RESOURCE_LATENT,
-                                                      SD_LAYOUT_WHCN_GGML,
-                                                      0,
-                                                      "vae_encode_latent_f32");
-    if (handle == 0) {
-        return false;
-    }
-    *out_gpu_latent = handle;
-    return true;
+    LOG_ERROR("sd_encode_image_normal_gpu is disabled in this build; VAE-encoded latent GPU handoff is not yet safe");
+    return false;
 }
 
 SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
@@ -4671,6 +4656,11 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
     }
     if (!sd_gpu_latent_shape_is_supported(*resource)) {
         LOG_ERROR("sd_decode_gpu_latent_normal_gpu unsupported latent shape/type");
+        return false;
+    }
+    if ((resource->flags & SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT) != 0) {
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu refuses VAE-encoded latent handle=%" PRIu64 "; capability supports_vae_encode_gpu_latent_output=false",
+                  gpu_latent);
         return false;
     }
 
