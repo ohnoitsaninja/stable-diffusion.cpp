@@ -1685,6 +1685,53 @@ struct GGMLRunnerContext {
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
 };
 
+struct GgmlBackendTensorResource {
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor* tensor = nullptr;
+
+    GgmlBackendTensorResource() = default;
+    GgmlBackendTensorResource(const GgmlBackendTensorResource&) = delete;
+    GgmlBackendTensorResource& operator=(const GgmlBackendTensorResource&) = delete;
+    GgmlBackendTensorResource(GgmlBackendTensorResource&& other) noexcept {
+        ctx = other.ctx;
+        buffer = other.buffer;
+        tensor = other.tensor;
+        other.ctx = nullptr;
+        other.buffer = nullptr;
+        other.tensor = nullptr;
+    }
+    GgmlBackendTensorResource& operator=(GgmlBackendTensorResource&& other) noexcept {
+        if (this != &other) {
+            reset();
+            ctx = other.ctx;
+            buffer = other.buffer;
+            tensor = other.tensor;
+            other.ctx = nullptr;
+            other.buffer = nullptr;
+            other.tensor = nullptr;
+        }
+        return *this;
+    }
+    ~GgmlBackendTensorResource() {
+        reset();
+    }
+    void reset() {
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+            buffer = nullptr;
+        }
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+        tensor = nullptr;
+    }
+    bool empty() const {
+        return tensor == nullptr || buffer == nullptr;
+    }
+};
+
 struct GGMLRunner {
 protected:
     typedef std::function<ggml_cgraph*()> get_graph_cb_t;
@@ -2400,6 +2447,31 @@ public:
         return handle;
     }
 
+    std::unique_ptr<GgmlBackendTensorResource> copy_tensor_to_resource_handle(ggml_tensor* src, const char* name) {
+        if (src == nullptr) {
+            return nullptr;
+        }
+        auto handle = std::make_unique<GgmlBackendTensorResource>();
+        ggml_init_params params;
+        params.mem_size   = static_cast<size_t>(MAX_PARAMS_TENSOR_NUM * ggml_tensor_overhead());
+        params.mem_buffer = nullptr;
+        params.no_alloc   = true;
+        handle->ctx       = ggml_init(params);
+        GGML_ASSERT(handle->ctx != nullptr);
+        handle->tensor = ggml_dup_tensor(handle->ctx, src);
+        if (name != nullptr) {
+            ggml_set_name(handle->tensor, name);
+        }
+        handle->buffer = ggml_backend_alloc_ctx_tensors(handle->ctx, runtime_backend);
+        if (handle->buffer == nullptr) {
+            LOG_ERROR("%s alloc backend tensor resource failed", get_desc().c_str());
+            return nullptr;
+        }
+        ggml_backend_tensor_copy(src, handle->tensor);
+        ggml_backend_synchronize(runtime_backend);
+        return handle;
+    }
+
     void cache(const std::string name, ggml_tensor* tensor) {
         cache_tensor_map[name] = tensor;
     }
@@ -2491,6 +2563,39 @@ public:
         }
         auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());
         auto output = copy_tensor_to_backend_handle(result, output_name);
+        free_compute_buffer();
+        return output;
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_to_backend_resource_handle(get_graph_cb_t get_graph,
+                                                                                  int n_threads,
+                                                                                  const char* output_name) {
+        if (!offload_params_to_runtime_backend()) {
+            LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
+            return nullptr;
+        }
+        if (!alloc_compute_buffer(get_graph)) {
+            LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
+            return nullptr;
+        }
+        reset_compute_ctx();
+        ggml_cgraph* gf = get_compute_graph(get_graph);
+        if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
+            LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
+            return nullptr;
+        }
+        copy_data_to_backend_tensor();
+        if (ggml_backend_is_cpu(runtime_backend)) {
+            ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
+        }
+
+        ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+            return nullptr;
+        }
+        auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());
+        auto output = copy_tensor_to_resource_handle(result, output_name);
         free_compute_buffer();
         return output;
     }

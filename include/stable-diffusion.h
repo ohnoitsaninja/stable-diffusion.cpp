@@ -309,6 +309,117 @@ typedef struct sd_vae_capabilities_t {
     uint32_t reserved[8];
 } sd_vae_capabilities_t;
 
+typedef uint64_t sd_gpu_handle_t;
+
+enum sd_backend_kind_t {
+    SD_BACKEND_CPU = 0,
+    SD_BACKEND_CUDA = 1,
+};
+
+enum sd_gpu_resource_kind_t {
+    SD_GPU_RESOURCE_TENSOR = 1,
+    SD_GPU_RESOURCE_IMAGE = 2,
+    SD_GPU_RESOURCE_LATENT = 3,
+};
+
+enum sd_tensor_dtype_t {
+    SD_DTYPE_F32 = 0,
+    SD_DTYPE_F16 = 1,
+    SD_DTYPE_BF16 = 2,
+    SD_DTYPE_U8 = 3,
+};
+
+enum sd_tensor_layout_t {
+    SD_LAYOUT_NCHW = 0,
+    SD_LAYOUT_NHWC = 1,
+    SD_LAYOUT_WHCN_GGML = 2,
+    SD_LAYOUT_PACKED_RGBA8 = 3,
+};
+
+enum sd_image_color_space_t {
+    SD_COLOR_LINEAR_RGB = 0,
+    SD_COLOR_SRGB = 1,
+};
+
+enum sd_gpu_resource_flags_t {
+    SD_GPU_RESOURCE_FLAG_VAE_DECODE_OUTPUT = 1u << 0,
+    SD_GPU_RESOURCE_FLAG_REQUIRES_VAE_OUTPUT_SCALE = 1u << 1,
+};
+
+typedef struct sd_gpu_device_info_t {
+    uint32_t struct_size;
+    uint32_t version;
+    enum sd_backend_kind_t backend;
+    int device_index;
+    char device_name[128];
+    uint64_t total_memory_bytes;
+    uint32_t reserved[8];
+} sd_gpu_device_info_t;
+
+typedef struct sd_gpu_tensor_desc_t {
+    uint32_t struct_size;
+    uint32_t version;
+    sd_gpu_handle_t handle;
+    enum sd_gpu_resource_kind_t kind;
+    enum sd_backend_kind_t backend;
+    int device_index;
+    enum sd_tensor_dtype_t dtype;
+    enum sd_tensor_layout_t layout;
+    int64_t n;
+    int64_t c;
+    int64_t h;
+    int64_t w;
+    int64_t stride_n;
+    int64_t stride_c;
+    int64_t stride_h;
+    int64_t stride_w;
+    uint64_t byte_offset;
+    uint64_t byte_size;
+    uint64_t producer_stream_id;
+    uint64_t ready_event_id;
+    uint32_t flags;
+    uint32_t refcount;
+    uint32_t reserved[16];
+} sd_gpu_tensor_desc_t;
+
+typedef struct sd_gpu_capabilities_t {
+    uint32_t struct_size;
+    uint32_t version;
+    bool supports_gpu_handles;
+    bool supports_cuda_gpu_handles;
+    bool supports_gpu_latent_output;
+    bool supports_gpu_image_output;
+    bool supports_gpu_image_to_rgba8;
+    bool supports_gpu_download;
+    bool supports_dlpack_export;
+    bool supports_cuda_pointer_borrow;
+    bool supports_cuda_ipc_export;
+    bool supports_external_memory_interop;
+    uint32_t reserved[16];
+} sd_gpu_capabilities_t;
+
+typedef struct sd_download_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    bool synchronize;
+    uint32_t reserved[8];
+} sd_download_options_t;
+
+typedef struct sd_cuda_borrowed_ptr_t {
+    uint32_t struct_size;
+    uint32_t version;
+    void* device_ptr;
+    uint64_t byte_size;
+    int device_index;
+    enum sd_tensor_dtype_t dtype;
+    enum sd_tensor_layout_t layout;
+    int64_t shape[4];
+    int64_t strides[4];
+    uint64_t ready_event_id;
+    uint64_t producer_stream_id;
+    uint32_t reserved[8];
+} sd_cuda_borrowed_ptr_t;
+
 typedef struct {
     int* layers;
     size_t layer_count;
@@ -507,6 +618,42 @@ SD_API bool sd_estimate_vae_normal_memory(sd_ctx_t* sd_ctx,
                                           const sd_vae_run_options_t* options,
                                           sd_vae_memory_report_t* report);
 SD_API bool sd_get_vae_capabilities(sd_ctx_t* sd_ctx, sd_vae_capabilities_t* capabilities);
+SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* capabilities);
+SD_API bool sd_gpu_handle_retain(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle);
+SD_API bool sd_gpu_handle_release(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle);
+SD_API bool sd_gpu_handle_get_desc(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle, sd_gpu_tensor_desc_t* desc);
+SD_API bool sd_gpu_handle_debug_name(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle, const char* name);
+SD_API bool sd_gpu_handle_borrow_cuda_ptr(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle, sd_cuda_borrowed_ptr_t* out);
+SD_API bool sd_gpu_handle_end_cuda_borrow(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle);
+SD_API bool sd_decode_latent_normal_gpu(sd_ctx_t* sd_ctx,
+                                        const sd_latent_t* latent,
+                                        const sd_vae_run_options_t* options,
+                                        sd_gpu_handle_t* out_gpu_image,
+                                        sd_vae_memory_report_t* report);
+SD_API bool sd_encode_image_normal_gpu(sd_ctx_t* sd_ctx,
+                                       const sd_image_t* image,
+                                       const sd_vae_run_options_t* options,
+                                       sd_gpu_handle_t* out_gpu_latent,
+                                       sd_vae_memory_report_t* report);
+SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
+                                            sd_gpu_handle_t gpu_latent,
+                                            const sd_vae_run_options_t* options,
+                                            sd_gpu_handle_t* out_gpu_image,
+                                            sd_vae_memory_report_t* report);
+SD_API bool sd_encode_gpu_image_normal_gpu(sd_ctx_t* sd_ctx,
+                                           sd_gpu_handle_t gpu_image,
+                                           const sd_vae_run_options_t* options,
+                                           sd_gpu_handle_t* out_gpu_latent,
+                                           sd_vae_memory_report_t* report);
+SD_API bool sd_gpu_image_download(sd_ctx_t* sd_ctx,
+                                  sd_gpu_handle_t gpu_image,
+                                  sd_image_t* out_cpu_image,
+                                  const sd_download_options_t* options);
+SD_API bool sd_gpu_tensor_download(sd_ctx_t* sd_ctx,
+                                   sd_gpu_handle_t gpu_tensor,
+                                   void* dst,
+                                   uint64_t dst_bytes,
+                                   const sd_download_options_t* options);
 SD_API bool sd_release_clip_model_params(sd_ctx_t* sd_ctx);
 SD_API bool sd_release_diffusion_model_params(sd_ctx_t* sd_ctx);
 SD_API void free_sd_latent(sd_latent_t* latent);

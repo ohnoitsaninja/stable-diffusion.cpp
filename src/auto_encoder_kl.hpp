@@ -978,6 +978,59 @@ struct AutoEncoderKL : public VAE {
         return take_or_empty(materialize_backend_tensor<float>(current.get(), z.dim()));
     }
 
+    std::unique_ptr<GgmlBackendTensorResource> _compute_staged_resource(const int n_threads,
+                                                                        const sd::Tensor<float>& z,
+                                                                        bool decode_graph) {
+        GGML_ASSERT(!decode_only || decode_graph);
+        const int stages = decode_graph ? ae.decode_stage_count() : ae.encode_stage_count();
+        std::unique_ptr<BackendTensorHandle> current;
+        std::unique_ptr<GgmlBackendTensorResource> final_resource;
+        sd_vae_memory_report_t aggregate = {};
+        aggregate.used_direct_conv = conv2d_direct_enabled;
+        for (int stage = 0; stage < stages; ++stage) {
+            auto get_graph = [&]() -> ggml_cgraph* {
+                if (stage == 0) {
+                    return build_stage_graph(z, decode_graph, stage);
+                }
+                return build_stage_graph(current->tensor, decode_graph, stage);
+            };
+            if (stage + 1 == stages) {
+                final_resource = compute_to_backend_resource_handle(get_graph, n_threads, "vae_comfy_normal_gpu_output");
+                sd_vae_memory_report_t stage_report = get_last_graph_report();
+                merge_stage_report(&aggregate, stage_report);
+                if (final_resource == nullptr || final_resource->empty()) {
+                    return nullptr;
+                }
+                BackendTensorHandle final_view;
+                final_view.tensor = final_resource->tensor;
+                final_view.buffer = final_resource->buffer;
+                record_stage_output(&aggregate, stage, &final_view, stage > 0);
+                final_view.tensor = nullptr;
+                final_view.buffer = nullptr;
+            } else {
+                auto stage_output = compute_to_backend_handle(get_graph, n_threads, "vae_comfy_normal_stage");
+                sd_vae_memory_report_t stage_report = get_last_graph_report();
+                merge_stage_report(&aggregate, stage_report);
+                if (stage_output == nullptr || stage_output->empty()) {
+                    return nullptr;
+                }
+                record_stage_output(&aggregate, stage, stage_output.get(), stage > 0);
+                current = std::move(stage_output);
+            }
+        }
+        aggregate.device_resident_stages = aggregate.stage_boundary_host_copies == 0 &&
+                                           final_resource != nullptr &&
+                                           final_resource->buffer != nullptr &&
+                                           !ggml_backend_buffer_is_host(final_resource->buffer);
+        LOG_INFO("[VAE] COMFY_NORMAL stage boundaries: device_resident=%s host_copies=%u device_copies=%u dtype_promotions=%u",
+                 aggregate.device_resident_stages ? "true" : "false",
+                 aggregate.stage_boundary_host_copies,
+                 aggregate.stage_boundary_device_copies,
+                 aggregate.stage_boundary_dtype_promotions);
+        last_graph_report = aggregate;
+        return final_resource;
+    }
+
     sd::Tensor<float> _compute(const int n_threads,
                                const sd::Tensor<float>& z,
                                bool decode_graph) override {
@@ -989,6 +1042,27 @@ struct AutoEncoderKL : public VAE {
             return build_graph(z, decode_graph);
         };
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), z.dim());
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> decode_to_backend_resource(int n_threads,
+                                                                          const sd::Tensor<float>& x,
+                                                                          sd_tiling_params_t tiling_params,
+                                                                          bool circular_x = false,
+                                                                          bool circular_y = false) override {
+        SD_UNUSED(circular_x);
+        SD_UNUSED(circular_y);
+        if (!comfy_normal_enabled || tiling_params.enabled) {
+            return nullptr;
+        }
+        int64_t t0 = ggml_time_ms();
+        auto output = _compute_staged_resource(n_threads, x, true);
+        if (output == nullptr || output->empty()) {
+            LOG_ERROR("vae decode GPU output compute failed");
+            return nullptr;
+        }
+        int64_t t1 = ggml_time_ms();
+        LOG_DEBUG("computing vae decode GPU output graph completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+        return output;
     }
 
     bool estimate_memory_report(const sd::Tensor<float>& z,

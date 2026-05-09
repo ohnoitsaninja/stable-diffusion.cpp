@@ -22,6 +22,10 @@ struct Args {
     bool vae_conv_direct = false;
     bool disable_default_vae_conv_direct = false;
     bool type_f16 = false;
+    bool gpu_decode_output = false;
+    bool download_gpu_output = false;
+    bool strict_gpu_resident = false;
+    bool dump_gpu_handle_desc = false;
 };
 
 static void usage(const char* argv0) {
@@ -38,6 +42,10 @@ static void usage(const char* argv0) {
         << "  --sample                 run sd_sample_latent after encode\n"
         << "  --skip-estimate          skip sd_estimate_vae_normal_memory smoke checks\n"
         << "  --split-decode-context   decode with a separate vae_decode_only=true context\n"
+        << "  --gpu-decode-output      call sd_decode_latent_normal_gpu and keep decode output as a GPU handle\n"
+        << "  --download-gpu-output    explicitly download the GPU image handle and write it\n"
+        << "  --strict-gpu-resident    set SDCPP_STRICT_GPU_RESIDENT=1 for GPU-output checks\n"
+        << "  --dump-gpu-handle-desc   print GPU handle descriptor after decode\n"
         << "  --no-decode              skip sd_decode_latent\n";
 }
 
@@ -88,6 +96,14 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.skip_estimate = true;
         } else if (arg == "--split-decode-context") {
             args.split_decode_context = true;
+        } else if (arg == "--gpu-decode-output") {
+            args.gpu_decode_output = true;
+        } else if (arg == "--download-gpu-output") {
+            args.download_gpu_output = true;
+        } else if (arg == "--strict-gpu-resident") {
+            args.strict_gpu_resident = true;
+        } else if (arg == "--dump-gpu-handle-desc") {
+            args.dump_gpu_handle_desc = true;
         } else if (arg == "--no-decode") {
             args.decode = false;
         } else {
@@ -205,6 +221,9 @@ int main(int argc, char** argv) {
     }
     if (args.disable_default_vae_conv_direct) {
         set_env_value("SDCPP_DISABLE_DEFAULT_VAE_CONV_DIRECT", "1");
+    }
+    if (args.strict_gpu_resident) {
+        set_env_value("SDCPP_STRICT_GPU_RESIDENT", "1");
     }
     sd_set_log_callback(sd_log_cb, nullptr);
 
@@ -327,27 +346,103 @@ int main(int argc, char** argv) {
 
         std::cout << "calling sd_decode_latent\n";
         sd_vae_memory_report_t decode_report;
-        sd_image_t* output = sd_decode_latent_normal(decode_ctx, latent_to_decode, &vae_options, &decode_report);
-        if (output == nullptr) {
-            std::cerr << "sd_decode_latent failed\n";
-            if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
-            if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
-            free_sd_latent(encoded);
-            free_sd_ctx(ctx);
-            return 1;
-        }
-        print_vae_report("decode_report", decode_report);
-        if (!write_image_to_file(args.output, output->data, output->width, output->height, output->channel)) {
-            std::cerr << "failed to write output: " << args.output << "\n";
+        if (args.gpu_decode_output) {
+            sd_gpu_handle_t gpu_image = 0;
+            if (!sd_decode_latent_normal_gpu(decode_ctx, latent_to_decode, &vae_options, &gpu_image, &decode_report)) {
+                std::cerr << "sd_decode_latent_normal_gpu failed\n";
+                if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            print_vae_report("decode_report", decode_report);
+            std::cout << "gpu_decode_handle=" << gpu_image << "\n";
+            if (args.dump_gpu_handle_desc) {
+                sd_gpu_tensor_desc_t desc{};
+                if (!sd_gpu_handle_get_desc(decode_ctx, gpu_image, &desc)) {
+                    std::cerr << "sd_gpu_handle_get_desc failed\n";
+                    sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                    if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                    free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                std::cout << "gpu_desc handle=" << desc.handle
+                          << " backend=" << desc.backend
+                          << " kind=" << desc.kind
+                          << " dtype=" << desc.dtype
+                          << " layout=" << desc.layout
+                          << " shape_nchw=" << desc.n << "x" << desc.c << "x" << desc.h << "x" << desc.w
+                          << " strides=" << desc.stride_n << "," << desc.stride_c << "," << desc.stride_h << "," << desc.stride_w
+                          << " bytes=" << desc.byte_size
+                          << " flags=" << desc.flags
+                          << " refcount=" << desc.refcount << "\n";
+            }
+            sd_cuda_borrowed_ptr_t borrowed{};
+            if (sd_gpu_handle_borrow_cuda_ptr(decode_ctx, gpu_image, &borrowed)) {
+                std::cout << "gpu_borrow device_ptr=" << borrowed.device_ptr
+                          << " bytes=" << borrowed.byte_size
+                          << " dtype=" << borrowed.dtype
+                          << " layout=" << borrowed.layout << "\n";
+                sd_gpu_handle_end_cuda_borrow(decode_ctx, gpu_image);
+            }
+            if (args.download_gpu_output) {
+                sd_image_t output{};
+                if (!sd_gpu_image_download(decode_ctx, gpu_image, &output, nullptr)) {
+                    std::cerr << "sd_gpu_image_download failed\n";
+                    sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                    if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                    free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                if (!write_image_to_file(args.output, output.data, output.width, output.height, output.channel)) {
+                    std::cerr << "failed to write output: " << args.output << "\n";
+                    free(output.data);
+                    sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                    if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                    free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                std::cout << "explicit_download_wrote " << args.output << "\n";
+                free(output.data);
+            }
+            if (!sd_gpu_handle_release(decode_ctx, gpu_image)) {
+                std::cerr << "sd_gpu_handle_release failed\n";
+                if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+        } else {
+            sd_image_t* output = sd_decode_latent_normal(decode_ctx, latent_to_decode, &vae_options, &decode_report);
+            if (output == nullptr) {
+                std::cerr << "sd_decode_latent failed\n";
+                if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            print_vae_report("decode_report", decode_report);
+            if (!write_image_to_file(args.output, output->data, output->width, output->height, output->channel)) {
+                std::cerr << "failed to write output: " << args.output << "\n";
+                free_sd_image(output);
+                if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            std::cout << "wrote " << args.output << "\n";
             free_sd_image(output);
-            if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
-            if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
-            free_sd_latent(encoded);
-            free_sd_ctx(ctx);
-            return 1;
         }
-        std::cout << "wrote " << args.output << "\n";
-        free_sd_image(output);
         if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
     }
 

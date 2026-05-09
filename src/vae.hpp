@@ -221,6 +221,19 @@ public:
         SD_UNUSED(report);
         return false;
     }
+
+    virtual std::unique_ptr<GgmlBackendTensorResource> decode_to_backend_resource(int n_threads,
+                                                                                  const sd::Tensor<float>& x,
+                                                                                  sd_tiling_params_t tiling_params,
+                                                                                  bool circular_x = false,
+                                                                                  bool circular_y = false) {
+        SD_UNUSED(n_threads);
+        SD_UNUSED(x);
+        SD_UNUSED(tiling_params);
+        SD_UNUSED(circular_x);
+        SD_UNUSED(circular_y);
+        return nullptr;
+    }
 };
 
 struct FakeVAE : public VAE {
