@@ -17,6 +17,7 @@ struct Args {
     int height         = 0;
     bool sample        = false;
     bool decode        = true;
+    bool skip_estimate = false;
     bool split_decode_context = false;
     bool vae_conv_direct = false;
     bool disable_default_vae_conv_direct = false;
@@ -35,6 +36,7 @@ static void usage(const char* argv0) {
         << "  --disable-default-vae-conv-direct disable CUDA SDXL default direct VAE convolution\n"
         << "  --type-f16               request f16 model tensor conversion\n"
         << "  --sample                 run sd_sample_latent after encode\n"
+        << "  --skip-estimate          skip sd_estimate_vae_normal_memory smoke checks\n"
         << "  --split-decode-context   decode with a separate vae_decode_only=true context\n"
         << "  --no-decode              skip sd_decode_latent\n";
 }
@@ -82,6 +84,8 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.type_f16 = true;
         } else if (arg == "--sample") {
             args.sample = true;
+        } else if (arg == "--skip-estimate") {
+            args.skip_estimate = true;
         } else if (arg == "--split-decode-context") {
             args.split_decode_context = true;
         } else if (arg == "--no-decode") {
@@ -249,9 +253,11 @@ int main(int argc, char** argv) {
         vae_options.fail_on_large_im2col = false;
     }
 
-    sd_vae_memory_report_t encode_estimate;
-    if (sd_estimate_vae_normal_memory(ctx, image.width, image.height, false, &vae_options, &encode_estimate)) {
-        print_vae_report("encode_estimate", encode_estimate);
+    if (!args.skip_estimate) {
+        sd_vae_memory_report_t encode_estimate;
+        if (sd_estimate_vae_normal_memory(ctx, image.width, image.height, false, &vae_options, &encode_estimate)) {
+            print_vae_report("encode_estimate", encode_estimate);
+        }
     }
 
     std::cout << "calling sd_encode_image\n";
@@ -310,11 +316,13 @@ int main(int argc, char** argv) {
             }
         }
 
-        sd_vae_memory_report_t decode_estimate;
-        uint32_t decode_width = latent_to_decode->width * 8;
-        uint32_t decode_height = latent_to_decode->height * 8;
-        if (sd_estimate_vae_normal_memory(decode_ctx, decode_width, decode_height, true, &vae_options, &decode_estimate)) {
-            print_vae_report("decode_estimate", decode_estimate);
+        if (!args.skip_estimate) {
+            sd_vae_memory_report_t decode_estimate;
+            uint32_t decode_width = latent_to_decode->width * 8;
+            uint32_t decode_height = latent_to_decode->height * 8;
+            if (sd_estimate_vae_normal_memory(decode_ctx, decode_width, decode_height, true, &vae_options, &decode_estimate)) {
+                print_vae_report("decode_estimate", decode_estimate);
+            }
         }
 
         std::cout << "calling sd_decode_latent\n";

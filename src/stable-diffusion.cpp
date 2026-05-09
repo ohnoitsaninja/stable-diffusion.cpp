@@ -3517,6 +3517,49 @@ static bool prepare_normal_vae_run(sd_ctx_t* sd_ctx,
     return true;
 }
 
+class ScopedVaeImplicitGemmConv {
+public:
+    explicit ScopedVaeImplicitGemmConv(sd_vae_exec_mode_t resolved_mode) {
+        if (resolved_mode != SD_VAE_EXEC_COMFY_NORMAL ||
+            StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV")) {
+            return;
+        }
+        const char* current = std::getenv(kEnvName);
+        if (current != nullptr) {
+            had_previous_ = true;
+            previous_ = current;
+        }
+#ifdef _WIN32
+        _putenv_s(kEnvName, "1");
+#else
+        setenv(kEnvName, "1", 1);
+#endif
+        active_ = true;
+        LOG_INFO("[VAE] COMFY_NORMAL conv backend: implicit_gemm (set SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV=1 to force direct conv)");
+    }
+
+    ~ScopedVaeImplicitGemmConv() {
+        if (!active_) {
+            return;
+        }
+#ifdef _WIN32
+        _putenv_s(kEnvName, had_previous_ ? previous_.c_str() : "");
+#else
+        if (had_previous_) {
+            setenv(kEnvName, previous_.c_str(), 1);
+        } else {
+            unsetenv(kEnvName);
+        }
+#endif
+    }
+
+private:
+    static constexpr const char* kEnvName = "SDCPP_EXPERIMENTAL_VAE_IMPLICIT_GEMM_CONV";
+    bool active_ = false;
+    bool had_previous_ = false;
+    std::string previous_;
+};
+
 static bool validate_init_latent_shape(sd_ctx_t* sd_ctx,
                                        const GenerationRequest& request,
                                        const sd::Tensor<float>& init_latent) {
@@ -3745,6 +3788,7 @@ SD_API sd_latent_t* sd_encode_image_normal(sd_ctx_t* sd_ctx,
     if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
         return nullptr;
     }
+    ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
 
     int64_t t0 = ggml_time_ms();
     sd::Tensor<float> image_tensor = sd_image_to_tensor(*image);
@@ -3970,6 +4014,7 @@ SD_API sd_image_t* sd_decode_latent_normal(sd_ctx_t* sd_ctx,
     if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
         return nullptr;
     }
+    ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
 
     int64_t t0 = ggml_time_ms();
     sd::Tensor<float> vae_latent = sd_ctx->sd->first_stage_model->diffusion_to_vae_latents(*tensor);
@@ -4034,6 +4079,7 @@ SD_API bool sd_estimate_vae_normal_memory(sd_ctx_t* sd_ctx,
     if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
         return false;
     }
+    ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
 
     sd::Tensor<float> input;
     if (decode) {

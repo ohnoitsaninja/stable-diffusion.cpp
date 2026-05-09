@@ -22,7 +22,7 @@ The mode uses:
 - no TAESD
 - no tiled VAE
 - no legacy IM2COL
-- direct convolution
+- CUDA implicit-GEMM convolution for COMFY_NORMAL VAE by default
 - stage-scoped graphs
 - CUDA device-resident stage boundaries
 - ABI-safe public C APIs with memory reports and capability discovery
@@ -65,9 +65,13 @@ All VAE option, report, and capability structs include `struct_size`,
 - `SDCPP_TRACE_VAE_STAGES=1`
 - `SDCPP_TRACE_GRAPH_ALLOC=1`
 - `SDCPP_DISABLE_COMFY_NORMAL_VAE=1`
+- `SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV=1`
 
 Strict mode fails or loudly reports if COMFY_NORMAL enters tiled VAE, TAESD,
 IM2COL, host stage copies, or a workspace regression beyond the staged baseline.
+
+`SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV=1` is the escape hatch for forcing the
+older CUDA direct conv path. It should be used only for diagnostics.
 
 ## Current Numbers
 
@@ -77,8 +81,9 @@ Measured on SDXL 1024 with the embedded checkpoint VAE:
 | --- | ---: |
 | Legacy IM2COL decode | 7680.25 MB |
 | Direct monolithic decode | 3840.25 MB |
-| COMFY_NORMAL staged decode | 2816 MB |
-| COMFY_NORMAL staged encode | 1536 MB |
+| COMFY_NORMAL staged decode, direct conv | 2816 MB, ~11.9s |
+| COMFY_NORMAL staged decode, implicit-GEMM conv | 2816 MB, ~0.8s |
+| COMFY_NORMAL staged encode, implicit-GEMM conv | 1536 MB, ~0.7s |
 | Comfy normal reference | 2371.94 MiB allocated / 3328 MiB reserved |
 
 Parity against Comfy normal VAE:
@@ -96,6 +101,16 @@ COMFY_NORMAL reports:
 - `stage_boundary_host_copies=0`
 - `stage_boundary_device_copies=5`
 
+Paralol headless SDXL T2I verification:
+
+- workflow: `F:\Paralol\build\runtime\user_workflows\sd_t2i_workflow.json`
+- scenario: `bounded-sink`
+- event log: `F:\Paralol\build\smoke-logs\sd-t2i-startprocess-20260509-175253.jsonl`
+- output: `F:\Paralol\build\generated\sd_t2i_comfy_normal_test.bmp`
+- result: `scenario_pass`
+- KSampler: about 6s
+- Latent Decode: about 1s
+
 ## Deferred Work
 
 Compact bf16/f16 VAE activations are deferred. The current path keeps storage
@@ -112,6 +127,10 @@ compact activations on a separate branch.
 `Latent Decode` should call `sd_decode_latent_normal` by default.
 
 `Latent Encode` should call `sd_encode_image_normal` by default.
+
+For SDXL, use a VAE decode-only context for Latent Decode when possible. The
+decode-only context avoids keeping CLIP/UNet resident during VAE decode and is
+the verified production path for the fast normal decode.
 
 The older tiled/direct/legacy paths should remain available only as explicit
 debug or low-memory fallback modes.
