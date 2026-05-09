@@ -1,0 +1,81 @@
+{
+  "summary": {
+    "recommendation": "wrap_up_and_productionize_comfy_normal_first",
+    "do_compact_bf16_f16_now": false,
+    "prototype_implemented": false,
+    "reason": "Current COMFY_NORMAL already removes the major IM2COL memory problem. Remaining compact dtype work requires coordinated graph dtype plumbing plus CUDA group_norm/upscale/conv changes; isolated low-risk prototypes would not produce meaningful memory reduction."
+  },
+  "paths": {
+    "repo": "C:/tmp/stable-diffusion.cpp-paralol",
+    "comfy_root": "F:/automatic1111/Stability/Packages/ComfyUI",
+    "model": "F:/automatic1111/Stability/Models/StableDiffusion/creapromptLightning_creapromtHypersdxlV1.2.safetensors",
+    "image": "F:/Paralol/examples/orc.png",
+    "trace_dir": "C:/tmp/stable-diffusion.cpp-paralol/build/vae-bf16-feasibility"
+  },
+  "baseline": {
+    "encode": {
+      "planned_workspace_mb": 1536,
+      "graphs": 6,
+      "stages": 6,
+      "stage_boundary_host_copies": 0,
+      "stage_boundary_device_copies": 5,
+      "used_im2col": false,
+      "used_direct_conv": true,
+      "storage_dtype": "f32"
+    },
+    "decode": {
+      "planned_workspace_mb": 2816,
+      "graphs": 6,
+      "stages": 6,
+      "stage_boundary_host_copies": 0,
+      "stage_boundary_device_copies": 5,
+      "used_im2col": false,
+      "used_direct_conv": true,
+      "storage_dtype": "f32"
+    },
+    "comfy_reference": {
+      "dtype": "torch.bfloat16",
+      "peak_allocated_mb": 2371.94384765625,
+      "peak_reserved_mb": 3328.0,
+      "mean_abs_diff": 0.0029507868457585573,
+      "p99_abs_diff": 0.019607841968536377,
+      "psnr_db": 45.17414118983224
+    },
+    "measured_nvml_peak": {
+      "available": false,
+      "note": "The only NVML CSV was from the aborted wrapper. stdout/stderr were empty and samples stayed around idle VRAM for about 899 seconds, so it is not a useful smoke measurement."
+    }
+  },
+  "decode_stage_trace": [
+    {"stage": 0, "planned_mb": 1184.25, "f32_mb": 2305, "dominant_ops_mb": {"MUL_MAT": 1056, "SCALE": 544.75, "CONV_2D": 288.25, "GROUP_NORM": 160, "CONT": 160, "ADD": 96}},
+    {"stage": 1, "planned_mb": 288, "f32_mb": 1376, "dominant_ops_mb": {"SCALE": 640, "CONV_2D": 320, "GROUP_NORM": 192, "UPSCALE": 128, "ADD": 96}},
+    {"stage": 2, "planned_mb": 1152, "f32_mb": 5504, "dominant_ops_mb": {"SCALE": 2560, "CONV_2D": 1280, "GROUP_NORM": 768, "UPSCALE": 512, "ADD": 384}},
+    {"stage": 3, "planned_mb": 2816, "f32_mb": 12544, "dominant_ops_mb": {"SCALE": 6144, "CONV_2D": 2816, "GROUP_NORM": 1792, "UPSCALE": 1024, "ADD": 768}},
+    {"stage": 4, "planned_mb": 2048, "f32_mb": 16896, "dominant_ops_mb": {"SCALE": 8192, "CONV_2D": 3584, "GROUP_NORM": 3584, "ADD": 1536}},
+    {"stage": 5, "planned_mb": 1024, "f32_mb": 1048, "dominant_ops_mb": {"SCALE": 524, "GROUP_NORM": 512, "CONV_2D": 12}}
+  ],
+  "encode_stage_trace": [
+    {"stage": 0, "planned_mb": 524, "f32_mb": 1036, "dominant_ops_mb": {"SCALE": 524, "CONV_2D": 512}},
+    {"stage": 1, "planned_mb": 1536, "f32_mb": 10498, "dominant_ops_mb": {"SCALE": 4737, "CONV_2D": 2176, "GROUP_NORM": 2048, "ADD": 1024, "PAD": 513}},
+    {"stage": 2, "planned_mb": 896, "f32_mb": 5634, "dominant_ops_mb": {"SCALE": 2625, "CONV_2D": 1344, "GROUP_NORM": 896, "ADD": 512, "PAD": 257}},
+    {"stage": 3, "planned_mb": 448, "f32_mb": 2818, "dominant_ops_mb": {"SCALE": 1313, "CONV_2D": 672, "GROUP_NORM": 448, "ADD": 256, "PAD": 129}},
+    {"stage": 4, "planned_mb": 96, "f32_mb": 576, "dominant_ops_mb": {"SCALE": 256, "CONV_2D": 128, "GROUP_NORM": 128, "ADD": 64}},
+    {"stage": 5, "planned_mb": 1184, "f32_mb": 2306.5, "dominant_ops_mb": {"MUL_MAT": 1056, "SCALE": 545.5, "CONV_2D": 257, "GROUP_NORM": 192, "CONT": 160, "ADD": 96}}
+  ],
+  "memory_savings_estimates": [
+    {"case": "theoretical_all_safe_activations_bf16", "decode_savings_mb": "1024-1400", "encode_savings_mb": "512-768", "decode_percent": "36-50", "encode_percent": "33-50"},
+    {"case": "pointwise_and_upscale_only", "decode_savings_mb": "256-512", "encode_savings_mb": "128-384", "decode_percent": "9-18", "encode_percent": "8-25"},
+    {"case": "pointwise_upscale_groupnorm_output_compact_fp32_reductions", "decode_savings_mb": "512-1024", "encode_savings_mb": "256-640", "decode_percent": "18-36", "encode_percent": "17-42"},
+    {"case": "conv_and_groupnorm_remain_f32", "decode_savings_mb": "0-256", "encode_savings_mb": "0-128", "decode_percent": "0-9", "encode_percent": "0-8"}
+  ],
+  "op_feasibility": [
+    {"op": "SCALE", "source": "ggml/src/ggml-cuda/scale.cu", "risk": "moderate", "correctness_risk": "low", "memory_win": "medium aggregate, low alone", "priority": "after graph dtype plan"},
+    {"op": "ADD", "source": "ggml/src/ggml-cuda/binbcast.cu", "risk": "moderate", "correctness_risk": "medium", "memory_win": "medium", "priority": "after conv/groupnorm"},
+    {"op": "SiLU_UNARY", "source": "ggml/src/ggml-cuda/unary.cu", "risk": "easy_to_moderate", "correctness_risk": "low_to_medium", "memory_win": "low in current trace", "priority": "later"},
+    {"op": "CLAMP", "source": "ggml/src/ggml-cuda/clamp.cu", "risk": "easy", "correctness_risk": "low", "memory_win": "low", "priority": "later"},
+    {"op": "UPSCALE_NEAREST", "source": "ggml/src/ggml.c and ggml/src/ggml-cuda/upscale.cu", "risk": "moderate", "correctness_risk": "low_to_medium", "memory_win": "high in decode", "priority": "first kernel candidate after graph dtype plumbing"},
+    {"op": "GROUP_NORM", "source": "ggml/src/ggml-cuda/norm.cu", "risk": "hard", "correctness_risk": "high", "memory_win": "high", "priority": "high_value_but_risky"},
+    {"op": "DIRECT_CONV_2D", "source": "ggml/src/ggml-cuda/conv2d.cu", "risk": "hard", "correctness_risk": "medium_to_high", "memory_win": "high", "priority": "defer_or_replace_with_cudnn_cutlass"}
+  ]
+}
+

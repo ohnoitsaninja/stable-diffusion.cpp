@@ -357,6 +357,48 @@ public:
         h = conv_out->forward(ctx, h);            // [N, z_channels*2, h, w]
         return h;
     }
+
+    int stage_count() const {
+        return static_cast<int>(ch_mult.size()) + 2;
+    }
+
+    ggml_tensor* forward_stage(GGMLRunnerContext* ctx, ggml_tensor* x, int stage) {
+        auto conv_in     = std::dynamic_pointer_cast<Conv2d>(blocks["conv_in"]);
+        auto mid_block_1 = std::dynamic_pointer_cast<ResnetBlock>(blocks["mid.block_1"]);
+        auto mid_attn_1  = std::dynamic_pointer_cast<AttnBlock>(blocks["mid.attn_1"]);
+        auto mid_block_2 = std::dynamic_pointer_cast<ResnetBlock>(blocks["mid.block_2"]);
+        auto norm_out    = std::dynamic_pointer_cast<GroupNorm32>(blocks["norm_out"]);
+        auto conv_out    = std::dynamic_pointer_cast<Conv2d>(blocks["conv_out"]);
+
+        if (stage == 0) {
+            return conv_in->forward(ctx, x);
+        }
+
+        size_t num_resolutions = ch_mult.size();
+        if (stage >= 1 && stage <= static_cast<int>(num_resolutions)) {
+            int i = stage - 1;
+            auto h = x;
+            for (int j = 0; j < num_res_blocks; j++) {
+                std::string name = "down." + std::to_string(i) + ".block." + std::to_string(j);
+                auto down_block  = std::dynamic_pointer_cast<ResnetBlock>(blocks[name]);
+                h = down_block->forward(ctx, h);
+            }
+            if (i != static_cast<int>(num_resolutions) - 1) {
+                std::string name = "down." + std::to_string(i) + ".downsample";
+                auto down_sample = std::dynamic_pointer_cast<DownSampleBlock>(blocks[name]);
+                h = down_sample->forward(ctx, h);
+            }
+            return h;
+        }
+
+        auto h = mid_block_1->forward(ctx, x);
+        h = mid_attn_1->forward(ctx, h);
+        h = mid_block_2->forward(ctx, h);
+        h = norm_out->forward(ctx, h);
+        h = ggml_silu_inplace(ctx->ggml_ctx, h);
+        h = conv_out->forward(ctx, h);
+        return h;
+    }
 };
 
 // ldm.modules.diffusionmodules.model.Decoder
@@ -478,6 +520,48 @@ public:
         h = norm_out->forward(ctx, h);
         h = ggml_silu_inplace(ctx->ggml_ctx, h);  // nonlinearity/swish
         h = conv_out->forward(ctx, h);            // [N, out_ch, h*8, w*8]
+        return h;
+    }
+
+    int stage_count() const {
+        return static_cast<int>(ch_mult.size()) + 2;
+    }
+
+    ggml_tensor* forward_stage(GGMLRunnerContext* ctx, ggml_tensor* z, int stage) {
+        auto conv_in     = std::dynamic_pointer_cast<Conv2d>(blocks["conv_in"]);
+        auto mid_block_1 = std::dynamic_pointer_cast<ResnetBlock>(blocks["mid.block_1"]);
+        auto mid_attn_1  = std::dynamic_pointer_cast<AttnBlock>(blocks["mid.attn_1"]);
+        auto mid_block_2 = std::dynamic_pointer_cast<ResnetBlock>(blocks["mid.block_2"]);
+        auto norm_out    = std::dynamic_pointer_cast<GroupNorm32>(blocks["norm_out"]);
+        auto conv_out    = std::dynamic_pointer_cast<Conv2d>(blocks["conv_out"]);
+
+        if (stage == 0) {
+            auto h = conv_in->forward(ctx, z);
+            h = mid_block_1->forward(ctx, h);
+            h = mid_attn_1->forward(ctx, h);
+            return mid_block_2->forward(ctx, h);
+        }
+
+        int num_resolutions = static_cast<int>(ch_mult.size());
+        if (stage >= 1 && stage <= num_resolutions) {
+            int i = num_resolutions - stage;
+            auto h = z;
+            for (int j = 0; j < num_res_blocks + 1; j++) {
+                std::string name = "up." + std::to_string(i) + ".block." + std::to_string(j);
+                auto up_block    = std::dynamic_pointer_cast<ResnetBlock>(blocks[name]);
+                h = up_block->forward(ctx, h);
+            }
+            if (i != 0) {
+                std::string name = "up." + std::to_string(i) + ".upsample";
+                auto up_sample   = std::dynamic_pointer_cast<UpSampleBlock>(blocks[name]);
+                h = up_sample->forward(ctx, h);
+            }
+            return h;
+        }
+
+        auto h = norm_out->forward(ctx, z);
+        h = ggml_silu_inplace(ctx->ggml_ctx, h);
+        h = conv_out->forward(ctx, h);
         return h;
     }
 };
@@ -608,6 +692,37 @@ public:
         return h;
     }
 
+    int decode_stage_count() {
+        auto decoder = std::dynamic_pointer_cast<Decoder>(blocks["decoder"]);
+        return decoder->stage_count();
+    }
+
+    ggml_tensor* decode_stage(GGMLRunnerContext* ctx, ggml_tensor* z, int stage) {
+        if (stage == 0) {
+            if (sd_version_is_flux2(version)) {
+                int64_t p = 2;
+                int64_t N = z->ne[3];
+                int64_t C = z->ne[2] / p / p;
+                int64_t h = z->ne[1];
+                int64_t w = z->ne[0];
+                int64_t H = h * p;
+                int64_t W = w * p;
+
+                z = ggml_reshape_4d(ctx->ggml_ctx, z, w * h, p * p, C, N);
+                z = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, z, 1, 0, 2, 3));
+                z = ggml_reshape_4d(ctx->ggml_ctx, z, p, p, w, h * C * N);
+                z = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, z, 0, 2, 1, 3));
+                z = ggml_reshape_4d(ctx->ggml_ctx, z, W, H, C, N);
+            }
+            if (use_quant) {
+                auto post_quant_conv = std::dynamic_pointer_cast<Conv2d>(blocks["post_quant_conv"]);
+                z = post_quant_conv->forward(ctx, z);
+            }
+        }
+        auto decoder = std::dynamic_pointer_cast<Decoder>(blocks["decoder"]);
+        return decoder->forward_stage(ctx, z, stage);
+    }
+
     ggml_tensor* encode(GGMLRunnerContext* ctx, ggml_tensor* x) {
         // x: [N, in_channels, h, w]
         auto encoder = std::dynamic_pointer_cast<Encoder>(blocks["encoder"]);
@@ -638,6 +753,40 @@ public:
         return z;
     }
 
+    int encode_stage_count() {
+        auto encoder = std::dynamic_pointer_cast<Encoder>(blocks["encoder"]);
+        return encoder->stage_count();
+    }
+
+    ggml_tensor* encode_stage(GGMLRunnerContext* ctx, ggml_tensor* x, int stage) {
+        auto encoder = std::dynamic_pointer_cast<Encoder>(blocks["encoder"]);
+        auto z = encoder->forward_stage(ctx, x, stage);
+        if (stage == encode_stage_count() - 1) {
+            if (use_quant) {
+                auto quant_conv = std::dynamic_pointer_cast<Conv2d>(blocks["quant_conv"]);
+                z = quant_conv->forward(ctx, z);
+            }
+            if (sd_version_is_flux2(version)) {
+                z = ggml_ext_chunk(ctx->ggml_ctx, z, 2, 2)[0];
+
+                int64_t p = 2;
+                int64_t N = z->ne[3];
+                int64_t C = z->ne[2];
+                int64_t H = z->ne[1];
+                int64_t W = z->ne[0];
+                int64_t h = H / p;
+                int64_t w = W / p;
+
+                z = ggml_reshape_4d(ctx->ggml_ctx, z, p, w, p, h * C * N);
+                z = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, z, 0, 2, 1, 3));
+                z = ggml_reshape_4d(ctx->ggml_ctx, z, p * p, w * h, C, N);
+                z = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, z, 1, 0, 2, 3));
+                z = ggml_reshape_4d(ctx->ggml_ctx, z, w, h, p * p * C, N);
+            }
+        }
+        return z;
+    }
+
     int get_encoder_output_channels() {
         int factor = dd_config.double_z ? 2 : 1;
         if (sd_version_is_flux2(version)) {
@@ -651,6 +800,7 @@ struct AutoEncoderKL : public VAE {
     float scale_factor = 1.f;
     float shift_factor = 0.f;
     bool decode_only   = true;
+    bool comfy_normal_enabled = false;
     AutoEncoderKLModel ae;
 
     AutoEncoderKL(ggml_backend_t backend,
@@ -704,6 +854,10 @@ struct AutoEncoderKL : public VAE {
         }
     }
 
+    void set_comfy_normal_enabled(bool enabled) override {
+        comfy_normal_enabled = enabled;
+    }
+
     std::string get_desc() override {
         return "vae";
     }
@@ -725,14 +879,167 @@ struct AutoEncoderKL : public VAE {
         return gf;
     }
 
+    ggml_cgraph* build_stage_graph(const sd::Tensor<float>& z_tensor, bool decode_graph, int stage) {
+        ggml_cgraph* gf = ggml_new_graph(compute_ctx);
+        ggml_tensor* z  = make_input(z_tensor);
+
+        auto runner_ctx = get_context();
+        ggml_tensor* out = decode_graph ? ae.decode_stage(&runner_ctx, z, stage)
+                                        : ae.encode_stage(&runner_ctx, z, stage);
+
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    ggml_cgraph* build_stage_graph(ggml_tensor* z, bool decode_graph, int stage) {
+        ggml_cgraph* gf = ggml_new_graph(compute_ctx);
+        auto runner_ctx = get_context();
+        ggml_tensor* out = decode_graph ? ae.decode_stage(&runner_ctx, z, stage)
+                                        : ae.encode_stage(&runner_ctx, z, stage);
+
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    static void merge_stage_report(sd_vae_memory_report_t* aggregate, const sd_vae_memory_report_t& stage_report) {
+        aggregate->graph_count += std::max<uint32_t>(stage_report.graph_count, 1);
+        aggregate->stage_count += 1;
+        aggregate->used_im2col = aggregate->used_im2col || stage_report.used_im2col;
+        aggregate->used_direct_conv = aggregate->used_direct_conv || stage_report.used_direct_conv;
+        aggregate->compact_activation_storage = aggregate->compact_activation_storage || stage_report.compact_activation_storage;
+        aggregate->estimated_peak_bytes = std::max(aggregate->estimated_peak_bytes, stage_report.estimated_peak_bytes);
+        aggregate->planned_workspace_bytes = std::max(aggregate->planned_workspace_bytes, stage_report.planned_workspace_bytes);
+        if (stage_report.largest_tensor_bytes > aggregate->largest_tensor_bytes) {
+            aggregate->largest_tensor_bytes = stage_report.largest_tensor_bytes;
+            std::snprintf(aggregate->largest_tensor_op, sizeof(aggregate->largest_tensor_op), "%s", stage_report.largest_tensor_op);
+            std::snprintf(aggregate->largest_tensor_type, sizeof(aggregate->largest_tensor_type), "%s", stage_report.largest_tensor_type);
+            std::snprintf(aggregate->largest_tensor_shape, sizeof(aggregate->largest_tensor_shape), "%s", stage_report.largest_tensor_shape);
+        }
+    }
+
+    static void record_stage_output(sd_vae_memory_report_t* aggregate,
+                                    int stage,
+                                    const BackendTensorHandle* handle,
+                                    bool boundary_input_was_device) {
+        if (handle == nullptr || handle->empty()) {
+            return;
+        }
+        aggregate->device_resident_stages = aggregate->device_resident_stages || !ggml_backend_buffer_is_host(handle->buffer);
+        if (stage >= 0 && stage < 16) {
+            std::snprintf(aggregate->stage_output_dtype[stage],
+                          sizeof(aggregate->stage_output_dtype[stage]),
+                          "%s",
+                          ggml_type_name(handle->tensor->type));
+            std::snprintf(aggregate->stage_output_backend[stage],
+                          sizeof(aggregate->stage_output_backend[stage]),
+                          "%s",
+                          ggml_backend_buffer_name(handle->buffer));
+        }
+        if (boundary_input_was_device) {
+            if (ggml_backend_buffer_is_host(handle->buffer)) {
+                aggregate->stage_boundary_host_copies += 1;
+            } else {
+                aggregate->stage_boundary_device_copies += 1;
+            }
+        }
+    }
+
+    sd::Tensor<float> _compute_staged(const int n_threads,
+                                      const sd::Tensor<float>& z,
+                                      bool decode_graph) {
+        GGML_ASSERT(!decode_only || decode_graph);
+        const int stages = decode_graph ? ae.decode_stage_count() : ae.encode_stage_count();
+        std::unique_ptr<BackendTensorHandle> current;
+        sd_vae_memory_report_t aggregate = {};
+        aggregate.used_direct_conv = conv2d_direct_enabled;
+        for (int stage = 0; stage < stages; ++stage) {
+            auto get_graph = [&]() -> ggml_cgraph* {
+                if (stage == 0) {
+                    return build_stage_graph(z, decode_graph, stage);
+                }
+                return build_stage_graph(current->tensor, decode_graph, stage);
+            };
+            auto stage_output = compute_to_backend_handle(get_graph, n_threads, "vae_comfy_normal_stage");
+            sd_vae_memory_report_t stage_report = get_last_graph_report();
+            merge_stage_report(&aggregate, stage_report);
+            if (stage_output == nullptr || stage_output->empty()) {
+                return {};
+            }
+            record_stage_output(&aggregate, stage, stage_output.get(), stage > 0);
+            current = std::move(stage_output);
+        }
+        aggregate.device_resident_stages = aggregate.stage_boundary_host_copies == 0 && !ggml_backend_buffer_is_host(current->buffer);
+        LOG_INFO("[VAE] COMFY_NORMAL stage boundaries: device_resident=%s host_copies=%u device_copies=%u dtype_promotions=%u",
+                 aggregate.device_resident_stages ? "true" : "false",
+                 aggregate.stage_boundary_host_copies,
+                 aggregate.stage_boundary_device_copies,
+                 aggregate.stage_boundary_dtype_promotions);
+        last_graph_report = aggregate;
+        return take_or_empty(materialize_backend_tensor<float>(current.get(), z.dim()));
+    }
+
     sd::Tensor<float> _compute(const int n_threads,
                                const sd::Tensor<float>& z,
                                bool decode_graph) override {
+        if (comfy_normal_enabled) {
+            return _compute_staged(n_threads, z, decode_graph);
+        }
         GGML_ASSERT(!decode_only || decode_graph);
         auto get_graph = [&]() -> ggml_cgraph* {
             return build_graph(z, decode_graph);
         };
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), z.dim());
+    }
+
+    bool estimate_memory_report(const sd::Tensor<float>& z,
+                                bool decode_graph,
+                                sd_vae_memory_report_t* report) override {
+        if (comfy_normal_enabled) {
+            const int stages = decode_graph ? ae.decode_stage_count() : ae.encode_stage_count();
+            std::unique_ptr<BackendTensorHandle> current;
+            sd_vae_memory_report_t aggregate = {};
+            aggregate.used_direct_conv = conv2d_direct_enabled;
+            for (int stage = 0; stage < stages; ++stage) {
+                auto get_graph = [&]() -> ggml_cgraph* {
+                    if (stage == 0) {
+                        return build_stage_graph(z, decode_graph, stage);
+                    }
+                    return build_stage_graph(current->tensor, decode_graph, stage);
+                };
+                auto stage_output = compute_to_backend_handle(get_graph, 1, "vae_comfy_normal_estimate_stage");
+                merge_stage_report(&aggregate, get_last_graph_report());
+                if (stage_output == nullptr || stage_output->empty()) {
+                    return false;
+                }
+                record_stage_output(&aggregate, stage, stage_output.get(), stage > 0);
+                current = std::move(stage_output);
+            }
+            aggregate.device_resident_stages = aggregate.stage_boundary_host_copies == 0 &&
+                                               current != nullptr &&
+                                               !ggml_backend_buffer_is_host(current->buffer);
+            last_graph_report = aggregate;
+            if (report != nullptr) {
+                *report = aggregate;
+            }
+            return true;
+        }
+        GGML_ASSERT(!decode_only || decode_graph);
+        auto get_graph = [&]() -> ggml_cgraph* {
+            return build_graph(z, decode_graph);
+        };
+        if (!offload_params_to_runtime_backend()) {
+            LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
+            return false;
+        }
+        if (!alloc_compute_buffer(get_graph)) {
+            LOG_ERROR("%s alloc compute buffer failed while estimating VAE memory", get_desc().c_str());
+            return false;
+        }
+        if (report != nullptr) {
+            *report = get_last_graph_report();
+        }
+        free_compute_buffer();
+        return true;
     }
 
     sd::Tensor<float> gaussian_latent_sample(const sd::Tensor<float>& moments, std::shared_ptr<RNG> rng) {

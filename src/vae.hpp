@@ -212,6 +212,15 @@ public:
     virtual sd::Tensor<float> vae_to_diffusion_latents(const sd::Tensor<float>& latents)                           = 0;
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix)         = 0;
     virtual void set_conv2d_scale(float scale) { SD_UNUSED(scale); };
+    virtual void set_comfy_normal_enabled(bool enabled) { SD_UNUSED(enabled); };
+    virtual bool estimate_memory_report(const sd::Tensor<float>& input,
+                                        bool decode_graph,
+                                        sd_vae_memory_report_t* report) {
+        SD_UNUSED(input);
+        SD_UNUSED(decode_graph);
+        SD_UNUSED(report);
+        return false;
+    }
 };
 
 struct FakeVAE : public VAE {
@@ -244,6 +253,17 @@ struct FakeVAE : public VAE {
     }
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) override {}
+
+    bool estimate_memory_report(const sd::Tensor<float>& input,
+                                bool decode_graph,
+                                sd_vae_memory_report_t* report) override {
+        SD_UNUSED(input);
+        SD_UNUSED(decode_graph);
+        if (report != nullptr) {
+            sd_vae_memory_report_init(report);
+        }
+        return true;
+    }
 
     std::string get_desc() override {
         return "fake_vae";

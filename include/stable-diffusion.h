@@ -233,6 +233,82 @@ typedef struct sd_latent_t {
     void* opaque;
 } sd_latent_t;
 
+enum sd_vae_exec_mode_t {
+    SD_VAE_EXEC_LEGACY_GGML_GRAPH,
+    SD_VAE_EXEC_DIRECT_GRAPH,
+    SD_VAE_EXEC_COMFY_NORMAL,
+    SD_VAE_EXEC_AUTO,
+};
+
+enum sd_vae_dtype_t {
+    SD_VAE_DTYPE_AUTO,
+    SD_VAE_DTYPE_BF16,
+    SD_VAE_DTYPE_F16,
+    SD_VAE_DTYPE_F32,
+};
+
+enum {
+    SD_VAE_API_VERSION = 1,
+};
+
+typedef struct sd_vae_run_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    enum sd_vae_exec_mode_t mode;
+    enum sd_vae_dtype_t storage_dtype;
+    bool fail_on_large_im2col;
+    bool allow_tiling;
+    bool allow_taesd;
+    uint64_t im2col_warn_bytes;
+    uint32_t reserved[8];
+} sd_vae_run_options_t;
+
+typedef struct sd_vae_memory_report_t {
+    uint32_t struct_size;
+    uint32_t version;
+    enum sd_vae_exec_mode_t requested_mode;
+    enum sd_vae_exec_mode_t resolved_mode;
+    enum sd_vae_dtype_t requested_storage_dtype;
+    enum sd_vae_dtype_t resolved_storage_dtype;
+    uint64_t planned_workspace_bytes;
+    uint64_t largest_tensor_bytes;
+    uint64_t estimated_peak_bytes;
+    uint64_t measured_peak_bytes;
+    uint32_t graph_count;
+    uint32_t stage_count;
+    uint32_t stage_boundary_host_copies;
+    uint32_t stage_boundary_device_copies;
+    uint32_t stage_boundary_dtype_promotions;
+    bool used_im2col;
+    bool used_direct_conv;
+    bool used_tiling;
+    bool used_taesd;
+    bool compact_activation_storage;
+    bool device_resident_stages;
+    char largest_tensor_op[32];
+    char largest_tensor_type[16];
+    char largest_tensor_shape[96];
+    char stage_output_dtype[16][16];
+    char stage_output_backend[16][32];
+    char math_dtype_policy[96];
+    char fallback_reason[192];
+    uint32_t reserved[16];
+} sd_vae_memory_report_t;
+
+typedef struct sd_vae_capabilities_t {
+    uint32_t struct_size;
+    uint32_t version;
+    bool supports_comfy_normal;
+    bool supports_device_resident_stages;
+    bool supports_bf16_storage;
+    bool supports_f16_storage;
+    bool supports_normal_encode;
+    bool supports_normal_decode;
+    bool supports_memory_report;
+    bool supports_no_im2col_guard;
+    uint32_t reserved[8];
+} sd_vae_capabilities_t;
+
 typedef struct {
     int* layers;
     size_t layer_count;
@@ -414,6 +490,23 @@ SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
 SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
                                     const sd_latent_t* latent,
                                     const sd_tiling_params_t* vae_tiling_params);
+SD_API void sd_vae_run_options_init(sd_vae_run_options_t* options);
+SD_API void sd_vae_memory_report_init(sd_vae_memory_report_t* report);
+SD_API sd_latent_t* sd_encode_image_normal(sd_ctx_t* sd_ctx,
+                                           const sd_image_t* image,
+                                           const sd_vae_run_options_t* options,
+                                           sd_vae_memory_report_t* report);
+SD_API sd_image_t* sd_decode_latent_normal(sd_ctx_t* sd_ctx,
+                                           const sd_latent_t* latent,
+                                           const sd_vae_run_options_t* options,
+                                           sd_vae_memory_report_t* report);
+SD_API bool sd_estimate_vae_normal_memory(sd_ctx_t* sd_ctx,
+                                          uint32_t width,
+                                          uint32_t height,
+                                          bool decode,
+                                          const sd_vae_run_options_t* options,
+                                          sd_vae_memory_report_t* report);
+SD_API bool sd_get_vae_capabilities(sd_ctx_t* sd_ctx, sd_vae_capabilities_t* capabilities);
 SD_API bool sd_release_clip_model_params(sd_ctx_t* sd_ctx);
 SD_API bool sd_release_diffusion_model_params(sd_ctx_t* sd_ctx);
 SD_API void free_sd_latent(sd_latent_t* latent);

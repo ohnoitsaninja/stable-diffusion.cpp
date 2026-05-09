@@ -2,6 +2,7 @@
 #define __GGML_EXTEND_HPP__
 
 #include <assert.h>
+#include <cstdlib>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <algorithm>
@@ -1688,6 +1689,53 @@ struct GGMLRunner {
 protected:
     typedef std::function<ggml_cgraph*()> get_graph_cb_t;
 
+    struct BackendTensorHandle {
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_tensor* tensor = nullptr;
+
+        BackendTensorHandle() = default;
+        BackendTensorHandle(const BackendTensorHandle&) = delete;
+        BackendTensorHandle& operator=(const BackendTensorHandle&) = delete;
+        BackendTensorHandle(BackendTensorHandle&& other) noexcept {
+            ctx = other.ctx;
+            buffer = other.buffer;
+            tensor = other.tensor;
+            other.ctx = nullptr;
+            other.buffer = nullptr;
+            other.tensor = nullptr;
+        }
+        BackendTensorHandle& operator=(BackendTensorHandle&& other) noexcept {
+            if (this != &other) {
+                reset();
+                ctx = other.ctx;
+                buffer = other.buffer;
+                tensor = other.tensor;
+                other.ctx = nullptr;
+                other.buffer = nullptr;
+                other.tensor = nullptr;
+            }
+            return *this;
+        }
+        ~BackendTensorHandle() {
+            reset();
+        }
+        void reset() {
+            if (buffer != nullptr) {
+                ggml_backend_buffer_free(buffer);
+                buffer = nullptr;
+            }
+            if (ctx != nullptr) {
+                ggml_free(ctx);
+                ctx = nullptr;
+            }
+            tensor = nullptr;
+        }
+        bool empty() const {
+            return tensor == nullptr || buffer == nullptr;
+        }
+    };
+
     ggml_backend_t params_backend  = nullptr;
     ggml_backend_t runtime_backend = nullptr;
 
@@ -1719,6 +1767,7 @@ protected:
     bool conv2d_direct_enabled = false;
     bool circular_x_enabled    = false;
     bool circular_y_enabled    = false;
+    sd_vae_memory_report_t last_graph_report = {};
 
     template <typename T>
     static sd::Tensor<T> take_or_empty(std::optional<sd::Tensor<T>> tensor) {
@@ -1838,12 +1887,207 @@ protected:
         return gf;
     }
 
+    static bool env_flag_enabled(const char* name) {
+        const char* value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }
+
+    static double env_mb_or_default(const char* name, double fallback) {
+        const char* value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0') {
+            return fallback;
+        }
+        char* end = nullptr;
+        double parsed = std::strtod(value, &end);
+        if (end == value || parsed <= 0.0) {
+            return fallback;
+        }
+        return parsed;
+    }
+
+    static std::string ggml_tensor_shape_str(const ggml_tensor* tensor) {
+        if (tensor == nullptr) {
+            return "<null>";
+        }
+        std::ostringstream oss;
+        oss << "[";
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (i != 0) {
+                oss << ",";
+            }
+            oss << tensor->ne[i];
+        }
+        oss << "]";
+        return oss.str();
+    }
+
+    static void copy_report_string(char* dst, size_t dst_size, const std::string& value) {
+        if (dst == nullptr || dst_size == 0) {
+            return;
+        }
+        std::snprintf(dst, dst_size, "%s", value.c_str());
+    }
+
+    static const char* vae_dtype_name(sd_vae_dtype_t dtype) {
+        switch (dtype) {
+            case SD_VAE_DTYPE_BF16:
+                return "bf16";
+            case SD_VAE_DTYPE_F16:
+                return "f16";
+            case SD_VAE_DTYPE_F32:
+                return "f32";
+            case SD_VAE_DTYPE_AUTO:
+            default:
+                return "auto";
+        }
+    }
+
+    void analyze_compute_graph_allocations(ggml_cgraph* gf) {
+        const bool trace_graph = env_flag_enabled("SDCPP_TRACE_GRAPH_ALLOC");
+        const double im2col_warn_mb = env_mb_or_default("SDCPP_IM2COL_WARN_MB", 512.0);
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(runtime_backend);
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        struct node_info {
+            int index;
+            size_t bytes;
+            const ggml_tensor* tensor;
+        };
+        std::vector<node_info> nodes;
+        std::map<std::string, std::pair<int, size_t>> by_op;
+        std::map<std::string, std::pair<int, size_t>> by_type;
+        if (trace_graph) {
+            nodes.reserve(static_cast<size_t>(n_nodes));
+        }
+        node_info largest_im2col{-1, 0, nullptr};
+        node_info largest_tensor{-1, 0, nullptr};
+        bool used_im2col = false;
+
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor* node = ggml_graph_node(gf, i);
+            size_t bytes = 0;
+            if (node != nullptr && node->data == nullptr && node->view_src == nullptr) {
+                bytes = ggml_backend_buft_get_alloc_size(buft, node);
+            }
+            if (trace_graph) {
+                nodes.push_back({i, bytes, node});
+            }
+            if (node != nullptr && node->op == GGML_OP_IM2COL && bytes > largest_im2col.bytes) {
+                largest_im2col = {i, bytes, node};
+            }
+            if (node != nullptr && node->op == GGML_OP_IM2COL) {
+                used_im2col = true;
+            }
+            if (node != nullptr && bytes > largest_tensor.bytes) {
+                largest_tensor = {i, bytes, node};
+            }
+            if (trace_graph && node != nullptr) {
+                auto& op_entry = by_op[ggml_op_name(node->op)];
+                op_entry.first += 1;
+                op_entry.second += bytes;
+                auto& type_entry = by_type[ggml_type_name(node->type)];
+                type_entry.first += 1;
+                type_entry.second += bytes;
+            }
+        }
+
+        last_graph_report = {};
+        last_graph_report.largest_tensor_bytes = largest_tensor.bytes;
+        last_graph_report.graph_count = 1;
+        last_graph_report.stage_count = 1;
+        last_graph_report.used_im2col = used_im2col;
+        last_graph_report.used_direct_conv = conv2d_direct_enabled;
+        last_graph_report.compact_activation_storage = false;
+        last_graph_report.device_resident_stages = false;
+        copy_report_string(last_graph_report.math_dtype_policy,
+                           sizeof(last_graph_report.math_dtype_policy),
+                           "storage=f32 math=f32");
+        copy_report_string(last_graph_report.fallback_reason,
+                           sizeof(last_graph_report.fallback_reason),
+                           "ggml CUDA VAE graph still produces f32 activation tensors for conv/groupnorm/upscale/pointwise ops");
+        if (largest_tensor.tensor != nullptr) {
+            copy_report_string(last_graph_report.largest_tensor_op,
+                               sizeof(last_graph_report.largest_tensor_op),
+                               ggml_op_name(largest_tensor.tensor->op));
+            copy_report_string(last_graph_report.largest_tensor_type,
+                               sizeof(last_graph_report.largest_tensor_type),
+                               ggml_type_name(largest_tensor.tensor->type));
+            copy_report_string(last_graph_report.largest_tensor_shape,
+                               sizeof(last_graph_report.largest_tensor_shape),
+                               ggml_tensor_shape_str(largest_tensor.tensor));
+        }
+
+        const double largest_im2col_mb = largest_im2col.bytes / 1024.0 / 1024.0;
+        if (largest_im2col.tensor != nullptr && largest_im2col_mb > im2col_warn_mb) {
+            const ggml_tensor* t = largest_im2col.tensor;
+            LOG_WARN("%s graph contains oversized IM2COL tensor: %.2fMB threshold=%.2fMB node=%d type=%s shape=%s src0=%s src1=%s; consider VAE conv-direct",
+                     get_desc().c_str(),
+                     largest_im2col_mb,
+                     im2col_warn_mb,
+                     largest_im2col.index,
+                     ggml_type_name(t->type),
+                     ggml_tensor_shape_str(t).c_str(),
+                     t->src[0] ? ggml_tensor_shape_str(t->src[0]).c_str() : "<none>",
+                     t->src[1] ? ggml_tensor_shape_str(t->src[1]).c_str() : "<none>");
+        }
+
+        if (!trace_graph) {
+            return;
+        }
+
+        std::sort(nodes.begin(), nodes.end(), [](const node_info& a, const node_info& b) {
+            return a.bytes > b.bytes;
+        });
+
+        LOG_INFO("%s graph allocation trace: nodes=%d backend=%s",
+                 get_desc().c_str(),
+                 n_nodes,
+                 ggml_backend_name(runtime_backend));
+
+        int printed = 0;
+        for (const auto& info : nodes) {
+            if (info.tensor == nullptr || info.bytes == 0 || printed >= 30) {
+                continue;
+            }
+            const ggml_tensor* t = info.tensor;
+            LOG_INFO("graph top tensor #%d bytes=%.2fMB op=%s type=%s shape=%s name=%s src0=%s:%s src1=%s:%s",
+                     info.index,
+                     info.bytes / 1024.0 / 1024.0,
+                     ggml_op_name(t->op),
+                     ggml_type_name(t->type),
+                     ggml_tensor_shape_str(t).c_str(),
+                     t->name,
+                     t->src[0] ? ggml_op_name(t->src[0]->op) : "<none>",
+                     t->src[0] ? ggml_tensor_shape_str(t->src[0]).c_str() : "<none>",
+                     t->src[1] ? ggml_op_name(t->src[1]->op) : "<none>",
+                     t->src[1] ? ggml_tensor_shape_str(t->src[1]).c_str() : "<none>");
+            printed += 1;
+        }
+
+        auto print_groups = [](const char* label, const std::map<std::string, std::pair<int, size_t>>& groups) {
+            std::vector<std::pair<std::string, std::pair<int, size_t>>> sorted(groups.begin(), groups.end());
+            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+                return a.second.second > b.second.second;
+            });
+            for (const auto& kv : sorted) {
+                LOG_INFO("graph by %s %s=%s count=%d bytes=%.2fMB",
+                         label,
+                         label,
+                         kv.first.c_str(),
+                         kv.second.first,
+                         kv.second.second / 1024.0 / 1024.0);
+            }
+        };
+        print_groups("op", by_op);
+        print_groups("type", by_type);
+    }
+
     bool alloc_compute_buffer(get_graph_cb_t get_graph) {
         if (compute_allocr != nullptr) {
             return true;
         }
         reset_compute_ctx();
         ggml_cgraph* gf = get_compute_graph(get_graph);
+        analyze_compute_graph_allocations(gf);
         backend_tensor_data_map.clear();
         compute_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(runtime_backend));
 
@@ -1856,10 +2100,18 @@ protected:
 
         // compute the required memory
         size_t compute_buffer_size = ggml_gallocr_get_buffer_size(compute_allocr, 0);
+        last_graph_report.planned_workspace_bytes = compute_buffer_size;
+        last_graph_report.estimated_peak_bytes = compute_buffer_size + get_params_buffer_size();
         LOG_DEBUG("%s compute buffer size: %.2f MB(%s)",
                   get_desc().c_str(),
                   compute_buffer_size / 1024.0 / 1024.0,
                   ggml_backend_is_cpu(runtime_backend) ? "RAM" : "VRAM");
+        if (env_flag_enabled("SDCPP_TRACE_GRAPH_ALLOC")) {
+            LOG_INFO("%s graph planned live buffer: %.2fMB(%s)",
+                     get_desc().c_str(),
+                     compute_buffer_size / 1024.0 / 1024.0,
+                     ggml_backend_is_cpu(runtime_backend) ? "RAM" : "VRAM");
+        }
         return true;
     }
 
@@ -2123,6 +2375,31 @@ public:
         }
     }
 
+    std::unique_ptr<BackendTensorHandle> copy_tensor_to_backend_handle(ggml_tensor* src, const char* name) {
+        if (src == nullptr) {
+            return nullptr;
+        }
+        auto handle = std::make_unique<BackendTensorHandle>();
+        ggml_init_params params;
+        params.mem_size   = static_cast<size_t>(MAX_PARAMS_TENSOR_NUM * ggml_tensor_overhead());
+        params.mem_buffer = nullptr;
+        params.no_alloc   = true;
+        handle->ctx       = ggml_init(params);
+        GGML_ASSERT(handle->ctx != nullptr);
+        handle->tensor = ggml_dup_tensor(handle->ctx, src);
+        if (name != nullptr) {
+            ggml_set_name(handle->tensor, name);
+        }
+        handle->buffer = ggml_backend_alloc_ctx_tensors(handle->ctx, runtime_backend);
+        if (handle->buffer == nullptr) {
+            LOG_ERROR("%s alloc backend tensor handle failed", get_desc().c_str());
+            return nullptr;
+        }
+        ggml_backend_tensor_copy(src, handle->tensor);
+        ggml_backend_synchronize(runtime_backend);
+        return handle;
+    }
+
     void cache(const std::string name, ggml_tensor* tensor) {
         cache_tensor_map[name] = tensor;
     }
@@ -2176,6 +2453,48 @@ public:
         return output;
     }
 
+    template <typename T>
+    std::optional<sd::Tensor<T>> materialize_backend_tensor(const BackendTensorHandle* handle,
+                                                            size_t expected_dim) {
+        if (handle == nullptr || handle->empty()) {
+            return std::nullopt;
+        }
+        return restore_trailing_singleton_dims(sd::make_sd_tensor_from_ggml<T>(handle->tensor), expected_dim);
+    }
+
+    std::unique_ptr<BackendTensorHandle> compute_to_backend_handle(get_graph_cb_t get_graph,
+                                                                   int n_threads,
+                                                                   const char* output_name) {
+        if (!offload_params_to_runtime_backend()) {
+            LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
+            return nullptr;
+        }
+        if (!alloc_compute_buffer(get_graph)) {
+            LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
+            return nullptr;
+        }
+        reset_compute_ctx();
+        ggml_cgraph* gf = get_compute_graph(get_graph);
+        if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
+            LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
+            return nullptr;
+        }
+        copy_data_to_backend_tensor();
+        if (ggml_backend_is_cpu(runtime_backend)) {
+            ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
+        }
+
+        ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+            return nullptr;
+        }
+        auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());
+        auto output = copy_tensor_to_backend_handle(result, output_name);
+        free_compute_buffer();
+        return output;
+    }
+
     void set_flash_attention_enabled(bool enabled) {
         flash_attn_enabled = enabled;
     }
@@ -2191,6 +2510,10 @@ public:
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {
         weight_adapter = adapter;
+    }
+
+    sd_vae_memory_report_t get_last_graph_report() const {
+        return last_graph_report;
     }
 };
 

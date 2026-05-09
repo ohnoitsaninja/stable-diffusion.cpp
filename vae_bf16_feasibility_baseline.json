@@ -1,0 +1,45 @@
+{
+  "trace_files": {
+    "encode_stdout": "C:/tmp/stable-diffusion.cpp-paralol/build/vae-bf16-feasibility/encode_trace.out.log",
+    "encode_stderr": "C:/tmp/stable-diffusion.cpp-paralol/build/vae-bf16-feasibility/encode_trace.err.log",
+    "decode_stdout": "C:/tmp/stable-diffusion.cpp-paralol/build/vae-bf16-feasibility/decode_trace.out.log",
+    "decode_stderr": "C:/tmp/stable-diffusion.cpp-paralol/build/vae-bf16-feasibility/decode_trace.err.log"
+  },
+  "stderr_empty": true,
+  "aborted_wrapper_files": {
+    "encode_nvml_csv": "C:/tmp/stable-diffusion.cpp-paralol/build/vae-bf16-feasibility/encode_nvml.csv",
+    "usable": false,
+    "reason": "The stalled wrapper produced empty stdout/stderr and sampled idle VRAM for about 899 seconds."
+  },
+  "encode": {
+    "planned_workspace_mb": 1536,
+    "stage_count": 6,
+    "graph_count": 6,
+    "used_im2col": false,
+    "stage_boundary_host_copies": 0,
+    "stages": [
+      {"stage": 0, "planned_mb": 524, "f32_mb": 1036},
+      {"stage": 1, "planned_mb": 1536, "f32_mb": 10498},
+      {"stage": 2, "planned_mb": 896, "f32_mb": 5634},
+      {"stage": 3, "planned_mb": 448, "f32_mb": 2818},
+      {"stage": 4, "planned_mb": 96, "f32_mb": 576},
+      {"stage": 5, "planned_mb": 1184, "f32_mb": 2306.5}
+    ]
+  },
+  "decode": {
+    "planned_workspace_mb": 2816,
+    "stage_count": 6,
+    "graph_count": 6,
+    "used_im2col": false,
+    "stage_boundary_host_copies": 0,
+    "stages": [
+      {"stage": 0, "planned_mb": 1184.25, "f32_mb": 2305},
+      {"stage": 1, "planned_mb": 288, "f32_mb": 1376},
+      {"stage": 2, "planned_mb": 1152, "f32_mb": 5504},
+      {"stage": 3, "planned_mb": 2816, "f32_mb": 12544},
+      {"stage": 4, "planned_mb": 2048, "f32_mb": 16896},
+      {"stage": 5, "planned_mb": 1024, "f32_mb": 1048}
+    ]
+  }
+}
+

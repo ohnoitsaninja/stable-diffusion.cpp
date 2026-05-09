@@ -242,6 +242,11 @@ public:
         }
     }
 
+    static bool env_flag_enabled(const char* name) {
+        const char* value = getenv(name);
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }
+
     bool init(const sd_ctx_params_t* sd_ctx_params) {
         n_threads               = sd_ctx_params->n_threads;
         vae_decode_only         = sd_ctx_params->vae_decode_only;
@@ -690,7 +695,16 @@ public:
                 }
             }
 
-            if (sd_ctx_params->vae_conv_direct) {
+            bool use_vae_conv_direct = sd_ctx_params->vae_conv_direct;
+#ifdef SD_USE_CUDA
+            if (!use_vae_conv_direct &&
+                sd_version_is_sdxl(version) &&
+                !env_flag_enabled("SDCPP_DISABLE_DEFAULT_VAE_CONV_DIRECT")) {
+                use_vae_conv_direct = true;
+                LOG_INFO("Defaulting to Conv2d direct in the SDXL VAE on CUDA; set SDCPP_DISABLE_DEFAULT_VAE_CONV_DIRECT=1 to use the im2col path");
+            }
+#endif
+            if (use_vae_conv_direct) {
                 LOG_INFO("Using Conv2d direct in the vae model");
                 first_stage_model->set_conv2d_direct_enabled(true);
                 if (preview_vae) {
@@ -3264,6 +3278,245 @@ static sd_latent_t* make_sd_latent(sd::Tensor<float>&& tensor) {
     return latent;
 }
 
+static uint64_t default_im2col_warn_bytes() {
+    return 512ull * 1024ull * 1024ull;
+}
+
+static sd_vae_run_options_t effective_vae_options(const sd_vae_run_options_t* options) {
+    sd_vae_run_options_t effective;
+    sd_vae_run_options_init(&effective);
+    if (options != nullptr) {
+        effective = *options;
+    }
+    if (effective.struct_size == 0) {
+        effective.struct_size = sizeof(sd_vae_run_options_t);
+    }
+    if (effective.version == 0) {
+        effective.version = SD_VAE_API_VERSION;
+    }
+    if (effective.im2col_warn_bytes == 0) {
+        effective.im2col_warn_bytes = default_im2col_warn_bytes();
+    }
+    const char* dtype_env = getenv("SDCPP_VAE_DTYPE");
+    if (dtype_env != nullptr && dtype_env[0] != '\0' && effective.storage_dtype == SD_VAE_DTYPE_AUTO) {
+        std::string dtype_str(dtype_env);
+        if (dtype_str == "bf16") {
+            effective.storage_dtype = SD_VAE_DTYPE_BF16;
+        } else if (dtype_str == "f16") {
+            effective.storage_dtype = SD_VAE_DTYPE_F16;
+        } else if (dtype_str == "f32") {
+            effective.storage_dtype = SD_VAE_DTYPE_F32;
+        } else {
+            effective.storage_dtype = SD_VAE_DTYPE_AUTO;
+        }
+    }
+    return effective;
+}
+
+static const char* sd_vae_exec_mode_name(enum sd_vae_exec_mode_t mode) {
+    switch (mode) {
+        case SD_VAE_EXEC_LEGACY_GGML_GRAPH:
+            return "legacy_ggml_graph";
+        case SD_VAE_EXEC_DIRECT_GRAPH:
+            return "direct_graph";
+        case SD_VAE_EXEC_COMFY_NORMAL:
+            return "comfy_normal";
+        case SD_VAE_EXEC_AUTO:
+        default:
+            return "auto";
+    }
+}
+
+static const char* sd_vae_dtype_name(enum sd_vae_dtype_t dtype) {
+    switch (dtype) {
+        case SD_VAE_DTYPE_BF16:
+            return "bf16";
+        case SD_VAE_DTYPE_F16:
+            return "f16";
+        case SD_VAE_DTYPE_F32:
+            return "f32";
+        case SD_VAE_DTYPE_AUTO:
+        default:
+            return "auto";
+    }
+}
+
+static sd_vae_dtype_t resolve_vae_storage_dtype(const sd_vae_run_options_t& options,
+                                                sd_vae_exec_mode_t resolved_mode,
+                                                std::string* fallback_reason) {
+    if (resolved_mode != SD_VAE_EXEC_COMFY_NORMAL) {
+        if (fallback_reason != nullptr) {
+            *fallback_reason = "dtype policy only applies to COMFY_NORMAL";
+        }
+        return SD_VAE_DTYPE_F32;
+    }
+    if (fallback_reason != nullptr) {
+        *fallback_reason = "f32 fallback: CUDA group_norm/upscale are f32-only; direct conv follows f32 input; pointwise graph stores f32";
+    }
+    return SD_VAE_DTYPE_F32;
+}
+
+static sd_vae_exec_mode_t resolve_vae_exec_mode(StableDiffusionGGML* sd, sd_vae_exec_mode_t requested) {
+    if (requested != SD_VAE_EXEC_AUTO) {
+        return requested;
+    }
+    if (StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_COMFY_NORMAL_VAE")) {
+        return SD_VAE_EXEC_DIRECT_GRAPH;
+    }
+#ifdef SD_USE_CUDA
+    if (sd != nullptr && sd_version_is_sdxl(sd->version)) {
+        return SD_VAE_EXEC_COMFY_NORMAL;
+    }
+#endif
+    return SD_VAE_EXEC_DIRECT_GRAPH;
+}
+
+static void log_vae_report(const char* operation, const sd_vae_memory_report_t& report) {
+    LOG_INFO("[VAE] %s report: requested_mode=%s resolved_mode=%s direct_conv=%s tiled=%s taesd=%s im2col=%s stages=%u graphs=%u host_copies=%u device_copies=%u planned=%.2fMB requested_dtype=%s resolved_dtype=%s fallback=\"%s\"",
+             operation,
+             sd_vae_exec_mode_name(report.requested_mode),
+             sd_vae_exec_mode_name(report.resolved_mode),
+             report.used_direct_conv ? "true" : "false",
+             report.used_tiling ? "true" : "false",
+             report.used_taesd ? "true" : "false",
+             report.used_im2col ? "true" : "false",
+             report.stage_count,
+             report.graph_count,
+             report.stage_boundary_host_copies,
+             report.stage_boundary_device_copies,
+             report.planned_workspace_bytes / 1024.0 / 1024.0,
+             sd_vae_dtype_name(report.requested_storage_dtype),
+             sd_vae_dtype_name(report.resolved_storage_dtype),
+             report.fallback_reason);
+}
+
+static void copy_vae_report(sd_vae_memory_report_t* report,
+                            const sd_vae_memory_report_t& graph_report,
+                            const sd_vae_run_options_t& options,
+                            sd_vae_exec_mode_t resolved_mode,
+                            bool used_tiling,
+                            bool used_taesd) {
+    if (report == nullptr) {
+        return;
+    }
+    *report = graph_report;
+    report->struct_size = sizeof(sd_vae_memory_report_t);
+    report->version = SD_VAE_API_VERSION;
+    report->requested_mode = options.mode;
+    report->resolved_mode = resolved_mode;
+    report->requested_storage_dtype = options.storage_dtype;
+    std::string fallback_reason;
+    report->resolved_storage_dtype = resolve_vae_storage_dtype(options, resolved_mode, &fallback_reason);
+    report->used_tiling = used_tiling;
+    report->used_taesd = used_taesd;
+    snprintf(report->math_dtype_policy,
+             sizeof(report->math_dtype_policy),
+             "storage=%s math=f32 reductions=f32",
+             sd_vae_dtype_name(report->resolved_storage_dtype));
+    snprintf(report->fallback_reason,
+             sizeof(report->fallback_reason),
+             "%s",
+             fallback_reason.c_str());
+    if (resolved_mode == SD_VAE_EXEC_COMFY_NORMAL) {
+        report->used_direct_conv = true;
+    }
+}
+
+static bool vae_report_large_im2col_disallowed(const sd_vae_memory_report_t& report,
+                                               const sd_vae_run_options_t& options) {
+    if (!options.fail_on_large_im2col || !report.used_im2col) {
+        return false;
+    }
+    uint64_t threshold = options.im2col_warn_bytes == 0 ? default_im2col_warn_bytes() : options.im2col_warn_bytes;
+    return report.largest_tensor_bytes > threshold;
+}
+
+static bool strict_comfy_normal_enabled() {
+    return StableDiffusionGGML::env_flag_enabled("SDCPP_VAE_STRICT_COMFY_NORMAL");
+}
+
+static bool vae_report_comfy_guard_failed(const sd_vae_memory_report_t& report,
+                                          sd_vae_exec_mode_t resolved_mode) {
+    if (resolved_mode != SD_VAE_EXEC_COMFY_NORMAL) {
+        return false;
+    }
+    bool failed = false;
+    const bool strict = strict_comfy_normal_enabled();
+    const uint64_t staged_decode_baseline = 3072ull * 1024ull * 1024ull;
+    const uint64_t allowed_workspace = staged_decode_baseline + staged_decode_baseline / 10;
+    auto guard_log = [&](const char* message) {
+        if (strict) {
+            LOG_ERROR("%s", message);
+            failed = true;
+        } else {
+            LOG_WARN("%s", message);
+        }
+    };
+
+    if (report.used_im2col) {
+        LOG_ERROR("COMFY_NORMAL VAE created IM2COL; this path is forbidden");
+        failed = true;
+    }
+    if (report.used_tiling) {
+        LOG_ERROR("COMFY_NORMAL VAE entered tiled VAE path; this path is forbidden");
+        failed = true;
+    }
+    if (report.used_taesd) {
+        LOG_ERROR("COMFY_NORMAL VAE entered TAESD path; this path is forbidden");
+        failed = true;
+    }
+    if (report.stage_boundary_host_copies > 0) {
+        guard_log("COMFY_NORMAL VAE had device-host stage boundary copies");
+    }
+    if (!report.device_resident_stages) {
+        guard_log("COMFY_NORMAL VAE stages were not device resident");
+    }
+    if (report.planned_workspace_bytes > allowed_workspace) {
+        guard_log("COMFY_NORMAL VAE planned workspace regressed above staged baseline +10%");
+    }
+    if (report.requested_storage_dtype != SD_VAE_DTYPE_AUTO &&
+        report.requested_storage_dtype != report.resolved_storage_dtype) {
+        guard_log("COMFY_NORMAL VAE compact storage dtype request fell back; see fallback_reason in report");
+    }
+    return failed;
+}
+
+static bool prepare_normal_vae_run(sd_ctx_t* sd_ctx,
+                                   const sd_vae_run_options_t& options,
+                                   sd_vae_exec_mode_t* resolved_mode,
+                                   bool* used_taesd) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_ctx->sd->first_stage_model == nullptr) {
+        LOG_ERROR("normal VAE requires a loaded VAE");
+        return false;
+    }
+    *resolved_mode = resolve_vae_exec_mode(sd_ctx->sd, options.mode);
+    *used_taesd = sd_ctx->sd->first_stage_model->get_desc() == "taesd" ||
+                  sd_ctx->sd->first_stage_model->get_desc() == "taehv";
+    if (*used_taesd && !options.allow_taesd) {
+        LOG_ERROR("normal VAE run refuses TAESD/TAEHV; recreate the context with the full checkpoint VAE or set allow_taesd for diagnostics");
+        return false;
+    }
+    sd_ctx->sd->vae_tiling_params = {false, 0, 0, 0.5f, 0, 0};
+    if (*resolved_mode == SD_VAE_EXEC_LEGACY_GGML_GRAPH) {
+        sd_ctx->sd->first_stage_model->set_comfy_normal_enabled(false);
+        sd_ctx->sd->first_stage_model->set_conv2d_direct_enabled(false);
+        LOG_WARN("normal VAE using legacy ggml graph compatibility mode; SDXL may allocate oversized IM2COL tensors");
+    } else if (*resolved_mode == SD_VAE_EXEC_COMFY_NORMAL) {
+        sd_ctx->sd->first_stage_model->set_comfy_normal_enabled(true);
+        sd_ctx->sd->first_stage_model->set_conv2d_direct_enabled(true);
+        std::string fallback_reason;
+        sd_vae_dtype_t resolved_dtype = resolve_vae_storage_dtype(options, *resolved_mode, &fallback_reason);
+        LOG_INFO("[VAE] COMFY_NORMAL dtype policy: requested=%s resolved=%s math=f32 fallback=\"%s\"",
+                 sd_vae_dtype_name(options.storage_dtype),
+                 sd_vae_dtype_name(resolved_dtype),
+                 fallback_reason.c_str());
+    } else {
+        sd_ctx->sd->first_stage_model->set_comfy_normal_enabled(false);
+        sd_ctx->sd->first_stage_model->set_conv2d_direct_enabled(true);
+    }
+    return true;
+}
+
 static bool validate_init_latent_shape(sd_ctx_t* sd_ctx,
                                        const GenerationRequest& request,
                                        const sd::Tensor<float>& init_latent) {
@@ -3413,6 +3666,9 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
 SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
                                     const sd_image_t* image,
                                     const sd_tiling_params_t* vae_tiling_params) {
+    if (vae_tiling_params == nullptr || !vae_tiling_params->enabled) {
+        return sd_encode_image_normal(sd_ctx, image, nullptr, nullptr);
+    }
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image == nullptr || image->data == nullptr) {
         return nullptr;
     }
@@ -3437,6 +3693,101 @@ SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
         LOG_ERROR("sd_encode_image failed");
         return nullptr;
     }
+    return make_sd_latent(std::move(latent));
+}
+
+SD_API void sd_vae_run_options_init(sd_vae_run_options_t* options) {
+    if (options == nullptr) {
+        return;
+    }
+    *options = {};
+    options->struct_size = sizeof(sd_vae_run_options_t);
+    options->version = SD_VAE_API_VERSION;
+    options->mode = SD_VAE_EXEC_AUTO;
+    options->storage_dtype = SD_VAE_DTYPE_AUTO;
+    options->fail_on_large_im2col = true;
+    options->allow_tiling = false;
+    options->allow_taesd = false;
+    options->im2col_warn_bytes = default_im2col_warn_bytes();
+}
+
+SD_API void sd_vae_memory_report_init(sd_vae_memory_report_t* report) {
+    if (report == nullptr) {
+        return;
+    }
+    *report = {};
+    report->struct_size = sizeof(sd_vae_memory_report_t);
+    report->version = SD_VAE_API_VERSION;
+    report->requested_mode = SD_VAE_EXEC_AUTO;
+    report->resolved_mode = SD_VAE_EXEC_AUTO;
+    report->requested_storage_dtype = SD_VAE_DTYPE_AUTO;
+    report->resolved_storage_dtype = SD_VAE_DTYPE_AUTO;
+}
+
+SD_API sd_latent_t* sd_encode_image_normal(sd_ctx_t* sd_ctx,
+                                           const sd_image_t* image,
+                                           const sd_vae_run_options_t* options,
+                                           sd_vae_memory_report_t* report) {
+    if (report != nullptr) {
+        sd_vae_memory_report_init(report);
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image == nullptr || image->data == nullptr) {
+        return nullptr;
+    }
+    if (sd_ctx->sd->vae_decode_only) {
+        LOG_ERROR("sd_encode_image_normal requires a VAE encode-capable context; recreate with vae_decode_only=false");
+        return nullptr;
+    }
+
+    sd_vae_run_options_t effective = effective_vae_options(options);
+    sd_vae_exec_mode_t resolved_mode = SD_VAE_EXEC_AUTO;
+    bool used_taesd = false;
+    if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
+        return nullptr;
+    }
+
+    int64_t t0 = ggml_time_ms();
+    sd::Tensor<float> image_tensor = sd_image_to_tensor(*image);
+    auto vae_output = sd_ctx->sd->first_stage_model->encode(sd_ctx->sd->n_threads,
+                                                            image_tensor,
+                                                            sd_ctx->sd->vae_tiling_params,
+                                                            sd_ctx->sd->circular_x,
+                                                            sd_ctx->sd->circular_y);
+    if (vae_output.empty()) {
+        LOG_ERROR("sd_encode_image_normal failed during VAE encode");
+        return nullptr;
+    }
+    sd_vae_memory_report_t graph_report = sd_ctx->sd->first_stage_model->get_last_graph_report();
+    sd_vae_memory_report_t full_report;
+    sd_vae_memory_report_init(&full_report);
+    copy_vae_report(&full_report, graph_report, effective, resolved_mode, false, used_taesd);
+    log_vae_report("encode", full_report);
+    if (report != nullptr) {
+        *report = full_report;
+    }
+    if (vae_report_large_im2col_disallowed(graph_report, effective)) {
+        LOG_ERROR("sd_encode_image_normal refused oversized IM2COL tensor: largest=%" PRIu64 " threshold=%" PRIu64,
+                  graph_report.largest_tensor_bytes,
+                  effective.im2col_warn_bytes);
+        return nullptr;
+    }
+    if (vae_report_comfy_guard_failed(full_report, resolved_mode)) {
+        return nullptr;
+    }
+
+    sd::Tensor<float> latent = sd_ctx->sd->first_stage_model->vae_output_to_latents(vae_output, sd_ctx->sd->rng);
+    if (sd_ctx->sd->version != VERSION_SD1_PIX2PIX) {
+        latent = sd_ctx->sd->first_stage_model->vae_to_diffusion_latents(latent);
+    }
+    if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
+        sd_ctx->sd->first_stage_model->free_params_buffer();
+    }
+    if (latent.empty()) {
+        LOG_ERROR("sd_encode_image_normal failed");
+        return nullptr;
+    }
+    int64_t t1 = ggml_time_ms();
+    LOG_INFO("sd_encode_image_normal completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
     return make_sd_latent(std::move(latent));
 }
 
@@ -3556,6 +3907,9 @@ SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
 SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
                                     const sd_latent_t* latent,
                                     const sd_tiling_params_t* vae_tiling_params) {
+    if (vae_tiling_params == nullptr || !vae_tiling_params->enabled) {
+        return sd_decode_latent_normal(sd_ctx, latent, nullptr, nullptr);
+    }
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
         return nullptr;
     }
@@ -3592,6 +3946,157 @@ SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
     }
     *result = output;
     return result;
+}
+
+SD_API sd_image_t* sd_decode_latent_normal(sd_ctx_t* sd_ctx,
+                                           const sd_latent_t* latent,
+                                           const sd_vae_run_options_t* options,
+                                           sd_vae_memory_report_t* report) {
+    if (report != nullptr) {
+        sd_vae_memory_report_init(report);
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return nullptr;
+    }
+    const sd::Tensor<float>* tensor = sd_latent_tensor(latent);
+    if (tensor == nullptr) {
+        LOG_ERROR("sd_decode_latent_normal received an invalid latent");
+        return nullptr;
+    }
+
+    sd_vae_run_options_t effective = effective_vae_options(options);
+    sd_vae_exec_mode_t resolved_mode = SD_VAE_EXEC_AUTO;
+    bool used_taesd = false;
+    if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
+        return nullptr;
+    }
+
+    int64_t t0 = ggml_time_ms();
+    sd::Tensor<float> vae_latent = sd_ctx->sd->first_stage_model->diffusion_to_vae_latents(*tensor);
+    sd::Tensor<float> image = sd_ctx->sd->first_stage_model->decode(sd_ctx->sd->n_threads,
+                                                                    vae_latent,
+                                                                    sd_ctx->sd->vae_tiling_params,
+                                                                    false,
+                                                                    sd_ctx->sd->circular_x,
+                                                                    sd_ctx->sd->circular_y);
+    int64_t t1 = ggml_time_ms();
+    sd_vae_memory_report_t graph_report = sd_ctx->sd->first_stage_model->get_last_graph_report();
+    sd_vae_memory_report_t full_report;
+    sd_vae_memory_report_init(&full_report);
+    copy_vae_report(&full_report, graph_report, effective, resolved_mode, false, used_taesd);
+    log_vae_report("decode", full_report);
+    if (report != nullptr) {
+        *report = full_report;
+    }
+    if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
+        sd_ctx->sd->first_stage_model->free_params_buffer();
+    }
+    if (vae_report_large_im2col_disallowed(graph_report, effective)) {
+        LOG_ERROR("sd_decode_latent_normal refused oversized IM2COL tensor: largest=%" PRIu64 " threshold=%" PRIu64,
+                  graph_report.largest_tensor_bytes,
+                  effective.im2col_warn_bytes);
+        return nullptr;
+    }
+    if (vae_report_comfy_guard_failed(full_report, resolved_mode)) {
+        return nullptr;
+    }
+    if (image.empty()) {
+        LOG_ERROR("sd_decode_latent_normal failed after %.2fs", (t1 - t0) * 1.0f / 1000);
+        return nullptr;
+    }
+    LOG_INFO("sd_decode_latent_normal completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+
+    sd_image_t output = tensor_to_sd_image(image);
+    sd_image_t* result = static_cast<sd_image_t*>(calloc(1, sizeof(sd_image_t)));
+    if (result == nullptr) {
+        free(output.data);
+        return nullptr;
+    }
+    *result = output;
+    return result;
+}
+
+SD_API bool sd_estimate_vae_normal_memory(sd_ctx_t* sd_ctx,
+                                          uint32_t width,
+                                          uint32_t height,
+                                          bool decode,
+                                          const sd_vae_run_options_t* options,
+                                          sd_vae_memory_report_t* report) {
+    if (report != nullptr) {
+        sd_vae_memory_report_init(report);
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || width == 0 || height == 0) {
+        return false;
+    }
+    sd_vae_run_options_t effective = effective_vae_options(options);
+    sd_vae_exec_mode_t resolved_mode = SD_VAE_EXEC_AUTO;
+    bool used_taesd = false;
+    if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
+        return false;
+    }
+
+    sd::Tensor<float> input;
+    if (decode) {
+        int scale_factor = sd_ctx->sd->first_stage_model->get_scale_factor();
+        if (scale_factor <= 0 || width % static_cast<uint32_t>(scale_factor) != 0 || height % static_cast<uint32_t>(scale_factor) != 0) {
+            LOG_ERROR("sd_estimate_vae_normal_memory decode dimensions must be divisible by VAE scale factor %d", scale_factor);
+            return false;
+        }
+        input = sd::zeros<float>({static_cast<int64_t>(width / scale_factor),
+                                  static_cast<int64_t>(height / scale_factor),
+                                  4,
+                                  1});
+        input = sd_ctx->sd->first_stage_model->diffusion_to_vae_latents(input);
+    } else {
+        input = sd::zeros<float>({static_cast<int64_t>(width),
+                                  static_cast<int64_t>(height),
+                                  3,
+                                  1});
+    }
+
+    sd_vae_memory_report_t graph_report;
+    sd_vae_memory_report_init(&graph_report);
+    if (!sd_ctx->sd->first_stage_model->estimate_memory_report(input, decode, &graph_report)) {
+        return false;
+    }
+    sd_vae_memory_report_t full_report;
+    sd_vae_memory_report_init(&full_report);
+    copy_vae_report(&full_report, graph_report, effective, resolved_mode, false, used_taesd);
+    log_vae_report(decode ? "estimate_decode" : "estimate_encode", full_report);
+    if (report != nullptr) {
+        *report = full_report;
+    }
+    if (vae_report_large_im2col_disallowed(graph_report, effective)) {
+        LOG_ERROR("sd_estimate_vae_normal_memory refused oversized IM2COL tensor: largest=%" PRIu64 " threshold=%" PRIu64,
+                  graph_report.largest_tensor_bytes,
+                  effective.im2col_warn_bytes);
+        return false;
+    }
+    if (vae_report_comfy_guard_failed(full_report, resolved_mode)) {
+        return false;
+    }
+    return true;
+}
+
+SD_API bool sd_get_vae_capabilities(sd_ctx_t* sd_ctx, sd_vae_capabilities_t* capabilities) {
+    if (capabilities == nullptr) {
+        return false;
+    }
+    *capabilities = {};
+    capabilities->struct_size = sizeof(sd_vae_capabilities_t);
+    capabilities->version = SD_VAE_API_VERSION;
+    capabilities->supports_comfy_normal = true;
+    capabilities->supports_device_resident_stages = true;
+    capabilities->supports_bf16_storage = false;
+    capabilities->supports_f16_storage = false;
+    capabilities->supports_normal_encode = true;
+    capabilities->supports_normal_decode = true;
+    capabilities->supports_memory_report = true;
+    capabilities->supports_no_im2col_guard = true;
+    if (sd_ctx != nullptr && sd_ctx->sd != nullptr && !sd_version_is_sdxl(sd_ctx->sd->version)) {
+        capabilities->supports_comfy_normal = false;
+    }
+    return true;
 }
 
 SD_API bool sd_release_clip_model_params(sd_ctx_t* sd_ctx) {

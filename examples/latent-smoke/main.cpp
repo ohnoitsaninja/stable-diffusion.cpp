@@ -18,6 +18,9 @@ struct Args {
     bool sample        = false;
     bool decode        = true;
     bool split_decode_context = false;
+    bool vae_conv_direct = false;
+    bool disable_default_vae_conv_direct = false;
+    bool type_f16 = false;
 };
 
 static void usage(const char* argv0) {
@@ -28,6 +31,9 @@ static void usage(const char* argv0) {
         << "  --image-channels <3|4>   channel count to load and pass into sd_encode_image (default: 4)\n"
         << "  --width <int>            optional target width for sample/decode path\n"
         << "  --height <int>           optional target height for sample/decode path\n"
+        << "  --vae-conv-direct        enable direct VAE convolution\n"
+        << "  --disable-default-vae-conv-direct disable CUDA SDXL default direct VAE convolution\n"
+        << "  --type-f16               request f16 model tensor conversion\n"
         << "  --sample                 run sd_sample_latent after encode\n"
         << "  --split-decode-context   decode with a separate vae_decode_only=true context\n"
         << "  --no-decode              skip sd_decode_latent\n";
@@ -68,6 +74,12 @@ static bool parse_args(int argc, char** argv, Args& args) {
             const char* value = need_value("--height");
             if (value == nullptr) return false;
             args.height = std::atoi(value);
+        } else if (arg == "--vae-conv-direct") {
+            args.vae_conv_direct = true;
+        } else if (arg == "--disable-default-vae-conv-direct") {
+            args.disable_default_vae_conv_direct = true;
+        } else if (arg == "--type-f16") {
+            args.type_f16 = true;
         } else if (arg == "--sample") {
             args.sample = true;
         } else if (arg == "--split-decode-context") {
@@ -90,19 +102,90 @@ static bool parse_args(int argc, char** argv, Args& args) {
     return true;
 }
 
+static void set_env_value(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 static sd_ctx_t* create_context(const Args& args, bool vae_decode_only) {
     sd_ctx_params_t ctx_params;
     sd_ctx_params_init(&ctx_params);
     ctx_params.model_path            = args.model.c_str();
     ctx_params.vae_decode_only       = vae_decode_only;
     ctx_params.diffusion_flash_attn  = true;
-    ctx_params.vae_conv_direct       = true;
+    ctx_params.vae_conv_direct       = args.vae_conv_direct;
+    ctx_params.wtype                 = args.type_f16 ? SD_TYPE_F16 : SD_TYPE_COUNT;
     ctx_params.offload_params_to_cpu = false;
     ctx_params.keep_clip_on_cpu      = false;
     ctx_params.keep_vae_on_cpu       = false;
 
     std::cout << "creating context vae_decode_only=" << (vae_decode_only ? "true" : "false") << "\n";
     return new_sd_ctx(&ctx_params);
+}
+
+static const char* vae_exec_mode_name(sd_vae_exec_mode_t mode) {
+    switch (mode) {
+        case SD_VAE_EXEC_LEGACY_GGML_GRAPH:
+            return "legacy_ggml_graph";
+        case SD_VAE_EXEC_DIRECT_GRAPH:
+            return "direct_graph";
+        case SD_VAE_EXEC_COMFY_NORMAL:
+            return "comfy_normal";
+        case SD_VAE_EXEC_AUTO:
+            return "auto";
+        default:
+            return "unknown";
+    }
+}
+
+static const char* vae_dtype_name(sd_vae_dtype_t dtype) {
+    switch (dtype) {
+        case SD_VAE_DTYPE_BF16:
+            return "bf16";
+        case SD_VAE_DTYPE_F16:
+            return "f16";
+        case SD_VAE_DTYPE_F32:
+            return "f32";
+        case SD_VAE_DTYPE_AUTO:
+        default:
+            return "auto";
+    }
+}
+
+static void print_vae_report(const char* label, const sd_vae_memory_report_t& report) {
+    std::cout << label
+              << " requested=" << vae_exec_mode_name(report.requested_mode)
+              << " resolved=" << vae_exec_mode_name(report.resolved_mode)
+              << " dtype_requested=" << vae_dtype_name(report.requested_storage_dtype)
+              << " dtype_resolved=" << vae_dtype_name(report.resolved_storage_dtype)
+              << " planned_mb=" << (static_cast<double>(report.planned_workspace_bytes) / 1024.0 / 1024.0)
+              << " largest_mb=" << (static_cast<double>(report.largest_tensor_bytes) / 1024.0 / 1024.0)
+              << " largest_op=" << report.largest_tensor_op
+              << " largest_type=" << report.largest_tensor_type
+              << " largest_shape=" << report.largest_tensor_shape
+              << " graphs=" << report.graph_count
+              << " stages=" << report.stage_count
+              << " host_copies=" << report.stage_boundary_host_copies
+              << " device_copies=" << report.stage_boundary_device_copies
+              << " dtype_promotions=" << report.stage_boundary_dtype_promotions
+              << " im2col=" << (report.used_im2col ? "true" : "false")
+              << " used_im2col=" << (report.used_im2col ? "true" : "false")
+              << " used_tiling=" << (report.used_tiling ? "true" : "false")
+              << " used_taesd=" << (report.used_taesd ? "true" : "false")
+              << " direct=" << (report.used_direct_conv ? "true" : "false")
+              << " direct_conv=" << (report.used_direct_conv ? "true" : "false")
+              << " device_resident=" << (report.device_resident_stages ? "true" : "false")
+              << " compact=" << (report.compact_activation_storage ? "true" : "false")
+              << " math_policy=\"" << report.math_dtype_policy << "\""
+              << " fallback=\"" << report.fallback_reason << "\""
+              << "\n";
+    for (uint32_t i = 0; i < report.stage_count && i < 16; ++i) {
+        std::cout << label << "_stage[" << i << "] dtype=" << report.stage_output_dtype[i]
+                  << " backend=" << report.stage_output_backend[i] << "\n";
+    }
 }
 
 static void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
@@ -115,6 +198,9 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, args)) {
         usage(argv[0]);
         return 2;
+    }
+    if (args.disable_default_vae_conv_direct) {
+        set_env_value("SDCPP_DISABLE_DEFAULT_VAE_CONV_DIRECT", "1");
     }
     sd_set_log_callback(sd_log_cb, nullptr);
 
@@ -156,15 +242,28 @@ int main(int argc, char** argv) {
     sd_tiling_params_t tiling{};
     tiling.enabled        = false;
     tiling.target_overlap = 0.5f;
+    sd_vae_run_options_t vae_options;
+    sd_vae_run_options_init(&vae_options);
+    if (args.disable_default_vae_conv_direct) {
+        vae_options.mode = SD_VAE_EXEC_LEGACY_GGML_GRAPH;
+        vae_options.fail_on_large_im2col = false;
+    }
+
+    sd_vae_memory_report_t encode_estimate;
+    if (sd_estimate_vae_normal_memory(ctx, image.width, image.height, false, &vae_options, &encode_estimate)) {
+        print_vae_report("encode_estimate", encode_estimate);
+    }
 
     std::cout << "calling sd_encode_image\n";
-    sd_latent_t* encoded = sd_encode_image(ctx, &image, &tiling);
+    sd_vae_memory_report_t encode_report;
+    sd_latent_t* encoded = sd_encode_image_normal(ctx, &image, &vae_options, &encode_report);
     free(image.data);
     if (encoded == nullptr) {
         std::cerr << "sd_encode_image failed\n";
         free_sd_ctx(ctx);
         return 1;
     }
+    print_vae_report("encode_report", encode_report);
     std::cout << "encoded latent " << encoded->width << "x" << encoded->height << "x"
               << encoded->channel << " elements=" << encoded->element_count << "\n";
 
@@ -211,8 +310,16 @@ int main(int argc, char** argv) {
             }
         }
 
+        sd_vae_memory_report_t decode_estimate;
+        uint32_t decode_width = latent_to_decode->width * 8;
+        uint32_t decode_height = latent_to_decode->height * 8;
+        if (sd_estimate_vae_normal_memory(decode_ctx, decode_width, decode_height, true, &vae_options, &decode_estimate)) {
+            print_vae_report("decode_estimate", decode_estimate);
+        }
+
         std::cout << "calling sd_decode_latent\n";
-        sd_image_t* output = sd_decode_latent(decode_ctx, latent_to_decode, &tiling);
+        sd_vae_memory_report_t decode_report;
+        sd_image_t* output = sd_decode_latent_normal(decode_ctx, latent_to_decode, &vae_options, &decode_report);
         if (output == nullptr) {
             std::cerr << "sd_decode_latent failed\n";
             if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
@@ -221,6 +328,7 @@ int main(int argc, char** argv) {
             free_sd_ctx(ctx);
             return 1;
         }
+        print_vae_report("decode_report", decode_report);
         if (!write_image_to_file(args.output, output->data, output->width, output->height, output->channel)) {
             std::cerr << "failed to write output: " << args.output << "\n";
             free_sd_image(output);
