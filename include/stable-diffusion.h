@@ -344,6 +344,9 @@ enum sd_image_color_space_t {
 enum sd_gpu_resource_flags_t {
     SD_GPU_RESOURCE_FLAG_VAE_DECODE_OUTPUT = 1u << 0,
     SD_GPU_RESOURCE_FLAG_REQUIRES_VAE_OUTPUT_SCALE = 1u << 1,
+    SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT = 1u << 2,
+    SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD = 1u << 3,
+    SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_DOWNLOAD = 1u << 4,
 };
 
 typedef struct sd_gpu_device_info_t {
@@ -388,14 +391,19 @@ typedef struct sd_gpu_capabilities_t {
     bool supports_gpu_handles;
     bool supports_cuda_gpu_handles;
     bool supports_gpu_latent_output;
+    bool supports_gpu_latent_input;
+    bool supports_sampler_gpu_latent_output;
+    bool supports_vae_gpu_latent_input;
     bool supports_gpu_image_output;
     bool supports_gpu_image_to_rgba8;
     bool supports_gpu_download;
+    bool supports_gpu_latent_download;
+    bool supports_gpu_latent_upload;
     bool supports_dlpack_export;
     bool supports_cuda_pointer_borrow;
     bool supports_cuda_ipc_export;
     bool supports_external_memory_interop;
-    uint32_t reserved[16];
+    uint32_t reserved[11];
 } sd_gpu_capabilities_t;
 
 typedef struct sd_download_options_t {
@@ -598,6 +606,10 @@ SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
 SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
                                      const sd_img_gen_params_t* sd_img_gen_params,
                                      const sd_latent_t* init_latent);
+SD_API bool sd_sample_latent_gpu(sd_ctx_t* sd_ctx,
+                                 const sd_img_gen_params_t* sd_img_gen_params,
+                                 const sd_latent_t* init_latent,
+                                 sd_gpu_handle_t* out_gpu_latent);
 SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
                                     const sd_latent_t* latent,
                                     const sd_tiling_params_t* vae_tiling_params);
@@ -625,6 +637,13 @@ SD_API bool sd_gpu_handle_get_desc(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle, sd_
 SD_API bool sd_gpu_handle_debug_name(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle, const char* name);
 SD_API bool sd_gpu_handle_borrow_cuda_ptr(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle, sd_cuda_borrowed_ptr_t* out);
 SD_API bool sd_gpu_handle_end_cuda_borrow(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle);
+SD_API sd_latent_t* sd_gpu_latent_download(sd_ctx_t* sd_ctx,
+                                           sd_gpu_handle_t gpu_latent,
+                                           const sd_download_options_t* options);
+SD_API bool sd_cpu_latent_upload(sd_ctx_t* sd_ctx,
+                                 const sd_latent_t* cpu_latent,
+                                 sd_gpu_handle_t* out_gpu_latent,
+                                 const sd_download_options_t* options);
 SD_API bool sd_decode_latent_normal_gpu(sd_ctx_t* sd_ctx,
                                         const sd_latent_t* latent,
                                         const sd_vae_run_options_t* options,

@@ -16,12 +16,16 @@ struct Args {
     int width          = 0;
     int height         = 0;
     bool sample        = false;
+    bool sample_without_init = false;
     bool decode        = true;
     bool skip_estimate = false;
     bool split_decode_context = false;
     bool vae_conv_direct = false;
     bool disable_default_vae_conv_direct = false;
     bool type_f16 = false;
+    bool gpu_sample_output = false;
+    bool gpu_latent_decode_input = false;
+    bool download_gpu_latent = false;
     bool gpu_decode_output = false;
     bool download_gpu_output = false;
     bool strict_gpu_resident = false;
@@ -40,6 +44,10 @@ static void usage(const char* argv0) {
         << "  --disable-default-vae-conv-direct disable CUDA SDXL default direct VAE convolution\n"
         << "  --type-f16               request f16 model tensor conversion\n"
         << "  --sample                 run sd_sample_latent after encode\n"
+        << "  --sample-without-init    run sampler with no init latent and skip VAE encode\n"
+        << "  --gpu-sample-output      run sd_sample_latent_gpu and keep sampled latent as a GPU handle\n"
+        << "  --gpu-latent-decode-input decode from a GPU latent handle with sd_decode_gpu_latent_normal_gpu\n"
+        << "  --download-gpu-latent    explicitly download the sampled GPU latent handle\n"
         << "  --skip-estimate          skip sd_estimate_vae_normal_memory smoke checks\n"
         << "  --split-decode-context   decode with a separate vae_decode_only=true context\n"
         << "  --gpu-decode-output      call sd_decode_latent_normal_gpu and keep decode output as a GPU handle\n"
@@ -92,6 +100,17 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.type_f16 = true;
         } else if (arg == "--sample") {
             args.sample = true;
+        } else if (arg == "--sample-without-init") {
+            args.sample = true;
+            args.sample_without_init = true;
+        } else if (arg == "--gpu-sample-output") {
+            args.gpu_sample_output = true;
+            args.sample = true;
+        } else if (arg == "--gpu-latent-decode-input") {
+            args.gpu_latent_decode_input = true;
+            args.gpu_decode_output = true;
+        } else if (arg == "--download-gpu-latent") {
+            args.download_gpu_latent = true;
         } else if (arg == "--skip-estimate") {
             args.skip_estimate = true;
         } else if (arg == "--split-decode-context") {
@@ -279,20 +298,27 @@ int main(int argc, char** argv) {
         }
     }
 
+    sd_latent_t* encoded = nullptr;
+    if (!args.sample_without_init) {
     std::cout << "calling sd_encode_image\n";
     sd_vae_memory_report_t encode_report;
-    sd_latent_t* encoded = sd_encode_image_normal(ctx, &image, &vae_options, &encode_report);
-    free(image.data);
+    encoded = sd_encode_image_normal(ctx, &image, &vae_options, &encode_report);
     if (encoded == nullptr) {
         std::cerr << "sd_encode_image failed\n";
+        free(image.data);
         free_sd_ctx(ctx);
         return 1;
     }
     print_vae_report("encode_report", encode_report);
     std::cout << "encoded latent " << encoded->width << "x" << encoded->height << "x"
               << encoded->channel << " elements=" << encoded->element_count << "\n";
+    } else {
+        std::cout << "skipping sd_encode_image; sampler init latent is null\n";
+    }
+    free(image.data);
 
     sd_latent_t* latent_to_decode = encoded;
+    sd_gpu_handle_t sampled_gpu_latent = 0;
     if (args.sample) {
         sd_img_gen_params_t gen_params;
         sd_img_gen_params_init(&gen_params);
@@ -309,17 +335,52 @@ int main(int argc, char** argv) {
         gen_params.sample_params.scheduler             = KARRAS_SCHEDULER;
         gen_params.vae_tiling_params                   = tiling;
 
-        std::cout << "calling sd_sample_latent\n";
-        sd_latent_t* sampled = sd_sample_latent(ctx, &gen_params, encoded);
-        if (sampled == nullptr) {
-            std::cerr << "sd_sample_latent failed\n";
-            free_sd_latent(encoded);
-            free_sd_ctx(ctx);
-            return 1;
+        if (args.gpu_sample_output) {
+            std::cout << "calling sd_sample_latent_gpu\n";
+            if (!sd_sample_latent_gpu(ctx, &gen_params, args.sample_without_init ? nullptr : encoded, &sampled_gpu_latent)) {
+                std::cerr << "sd_sample_latent_gpu failed\n";
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            sd_gpu_tensor_desc_t desc{};
+            if (sd_gpu_handle_get_desc(ctx, sampled_gpu_latent, &desc)) {
+                std::cout << "gpu_sample_latent_desc handle=" << desc.handle
+                          << " backend=" << desc.backend
+                          << " kind=" << desc.kind
+                          << " dtype=" << desc.dtype
+                          << " layout=" << desc.layout
+                          << " shape_nchw=" << desc.n << "x" << desc.c << "x" << desc.h << "x" << desc.w
+                          << " bytes=" << desc.byte_size
+                          << " flags=" << desc.flags
+                          << " refcount=" << desc.refcount << "\n";
+            }
+            if (args.download_gpu_latent || !args.gpu_latent_decode_input) {
+                sd_latent_t* sampled = sd_gpu_latent_download(ctx, sampled_gpu_latent, nullptr);
+                if (sampled == nullptr) {
+                    std::cerr << "sd_gpu_latent_download failed\n";
+                    sd_gpu_handle_release(ctx, sampled_gpu_latent);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                std::cout << "downloaded sampled latent " << sampled->width << "x" << sampled->height << "x"
+                          << sampled->channel << " elements=" << sampled->element_count << "\n";
+                latent_to_decode = sampled;
+            }
+        } else {
+            std::cout << "calling sd_sample_latent\n";
+            sd_latent_t* sampled = sd_sample_latent(ctx, &gen_params, args.sample_without_init ? nullptr : encoded);
+            if (sampled == nullptr) {
+                std::cerr << "sd_sample_latent failed\n";
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            std::cout << "sampled latent " << sampled->width << "x" << sampled->height << "x"
+                      << sampled->channel << " elements=" << sampled->element_count << "\n";
+            latent_to_decode = sampled;
         }
-        std::cout << "sampled latent " << sampled->width << "x" << sampled->height << "x"
-                  << sampled->channel << " elements=" << sampled->element_count << "\n";
-        latent_to_decode = sampled;
     }
 
     if (args.decode) {
@@ -337,8 +398,8 @@ int main(int argc, char** argv) {
 
         if (!args.skip_estimate) {
             sd_vae_memory_report_t decode_estimate;
-            uint32_t decode_width = latent_to_decode->width * 8;
-            uint32_t decode_height = latent_to_decode->height * 8;
+            uint32_t decode_width = latent_to_decode != nullptr ? latent_to_decode->width * 8 : static_cast<uint32_t>(args.width > 0 ? args.width : 1024);
+            uint32_t decode_height = latent_to_decode != nullptr ? latent_to_decode->height * 8 : static_cast<uint32_t>(args.height > 0 ? args.height : 1024);
             if (sd_estimate_vae_normal_memory(decode_ctx, decode_width, decode_height, true, &vae_options, &decode_estimate)) {
                 print_vae_report("decode_estimate", decode_estimate);
             }
@@ -348,11 +409,22 @@ int main(int argc, char** argv) {
         sd_vae_memory_report_t decode_report;
         if (args.gpu_decode_output) {
             sd_gpu_handle_t gpu_image = 0;
-            if (!sd_decode_latent_normal_gpu(decode_ctx, latent_to_decode, &vae_options, &gpu_image, &decode_report)) {
+            bool decode_ok = false;
+            if (args.gpu_latent_decode_input) {
+                if (sampled_gpu_latent == 0) {
+                    std::cerr << "--gpu-latent-decode-input requires --gpu-sample-output in this smoke\n";
+                } else {
+                    decode_ok = sd_decode_gpu_latent_normal_gpu(decode_ctx, sampled_gpu_latent, &vae_options, &gpu_image, &decode_report);
+                }
+            } else {
+                decode_ok = sd_decode_latent_normal_gpu(decode_ctx, latent_to_decode, &vae_options, &gpu_image, &decode_report);
+            }
+            if (!decode_ok) {
                 std::cerr << "sd_decode_latent_normal_gpu failed\n";
+                if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
                 if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
                 if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
-                free_sd_latent(encoded);
+                if (encoded != nullptr) free_sd_latent(encoded);
                 free_sd_ctx(ctx);
                 return 1;
             }
@@ -363,9 +435,10 @@ int main(int argc, char** argv) {
                 if (!sd_gpu_handle_get_desc(decode_ctx, gpu_image, &desc)) {
                     std::cerr << "sd_gpu_handle_get_desc failed\n";
                     sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
                     if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
                     if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
-                    free_sd_latent(encoded);
+                    if (encoded != nullptr) free_sd_latent(encoded);
                     free_sd_ctx(ctx);
                     return 1;
                 }
@@ -393,9 +466,10 @@ int main(int argc, char** argv) {
                 if (!sd_gpu_image_download(decode_ctx, gpu_image, &output, nullptr)) {
                     std::cerr << "sd_gpu_image_download failed\n";
                     sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
                     if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
                     if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
-                    free_sd_latent(encoded);
+                    if (encoded != nullptr) free_sd_latent(encoded);
                     free_sd_ctx(ctx);
                     return 1;
                 }
@@ -403,9 +477,10 @@ int main(int argc, char** argv) {
                     std::cerr << "failed to write output: " << args.output << "\n";
                     free(output.data);
                     sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
                     if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
                     if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
-                    free_sd_latent(encoded);
+                    if (encoded != nullptr) free_sd_latent(encoded);
                     free_sd_ctx(ctx);
                     return 1;
                 }
@@ -414,9 +489,10 @@ int main(int argc, char** argv) {
             }
             if (!sd_gpu_handle_release(decode_ctx, gpu_image)) {
                 std::cerr << "sd_gpu_handle_release failed\n";
+                if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
                 if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
                 if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
-                free_sd_latent(encoded);
+                if (encoded != nullptr) free_sd_latent(encoded);
                 free_sd_ctx(ctx);
                 return 1;
             }
@@ -426,7 +502,7 @@ int main(int argc, char** argv) {
                 std::cerr << "sd_decode_latent failed\n";
                 if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
                 if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
-                free_sd_latent(encoded);
+                if (encoded != nullptr) free_sd_latent(encoded);
                 free_sd_ctx(ctx);
                 return 1;
             }
@@ -436,7 +512,7 @@ int main(int argc, char** argv) {
                 free_sd_image(output);
                 if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
                 if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
-                free_sd_latent(encoded);
+                if (encoded != nullptr) free_sd_latent(encoded);
                 free_sd_ctx(ctx);
                 return 1;
             }
@@ -449,7 +525,12 @@ int main(int argc, char** argv) {
     if (latent_to_decode != encoded) {
         free_sd_latent(latent_to_decode);
     }
-    free_sd_latent(encoded);
+    if (sampled_gpu_latent != 0) {
+        sd_gpu_handle_release(ctx, sampled_gpu_latent);
+    }
+    if (encoded != nullptr) {
+        free_sd_latent(encoded);
+    }
     free_sd_ctx(ctx);
     return 0;
 }
