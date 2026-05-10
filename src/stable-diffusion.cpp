@@ -726,8 +726,8 @@ public:
                 }
                 control_net = std::make_shared<ControlNet>(controlnet_backend,
                                                            offload_params_to_cpu,
-                                                           tensor_storage_map,
                                                            version);
+                control_net->set_wtype_override(wtype, tensor_type_rules);
                 if (sd_ctx_params->diffusion_conv_direct) {
                     LOG_INFO("Using Conv2d direct in the control net");
                     control_net->set_conv2d_direct_enabled(true);

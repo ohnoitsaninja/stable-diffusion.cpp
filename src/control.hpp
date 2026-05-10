@@ -4,7 +4,7 @@
 #include "common_block.hpp"
 #include "model.h"
 
-#define CONTROL_NET_GRAPH_SIZE 1536
+#define CONTROL_NET_GRAPH_SIZE 4096
 
 /*
     =================================== ControlNet ===================================
@@ -309,6 +309,9 @@ public:
 struct ControlNet : public GGMLRunner {
     SDVersion version = VERSION_SD1;
     ControlNetBlock control_net;
+    ggml_type wtype_override = GGML_TYPE_COUNT;
+    std::string tensor_type_rules;
+    bool params_initialized = false;
 
     ggml_backend_buffer_t control_buffer = nullptr;
     ggml_context* control_ctx            = nullptr;
@@ -320,11 +323,8 @@ struct ControlNet : public GGMLRunner {
 
     ControlNet(ggml_backend_t backend,
                bool offload_params_to_cpu,
-               const String2TensorStorage& tensor_storage_map = {},
                SDVersion version                              = VERSION_SD1)
-        : GGMLRunner(backend, offload_params_to_cpu), control_net(version) {
-        control_net.init(params_ctx, tensor_storage_map, "");
-    }
+        : GGMLRunner(backend, offload_params_to_cpu), version(version), control_net(version) {}
 
     ~ControlNet() override {
         free_control_ctx();
@@ -372,6 +372,97 @@ struct ControlNet : public GGMLRunner {
 
     std::string get_desc() override {
         return "control_net";
+    }
+
+    void set_wtype_override(ggml_type wtype, const std::string& rules) {
+        wtype_override    = wtype;
+        tensor_type_rules = rules;
+    }
+
+    static std::string format_type_histogram(const std::map<ggml_type, int>& histogram) {
+        if (histogram.empty()) {
+            return "(empty)";
+        }
+        std::stringstream ss;
+        bool first = true;
+        for (const auto& [type, count] : histogram) {
+            if (!first) {
+                ss << ", ";
+            }
+            first = false;
+            ss << ggml_type_name(type) << "=" << count;
+        }
+        return ss.str();
+    }
+
+    static std::string format_conversion_histogram(const std::map<std::string, int>& histogram) {
+        if (histogram.empty()) {
+            return "(empty)";
+        }
+        std::stringstream ss;
+        bool first = true;
+        for (const auto& [conversion, count] : histogram) {
+            if (!first) {
+                ss << ", ";
+            }
+            first = false;
+            ss << conversion << "=" << count;
+        }
+        return ss.str();
+    }
+
+    static std::string format_type_bytes(const std::map<ggml_type, uint64_t>& histogram) {
+        if (histogram.empty()) {
+            return "(empty)";
+        }
+        std::stringstream ss;
+        bool first = true;
+        for (const auto& [type, bytes] : histogram) {
+            if (!first) {
+                ss << ", ";
+            }
+            first = false;
+            ss << ggml_type_name(type) << "=" << (bytes / (1024.0 * 1024.0)) << "MB";
+        }
+        return ss.str();
+    }
+
+    void log_dtype_histograms(const String2TensorStorage& source_tensors,
+                              const std::map<std::string, ggml_tensor*>& dest_tensors) {
+        std::map<ggml_type, int> source_histogram;
+        std::map<ggml_type, int> source_expected_histogram;
+        std::map<ggml_type, int> dest_histogram;
+        std::map<ggml_type, uint64_t> dest_bytes;
+        std::map<std::string, int> matched_conversion_histogram;
+        int matched_tensors = 0;
+
+        for (const auto& [_, storage] : source_tensors) {
+            source_histogram[storage.type]++;
+            ggml_type expected_type = storage.expected_type == GGML_TYPE_COUNT ? storage.type : storage.expected_type;
+            source_expected_histogram[expected_type]++;
+        }
+
+        for (const auto& [name, tensor] : dest_tensors) {
+            if (tensor == nullptr) {
+                continue;
+            }
+            dest_histogram[tensor->type]++;
+            dest_bytes[tensor->type] += ggml_nbytes(tensor);
+            auto iter = source_tensors.find(name);
+            if (iter != source_tensors.end()) {
+                matched_tensors++;
+                std::string conversion = std::string(ggml_type_name(iter->second.type)) + "->" + ggml_type_name(tensor->type);
+                matched_conversion_histogram[conversion]++;
+            }
+        }
+
+        LOG_INFO("ControlNet source tensor dtypes: %s", format_type_histogram(source_histogram).c_str());
+        LOG_INFO("ControlNet expected tensor dtypes after overrides: %s", format_type_histogram(source_expected_histogram).c_str());
+        LOG_INFO("ControlNet destination tensor dtypes before allocation: %s", format_type_histogram(dest_histogram).c_str());
+        LOG_INFO("ControlNet destination tensor bytes before allocation: %s", format_type_bytes(dest_bytes).c_str());
+        LOG_INFO("ControlNet matched source->destination dtype conversions: %s (%d matched tensors)",
+                 format_conversion_histogram(matched_conversion_histogram).c_str(),
+                 matched_tensors);
     }
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {
@@ -457,16 +548,32 @@ struct ControlNet : public GGMLRunner {
 
     bool load_from_file(const std::string& file_path, int n_threads) {
         LOG_INFO("loading control net from '%s'", file_path.c_str());
-        alloc_params_buffer();
-        std::map<std::string, ggml_tensor*> tensors;
-        control_net.get_param_tensors(tensors);
-        std::set<std::string> ignore_tensors;
-
         ModelLoader model_loader;
-        if (!model_loader.init_from_file_and_convert_name(file_path)) {
+        if (!model_loader.init_from_file_and_convert_name(file_path, "controlnet.", version)) {
             LOG_ERROR("init control net model loader from file failed: '%s'", file_path.c_str());
             return false;
         }
+        if (wtype_override != GGML_TYPE_COUNT || !tensor_type_rules.empty()) {
+            model_loader.set_wtype_override(wtype_override, tensor_type_rules);
+        }
+
+        if (params_initialized) {
+            LOG_ERROR("ControlNet params were already initialized before loading '%s'", file_path.c_str());
+            return false;
+        }
+        control_net.init(params_ctx, model_loader.get_tensor_storage_map(), "controlnet");
+        params_initialized = true;
+
+        std::map<std::string, ggml_tensor*> tensors;
+        control_net.get_param_tensors(tensors, "controlnet");
+        log_dtype_histograms(model_loader.get_tensor_storage_map(), tensors);
+
+        if (!alloc_params_buffer()) {
+            LOG_ERROR("alloc control net params buffer failed");
+            return false;
+        }
+
+        std::set<std::string> ignore_tensors;
 
         bool success = model_loader.load_tensors(tensors, ignore_tensors, n_threads);
 

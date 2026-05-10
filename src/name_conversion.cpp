@@ -396,6 +396,57 @@ std::string convert_diffusers_unet_to_original_sdxl(std::string name) {
     return result;
 }
 
+std::string convert_diffusion_model_name(std::string name, std::string prefix, SDVersion version);
+
+std::string convert_diffusers_controlnet_to_original(std::string name, SDVersion version) {
+    if (starts_with(name, "controlnet.")) {
+        name = name.substr(strlen("controlnet."));
+    }
+    if (starts_with(name, "control_model.")) {  // for controlnet pth models
+        name = name.substr(strlen("control_model."));
+    }
+
+    static const std::vector<std::pair<std::string, std::string>> hint_block_prefix_map = {
+        {"controlnet_cond_embedding.conv_in.", "input_hint_block.0."},
+        {"controlnet_cond_embedding.blocks.0.", "input_hint_block.2."},
+        {"controlnet_cond_embedding.blocks.1.", "input_hint_block.4."},
+        {"controlnet_cond_embedding.blocks.2.", "input_hint_block.6."},
+        {"controlnet_cond_embedding.blocks.3.", "input_hint_block.8."},
+        {"controlnet_cond_embedding.blocks.4.", "input_hint_block.10."},
+        {"controlnet_cond_embedding.blocks.5.", "input_hint_block.12."},
+        {"controlnet_cond_embedding.conv_out.", "input_hint_block.14."},
+    };
+    replace_with_prefix_map(name, hint_block_prefix_map);
+
+    static const std::string controlnet_down_prefix = "controlnet_down_blocks.";
+    if (starts_with(name, controlnet_down_prefix)) {
+        std::string remain = name.substr(controlnet_down_prefix.size());
+        size_t pos         = remain.find('.');
+        if (pos != std::string::npos) {
+            std::string idx    = remain.substr(0, pos);
+            std::string suffix = remain.substr(pos + 1);
+            return "zero_convs." + idx + ".0." + suffix;
+        }
+    }
+
+    static const std::string controlnet_mid_prefix = "controlnet_mid_block.";
+    if (starts_with(name, controlnet_mid_prefix)) {
+        return "middle_block_out.0." + name.substr(controlnet_mid_prefix.size());
+    }
+
+    if (starts_with(name, "input_hint_block.") ||
+        starts_with(name, "zero_convs.") ||
+        starts_with(name, "middle_block_out.") ||
+        starts_with(name, "input_blocks.") ||
+        starts_with(name, "middle_block.") ||
+        starts_with(name, "time_embed.") ||
+        starts_with(name, "label_emb.")) {
+        return name;
+    }
+
+    return convert_diffusion_model_name(name, "", version);
+}
+
 std::string convert_diffusers_dit_to_original_sd3(std::string name) {
     int num_layers = 38;
     static std::unordered_map<std::string, std::string> sd3_name_map;
@@ -1142,11 +1193,8 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
 
     // controlnet
     {
-        if (starts_with(name, "control_model.")) {  // for controlnet pth models
-            size_t pos = name.find('.');
-            if (pos != std::string::npos) {
-                name = name.substr(pos + 1);
-            }
+        if (starts_with(name, "controlnet.") || starts_with(name, "control_model.")) {
+            name = "controlnet." + convert_diffusers_controlnet_to_original(name, version);
         }
     }
 
