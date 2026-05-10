@@ -320,6 +320,9 @@ struct ControlNet : public GGMLRunner {
     std::vector<sd::Tensor<float>> controls;
     sd::Tensor<float> guided_hint;
     bool guided_hint_cached = false;
+    int64_t last_compute_ms = 0;
+    int64_t last_materialize_ms = 0;
+    uint64_t last_materialize_bytes = 0;
 
     ControlNet(ggml_backend_t backend,
                bool offload_params_to_cpu,
@@ -368,6 +371,9 @@ struct ControlNet : public GGMLRunner {
         guided_hint             = {};
         control_outputs_ggml.clear();
         controls.clear();
+        last_compute_ms = 0;
+        last_materialize_ms = 0;
+        last_materialize_bytes = 0;
     }
 
     std::string get_desc() override {
@@ -483,8 +489,9 @@ struct ControlNet : public GGMLRunner {
         ggml_tensor* y         = make_optional_input(y_tensor);
 
         ggml_tensor* guided_hint_input = nullptr;
-        if (guided_hint_cached && !guided_hint.empty()) {
-            guided_hint_input = make_input(guided_hint);
+        const bool reuse_backend_guided_hint = guided_hint_cached && guided_hint_output_ggml != nullptr;
+        if (reuse_backend_guided_hint) {
+            guided_hint_input = guided_hint_output_ggml;
             hint              = nullptr;
         } else {
             hint = make_input(hint_tensor);
@@ -504,7 +511,9 @@ struct ControlNet : public GGMLRunner {
             alloc_control_ctx(outs);
         }
 
-        ggml_build_forward_expand(gf, ggml_cpy(compute_ctx, outs[0], guided_hint_output_ggml));
+        if (!reuse_backend_guided_hint) {
+            ggml_build_forward_expand(gf, ggml_cpy(compute_ctx, outs[0], guided_hint_output_ggml));
+        }
         for (int i = 0; i < outs.size() - 1; i++) {
             ggml_build_forward_expand(gf, ggml_cpy(compute_ctx, outs[i + 1], control_outputs_ggml[i]));
         }
@@ -526,24 +535,64 @@ struct ControlNet : public GGMLRunner {
             return build_graph(x, hint, timesteps, context, y);
         };
 
+        int64_t compute_start = ggml_time_ms();
         auto compute_result = GGMLRunner::compute<float>(get_graph, n_threads, false);
+        last_compute_ms = ggml_time_ms() - compute_start;
         if (!compute_result.has_value()) {
             return std::nullopt;
         }
 
+        int64_t materialize_start = ggml_time_ms();
+        last_materialize_bytes = 0;
         if (guided_hint_output_ggml != nullptr) {
+            last_materialize_bytes += ggml_nbytes(guided_hint_output_ggml);
             guided_hint = restore_trailing_singleton_dims(sd::make_sd_tensor_from_ggml<float>(guided_hint_output_ggml),
                                                           4);
         }
         controls.clear();
         controls.reserve(control_outputs_ggml.size());
         for (ggml_tensor* control : control_outputs_ggml) {
+            last_materialize_bytes += ggml_nbytes(control);
             auto control_host = restore_trailing_singleton_dims(sd::make_sd_tensor_from_ggml<float>(control), 4);
             GGML_ASSERT(!control_host.empty());
             controls.push_back(std::move(control_host));
         }
+        last_materialize_ms = ggml_time_ms() - materialize_start;
         guided_hint_cached = true;
         return controls;
+    }
+
+    std::optional<std::vector<ggml_tensor*>> compute_backend(int n_threads,
+                                                             const sd::Tensor<float>& x,
+                                                             const sd::Tensor<float>& hint,
+                                                             const sd::Tensor<float>& timesteps,
+                                                             const sd::Tensor<float>& context = {},
+                                                             const sd::Tensor<float>& y       = {}) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            return build_graph(x, hint, timesteps, context, y);
+        };
+
+        int64_t compute_start = ggml_time_ms();
+        if (!GGMLRunner::compute_no_output(get_graph, n_threads, false)) {
+            return std::nullopt;
+        }
+        last_compute_ms = ggml_time_ms() - compute_start;
+        last_materialize_ms = 0;
+        last_materialize_bytes = 0;
+        guided_hint_cached = true;
+        return control_outputs_ggml;
+    }
+
+    int64_t get_last_compute_ms() const {
+        return last_compute_ms;
+    }
+
+    int64_t get_last_materialize_ms() const {
+        return last_materialize_ms;
+    }
+
+    uint64_t get_last_materialize_bytes() const {
+        return last_materialize_bytes;
     }
 
     bool load_from_file(const std::string& file_path, int n_threads) {

@@ -1604,10 +1604,39 @@ public:
                                  const sd::Tensor<float>& noised_input,
                                  const sd::Tensor<float>& timesteps_tensor,
                                  const SDCondition& condition,
-                                 std::vector<sd::Tensor<float>>* controls) {
+                                 std::vector<sd::Tensor<float>>* controls,
+                                 std::vector<ggml_tensor*>* backend_controls,
+                                 const char* pass_name) {
         GGML_ASSERT(controls != nullptr);
+        GGML_ASSERT(backend_controls != nullptr);
         controls->clear();
+        backend_controls->clear();
         if (control_image.empty() || control_net == nullptr) {
+            return;
+        }
+
+        int64_t t0 = ggml_time_ms();
+        auto backend_result = control_net->compute_backend(n_threads,
+                                                           noised_input,
+                                                           control_image,
+                                                           timesteps_tensor,
+                                                           condition.c_crossattn,
+                                                           condition.c_vector);
+        if (backend_result.has_value()) {
+            *backend_controls = std::move(*backend_result);
+            if (env_flag_enabled("SDCPP_TRACE_CONTROLNET")) {
+                uint64_t control_bytes = 0;
+                for (const auto* control : *backend_controls) {
+                    if (control != nullptr) {
+                        control_bytes += ggml_nbytes(control);
+                    }
+                }
+                LOG_INFO("[ControlNet] pass=%s backend compute=%" PRId64 "ms controls=%zu gpu_bytes=%.2fMB host_materialize=0ms d2h=0",
+                         pass_name ? pass_name : "unknown",
+                         ggml_time_ms() - t0,
+                         backend_controls->size(),
+                         control_bytes / 1024.0 / 1024.0);
+            }
             return;
         }
 
@@ -1623,6 +1652,14 @@ public:
         }
 
         *controls = std::move(*control_result);
+        if (env_flag_enabled("SDCPP_TRACE_CONTROLNET")) {
+            LOG_INFO("[ControlNet] pass=%s host fallback compute=%" PRId64 "ms materialize=%" PRId64 "ms d2h=%.2fMB controls=%zu",
+                     pass_name ? pass_name : "unknown",
+                     ggml_time_ms() - t0,
+                     control_net->get_last_materialize_ms(),
+                     control_net->get_last_materialize_bytes() / 1024.0 / 1024.0,
+                     controls->size());
+        }
     }
 
     sd::Tensor<float> sample(const std::shared_ptr<DiffusionModel>& work_diffusion_model,
@@ -1718,6 +1755,7 @@ public:
             sd::Tensor<float> skip_cond_out;
             sd_sample::SampleStepCacheDispatcher step_cache(cache_runtime, step, sigma);
             std::vector<sd::Tensor<float>> controls;
+            std::vector<ggml_tensor*> backend_controls;
             DiffusionParams diffusion_params;
             diffusion_params.x                  = &noised_input;
             diffusion_params.timesteps          = &timesteps_tensor;
@@ -1725,6 +1763,7 @@ public:
             diffusion_params.ref_latents        = &ref_latents;
             diffusion_params.increase_ref_index = increase_ref_index;
             diffusion_params.controls           = &controls;
+            diffusion_params.backend_controls   = &backend_controls;
             diffusion_params.control_strength   = control_strength;
             diffusion_params.vace_context       = vace_context.empty() ? nullptr : &vace_context;
             diffusion_params.vace_strength      = vace_strength;
@@ -1734,7 +1773,9 @@ public:
                                     noised_input,
                                     timesteps_tensor,
                                     cond,
-                                    &controls);
+                                    &controls,
+                                    &backend_controls,
+                                    "cond");
 
             auto run_condition = [&](const SDCondition& condition,
                                      const sd::Tensor<float>* c_concat_override = nullptr,
@@ -1781,7 +1822,9 @@ public:
                                             noised_input,
                                             timesteps_tensor,
                                             uncond,
-                                            &controls);
+                                            &controls,
+                                            &backend_controls,
+                                            "uncond");
                 }
                 uncond_out = run_condition(uncond);
                 if (uncond_out.empty()) {
@@ -2977,7 +3020,16 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
     }
 
     if (sd_img_gen_params->control_image.data != nullptr) {
+        int64_t control_convert_start = ggml_time_ms();
         control_image_tensor = sd_image_to_tensor(sd_img_gen_params->control_image, request->width, request->height);
+        if (StableDiffusionGGML::env_flag_enabled("SDCPP_TRACE_CONTROLNET")) {
+            LOG_INFO("[ControlNet] control image tensor conversion completed in %" PRId64 "ms shape=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
+                     ggml_time_ms() - control_convert_start,
+                     control_image_tensor.shape()[0],
+                     control_image_tensor.shape()[1],
+                     control_image_tensor.shape()[2],
+                     control_image_tensor.shape()[3]);
+        }
     }
 
     if (init_image_tensor.empty() || mask_image_tensor.empty()) {
@@ -3009,12 +3061,19 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         }
     }
 
-    if (!control_image_tensor.empty() && !sd_ctx->sd->vae_decode_only) {
+    if (!control_image_tensor.empty() && !sd_ctx->sd->vae_decode_only && sd_version_is_control(sd_ctx->sd->version)) {
+        int64_t control_encode_start = ggml_time_ms();
         control_latent = sd_ctx->sd->encode_first_stage(control_image_tensor);
         if (control_latent.empty()) {
             LOG_ERROR("failed to encode control image");
             return std::nullopt;
         }
+        if (StableDiffusionGGML::env_flag_enabled("SDCPP_TRACE_CONTROLNET")) {
+            LOG_INFO("[ControlNet] control image VAE encode completed in %" PRId64 "ms for built-in control model concat latent",
+                     ggml_time_ms() - control_encode_start);
+        }
+    } else if (!control_image_tensor.empty() && StableDiffusionGGML::env_flag_enabled("SDCPP_TRACE_CONTROLNET")) {
+        LOG_INFO("[ControlNet] skipped control image VAE encode for external ControlNet path version=%d", static_cast<int>(sd_ctx->sd->version));
     }
 
     std::vector<sd::Tensor<float>> ref_images;

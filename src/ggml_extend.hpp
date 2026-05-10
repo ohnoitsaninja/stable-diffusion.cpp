@@ -2525,6 +2525,41 @@ public:
         return output;
     }
 
+    bool compute_no_output(get_graph_cb_t get_graph,
+                           int n_threads,
+                           bool free_compute_buffer_immediately) {
+        if (!offload_params_to_runtime_backend()) {
+            LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
+            return false;
+        }
+        if (!alloc_compute_buffer(get_graph)) {
+            LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
+            return false;
+        }
+        reset_compute_ctx();
+        ggml_cgraph* gf = get_compute_graph(get_graph);
+        if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
+            LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
+            return false;
+        }
+        copy_data_to_backend_tensor();
+        if (ggml_backend_is_cpu(runtime_backend)) {
+            ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
+        }
+
+        ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+            return false;
+        }
+        copy_cache_tensors_to_cache_buffer();
+
+        if (free_compute_buffer_immediately) {
+            free_compute_buffer();
+        }
+        return true;
+    }
+
     template <typename T>
     std::optional<sd::Tensor<T>> materialize_backend_tensor(const BackendTensorHandle* handle,
                                                             size_t expected_dim) {

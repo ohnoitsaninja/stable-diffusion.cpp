@@ -528,7 +528,7 @@ public:
             }
         }
         if (controls.size() > 0) {
-            auto cs = ggml_ext_scale(ctx->ggml_ctx, controls[controls.size() - 1], control_strength, true);
+            auto cs = ggml_ext_scale(ctx->ggml_ctx, controls[controls.size() - 1], control_strength, false);
             h       = ggml_add(ctx->ggml_ctx, h, cs);  // middle control
         }
         int control_offset = static_cast<int>(controls.size() - 2);
@@ -541,7 +541,7 @@ public:
                 hs.pop_back();
 
                 if (controls.size() > 0) {
-                    auto cs = ggml_ext_scale(ctx->ggml_ctx, controls[control_offset], control_strength, true);
+                    auto cs = ggml_ext_scale(ctx->ggml_ctx, controls[control_offset], control_strength, false);
                     h_skip  = ggml_add(ctx->ggml_ctx, h_skip, cs);  // control net condition
                     control_offset--;
                 }
@@ -616,6 +616,7 @@ struct UNetModelRunner : public GGMLRunner {
                              const sd::Tensor<float>& y_tensor                     = {},
                              int num_video_frames                                  = -1,
                              const std::vector<sd::Tensor<float>>& controls_tensor = {},
+                             const std::vector<ggml_tensor*>* backend_controls     = nullptr,
                              float control_strength                                = 0.f) {
         ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
 
@@ -625,9 +626,13 @@ struct UNetModelRunner : public GGMLRunner {
         ggml_tensor* c_concat  = make_optional_input(c_concat_tensor);
         ggml_tensor* y         = make_optional_input(y_tensor);
         std::vector<ggml_tensor*> controls;
-        controls.reserve(controls_tensor.size());
-        for (const auto& control_tensor : controls_tensor) {
-            controls.push_back(make_input(control_tensor));
+        if (backend_controls != nullptr && !backend_controls->empty()) {
+            controls = *backend_controls;
+        } else {
+            controls.reserve(controls_tensor.size());
+            for (const auto& control_tensor : controls_tensor) {
+                controls.push_back(make_input(control_tensor));
+            }
         }
 
         if (num_video_frames == -1) {
@@ -659,6 +664,7 @@ struct UNetModelRunner : public GGMLRunner {
                               const sd::Tensor<float>& y                     = {},
                               int num_video_frames                           = -1,
                               const std::vector<sd::Tensor<float>>& controls = {},
+                              const std::vector<ggml_tensor*>* backend_controls = nullptr,
                               float control_strength                         = 0.f) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
@@ -666,7 +672,7 @@ struct UNetModelRunner : public GGMLRunner {
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         auto get_graph = [&]() -> ggml_cgraph* {
-            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength);
+            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, backend_controls, control_strength);
         };
 
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
@@ -713,6 +719,7 @@ struct UNetModelRunner : public GGMLRunner {
                                    y,
                                    num_video_frames,
                                    {},
+                                   nullptr,
                                    0.f);
             int64_t t1   = ggml_time_ms();
 

@@ -24,6 +24,7 @@ struct DiffusionParams {
     bool increase_ref_index                           = false;
     int num_video_frames                              = -1;
     const std::vector<sd::Tensor<float>>* controls    = nullptr;
+    const std::vector<ggml_tensor*>* backend_controls  = nullptr;
     float control_strength                            = 0.f;
     const sd::Tensor<float>* vace_context             = nullptr;
     float vace_strength                               = 1.f;
@@ -114,6 +115,7 @@ struct UNetModel : public DiffusionModel {
                             tensor_or_empty(diffusion_params.y),
                             diffusion_params.num_video_frames,
                             diffusion_params.controls ? *diffusion_params.controls : empty_controls,
+                            diffusion_params.backend_controls,
                             diffusion_params.control_strength);
     }
 };
