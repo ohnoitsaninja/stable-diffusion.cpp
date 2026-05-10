@@ -22,6 +22,7 @@
 #include "latent-preview.h"
 #include "name_conversion.h"
 
+#include <limits>
 #include <new>
 #include <unordered_map>
 
@@ -4614,6 +4615,110 @@ SD_API bool sd_gpu_image_download(sd_ctx_t* sd_ctx,
     return true;
 }
 
+SD_API bool sd_gpu_image_download_to_buffer(sd_ctx_t* sd_ctx,
+                                            sd_gpu_handle_t gpu_image,
+                                            void* dst_rgba8,
+                                            uint64_t dst_bytes,
+                                            uint64_t dst_stride_bytes,
+                                            const sd_download_options_t* options) {
+    SD_UNUSED(options);
+    auto resource = sd_gpu_resource_lookup(sd_ctx, gpu_image);
+    if (resource == nullptr || dst_rgba8 == nullptr || resource->kind != SD_GPU_RESOURCE_IMAGE ||
+        resource->tensor == nullptr || resource->tensor->empty()) {
+        return false;
+    }
+
+    sd_gpu_tensor_desc_t desc;
+    if (!sd_gpu_fill_desc(*resource, &desc)) {
+        return false;
+    }
+    if (desc.layout != SD_LAYOUT_WHCN_GGML || desc.dtype != SD_DTYPE_F32 || desc.n != 1 ||
+        (desc.c != 3 && desc.c != 4) || desc.w <= 0 || desc.h <= 0) {
+        LOG_ERROR("sd_gpu_image_download_to_buffer expected f32 WHCN RGB/RGBA image, got layout=%d dtype=%d shape=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
+                  static_cast<int>(desc.layout),
+                  static_cast<int>(desc.dtype),
+                  desc.n,
+                  desc.c,
+                  desc.h,
+                  desc.w);
+        return false;
+    }
+
+    const uint64_t width = static_cast<uint64_t>(desc.w);
+    const uint64_t height = static_cast<uint64_t>(desc.h);
+    const uint64_t channels = static_cast<uint64_t>(desc.c);
+    if (width > std::numeric_limits<uint64_t>::max() / 4u) {
+        LOG_ERROR("sd_gpu_image_download_to_buffer row size overflow");
+        return false;
+    }
+    const uint64_t row_bytes = width * 4u;
+    if (dst_stride_bytes < row_bytes) {
+        LOG_ERROR("sd_gpu_image_download_to_buffer stride too small: stride=%" PRIu64 " required=%" PRIu64,
+                  dst_stride_bytes,
+                  row_bytes);
+        return false;
+    }
+    uint64_t required_bytes = row_bytes;
+    if (height > 1) {
+        if ((height - 1) > (std::numeric_limits<uint64_t>::max() - row_bytes) / dst_stride_bytes) {
+            LOG_ERROR("sd_gpu_image_download_to_buffer destination size overflow");
+            return false;
+        }
+        required_bytes = (height - 1) * dst_stride_bytes + row_bytes;
+    }
+    if (dst_bytes < required_bytes) {
+        LOG_ERROR("sd_gpu_image_download_to_buffer destination too small: dst=%" PRIu64 " required=%" PRIu64,
+                  dst_bytes,
+                  required_bytes);
+        return false;
+    }
+
+    sd::Tensor<float> image = sd::make_sd_tensor_from_ggml<float>(resource->tensor->tensor);
+    if (image.empty()) {
+        return false;
+    }
+    if (image.dim() == 3) {
+        image.reshape_({image.shape()[0], image.shape()[1], image.shape()[2], 1});
+    }
+    if (image.dim() != 4 || image.shape()[0] != desc.w || image.shape()[1] != desc.h ||
+        image.shape()[2] != desc.c || image.shape()[3] != 1) {
+        LOG_ERROR("sd_gpu_image_download_to_buffer downloaded tensor shape mismatch");
+        return false;
+    }
+    if ((resource->flags & SD_GPU_RESOURCE_FLAG_REQUIRES_VAE_OUTPUT_SCALE) != 0) {
+        scale_vae_decode_output_to_image_range(&image);
+    }
+
+    const float* src = image.data();
+    uint8_t* dst = static_cast<uint8_t*>(dst_rgba8);
+    const size_t plane = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const auto to_u8 = [](float value) -> uint8_t {
+        value = std::clamp(value, 0.0f, 1.0f);
+        return static_cast<uint8_t>(value * 255.0f + 0.5f);
+    };
+    for (uint64_t y = 0; y < height; ++y) {
+        uint8_t* row = dst + y * dst_stride_bytes;
+        const size_t row_base = static_cast<size_t>(y) * static_cast<size_t>(width);
+        for (uint64_t x = 0; x < width; ++x) {
+            const size_t pixel_index = row_base + static_cast<size_t>(x);
+            uint8_t* out = row + x * 4u;
+            out[0] = to_u8(src[pixel_index + 0u * plane]);
+            out[1] = to_u8(src[pixel_index + 1u * plane]);
+            out[2] = to_u8(src[pixel_index + 2u * plane]);
+            out[3] = channels == 4 ? to_u8(src[pixel_index + 3u * plane]) : 255;
+        }
+    }
+    if (trace_gpu_handles_enabled()) {
+        LOG_INFO("[GPU] image download to caller buffer id=%" PRIu64 " %" PRIu64 "x%" PRIu64 " stride=%" PRIu64 " bytes=%" PRIu64,
+                 gpu_image,
+                 width,
+                 height,
+                 dst_stride_bytes,
+                 required_bytes);
+    }
+    return true;
+}
+
 SD_API bool sd_encode_image_normal_gpu(sd_ctx_t* sd_ctx,
                                        const sd_image_t* image,
                                        const sd_vae_run_options_t* options,
@@ -4808,6 +4913,10 @@ SD_API void free_sd_image(sd_image_t* image) {
     free(image->data);
     image->data = nullptr;
     free(image);
+}
+
+SD_API void sd_free_downloaded_image(void* ptr) {
+    free(ptr);
 }
 
 static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd_ctx_t* sd_ctx,

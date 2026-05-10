@@ -85,6 +85,8 @@ def main() -> int:
         "sd_decode_latent_normal_gpu",
         "sd_decode_gpu_latent_normal_gpu",
         "sd_gpu_image_download",
+        "sd_gpu_image_download_to_buffer",
+        "sd_free_downloaded_image",
         "sd_gpu_handle_get_desc",
         "sd_gpu_handle_retain",
         "sd_gpu_handle_release",

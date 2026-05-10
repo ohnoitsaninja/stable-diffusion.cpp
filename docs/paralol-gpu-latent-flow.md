@@ -100,6 +100,16 @@ ggml graph tensors:
   strides, byte size, flags, and refcount.
 - `sd_gpu_handle_borrow_cuda_ptr(...)` is same-process only and does not
   transfer ownership.
+- `sd_gpu_image_download(...)` writes an `sd_image_t` view whose `data` pointer
+  is allocated by the stable-diffusion.cpp DLL. Callers that copy those pixels
+  into their own buffers must release `data` with
+  `sd_free_downloaded_image(output.data)`.
+- `free_sd_image(...)` remains for APIs that return an owned `sd_image_t*`
+  wrapper struct, such as `sd_decode_latent_normal(...)`.
+- `sd_gpu_image_download_to_buffer(...)` is the preferred Paralol path when the
+  caller already owns an RGBA8 destination. It validates the GPU image handle,
+  destination size, and stride, then copies directly into caller-owned RGBA8
+  memory without returning DLL-owned CPU image memory.
 
 Do not pass raw CUDA pointers across process boundaries. Future cross-process
 or graphics interop should use a separate IPC/external-memory API.
@@ -112,7 +122,9 @@ For the next Paralol worker integration:
 - Treat image values as `CPU image OR GPU image handle`.
 - If KSampler calls `sd_sample_latent_gpu`, inspect handle flags. `CPU_BRIDGE_UPLOAD` means the sampler itself still materialized on CPU.
 - Latent Decode should prefer `sd_decode_gpu_latent_normal_gpu` when it receives a CUDA latent handle.
-- Save/export/debug consumers should explicitly call `sd_gpu_latent_download` or `sd_gpu_image_download`.
+- Save/export/debug consumers should explicitly call `sd_gpu_latent_download`,
+  `sd_gpu_image_download`, or preferably `sd_gpu_image_download_to_buffer` when
+  they already own the output buffer.
 - VAE Encode should stay on the CPU latent path for now. Do not request GPU
   encoded-latent handles until `supports_vae_encode_gpu_latent_output=true`.
 
@@ -126,6 +138,8 @@ Supported now:
   `sd_sample_latent -> sd_cpu_latent_upload -> sd_decode_gpu_latent_normal_gpu`
 - GPU image output:
   `sd_decode_gpu_latent_normal_gpu -> SD_GPU_RESOURCE_IMAGE -> sd_gpu_image_download`
+- Caller-owned image output:
+  `sd_decode_gpu_latent_normal_gpu -> SD_GPU_RESOURCE_IMAGE -> sd_gpu_image_download_to_buffer`
 
 Refused now:
 

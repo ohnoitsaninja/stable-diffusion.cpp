@@ -30,6 +30,7 @@ struct Args {
     bool download_gpu_latent = false;
     bool gpu_decode_output = false;
     bool download_gpu_output = false;
+    bool download_gpu_output_buffer = false;
     bool strict_gpu_resident = false;
     bool dump_gpu_handle_desc = false;
     bool expect_gpu_encode_refusal = false;
@@ -58,6 +59,7 @@ static void usage(const char* argv0) {
         << "  --split-decode-context   decode with a separate vae_decode_only=true context\n"
         << "  --gpu-decode-output      call sd_decode_latent_normal_gpu and keep decode output as a GPU handle\n"
         << "  --download-gpu-output    explicitly download the GPU image handle and write it\n"
+        << "  --download-gpu-output-buffer download GPU image directly into caller-owned RGBA8 memory\n"
         << "  --strict-gpu-resident    set SDCPP_STRICT_GPU_RESIDENT=1 for GPU-output checks\n"
         << "  --dump-gpu-handle-desc   print GPU handle descriptor after decode\n"
         << "  --expect-gpu-encode-refusal treat sd_encode_image_normal_gpu refusal as a passing smoke result\n"
@@ -133,6 +135,8 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.gpu_decode_output = true;
         } else if (arg == "--download-gpu-output") {
             args.download_gpu_output = true;
+        } else if (arg == "--download-gpu-output-buffer") {
+            args.download_gpu_output_buffer = true;
         } else if (arg == "--strict-gpu-resident") {
             args.strict_gpu_resident = true;
         } else if (arg == "--dump-gpu-handle-desc") {
@@ -552,7 +556,7 @@ int main(int argc, char** argv) {
                 }
                 if (!write_image_to_file(args.output, output.data, output.width, output.height, output.channel)) {
                     std::cerr << "failed to write output: " << args.output << "\n";
-                    free(output.data);
+                    sd_free_downloaded_image(output.data);
                     sd_gpu_handle_release(decode_ctx, gpu_image);
                     if (uploaded_gpu_latent != 0) sd_gpu_handle_release(ctx, uploaded_gpu_latent);
                     if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
@@ -564,7 +568,52 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 std::cout << "explicit_download_wrote " << args.output << "\n";
-                free(output.data);
+                sd_free_downloaded_image(output.data);
+            }
+            if (args.download_gpu_output_buffer) {
+                sd_gpu_tensor_desc_t desc{};
+                if (!sd_gpu_handle_get_desc(decode_ctx, gpu_image, &desc) || desc.w <= 0 || desc.h <= 0) {
+                    std::cerr << "sd_gpu_handle_get_desc for buffer download failed\n";
+                    sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (uploaded_gpu_latent != 0) sd_gpu_handle_release(ctx, uploaded_gpu_latent);
+                    if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
+                    if (encoded_gpu_latent != 0) sd_gpu_handle_release(ctx, encoded_gpu_latent);
+                    if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                    if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                const uint64_t stride = static_cast<uint64_t>(desc.w) * 4u;
+                const uint64_t bytes = stride * static_cast<uint64_t>(desc.h);
+                std::vector<uint8_t> rgba(static_cast<size_t>(bytes));
+                if (!sd_gpu_image_download_to_buffer(decode_ctx, gpu_image, rgba.data(), bytes, stride, nullptr)) {
+                    std::cerr << "sd_gpu_image_download_to_buffer failed\n";
+                    sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (uploaded_gpu_latent != 0) sd_gpu_handle_release(ctx, uploaded_gpu_latent);
+                    if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
+                    if (encoded_gpu_latent != 0) sd_gpu_handle_release(ctx, encoded_gpu_latent);
+                    if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                    if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                if (!write_image_to_file(args.output, rgba.data(), static_cast<uint32_t>(desc.w), static_cast<uint32_t>(desc.h), 4)) {
+                    std::cerr << "failed to write caller-owned output: " << args.output << "\n";
+                    sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (uploaded_gpu_latent != 0) sd_gpu_handle_release(ctx, uploaded_gpu_latent);
+                    if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
+                    if (encoded_gpu_latent != 0) sd_gpu_handle_release(ctx, encoded_gpu_latent);
+                    if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                    if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                std::cout << "caller_owned_download_wrote " << args.output
+                          << " bytes=" << bytes
+                          << " stride=" << stride << "\n";
             }
             if (!sd_gpu_handle_release(decode_ctx, gpu_image)) {
                 std::cerr << "sd_gpu_handle_release failed\n";

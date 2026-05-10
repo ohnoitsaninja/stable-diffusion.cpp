@@ -671,6 +671,12 @@ SD_API bool sd_gpu_image_download(sd_ctx_t* sd_ctx,
                                   sd_gpu_handle_t gpu_image,
                                   sd_image_t* out_cpu_image,
                                   const sd_download_options_t* options);
+SD_API bool sd_gpu_image_download_to_buffer(sd_ctx_t* sd_ctx,
+                                            sd_gpu_handle_t gpu_image,
+                                            void* dst_rgba8,
+                                            uint64_t dst_bytes,
+                                            uint64_t dst_stride_bytes,
+                                            const sd_download_options_t* options);
 SD_API bool sd_gpu_tensor_download(sd_ctx_t* sd_ctx,
                                    sd_gpu_handle_t gpu_tensor,
                                    void* dst,
@@ -680,6 +686,7 @@ SD_API bool sd_release_clip_model_params(sd_ctx_t* sd_ctx);
 SD_API bool sd_release_diffusion_model_params(sd_ctx_t* sd_ctx);
 SD_API void free_sd_latent(sd_latent_t* latent);
 SD_API void free_sd_image(sd_image_t* image);
+SD_API void sd_free_downloaded_image(void* ptr);
 
 SD_API void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params);
 SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* sd_vid_gen_params, int* num_frames_out);
