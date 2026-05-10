@@ -572,7 +572,7 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    bool vae_decode_only = true;
+    bool vae_decode_only = cli_params.mode != IMG_GEN && cli_params.mode != VID_GEN;
 
     auto load_image_and_update_size = [&](const std::string& path,
                                           SDImageOwner& image,

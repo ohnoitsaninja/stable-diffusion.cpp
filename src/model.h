@@ -184,6 +184,8 @@ struct TensorStorage {
     ggml_type expected_type = GGML_TYPE_COUNT;
     bool is_f8_e4m3         = false;
     bool is_f8_e5m2         = false;
+    bool has_f8_weight_scale = false;
+    float f8_weight_scale    = 1.0f;
     bool is_f64             = false;
     bool is_i64             = false;
     int64_t ne[SD_MAX_DIMS] = {1, 1, 1, 1, 1};

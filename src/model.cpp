@@ -179,6 +179,15 @@ void f8_e5m2_to_f16_vec(uint8_t* src, uint16_t* dst, int64_t n) {
     }
 }
 
+void scale_f16_vec(uint16_t* dst, int64_t n, float scale) {
+    if (scale == 1.0f) {
+        return;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        dst[i] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(dst[i]) * scale);
+    }
+}
+
 void f64_to_f32_vec(double* src, float* dst, int64_t n) {
     // support inplace op
     for (int64_t i = 0; i < n; i++) {
@@ -521,6 +530,41 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         return false;
     }
 
+    std::unordered_map<std::string, float> f8_weight_scales;
+    for (auto& item : header_.items()) {
+        std::string name = item.key();
+        if (!ends_with(name, ".weight_scale")) {
+            continue;
+        }
+
+        nlohmann::json tensor_info = item.value();
+        if (tensor_info.contains("dtype") && tensor_info["dtype"].get<std::string>() == "F32") {
+            nlohmann::json shape = tensor_info["shape"];
+            bool scalar_shape    = shape.empty();
+            if (!scalar_shape) {
+                scalar_shape = true;
+            }
+            for (auto& dim : shape) {
+                scalar_shape = scalar_shape && dim.get<int64_t>() == 1;
+            }
+            size_t begin = tensor_info["data_offsets"][0].get<size_t>();
+            size_t end   = tensor_info["data_offsets"][1].get<size_t>();
+            if (scalar_shape && end - begin == sizeof(float)) {
+                float scale = 1.0f;
+                file.seekg(ST_HEADER_SIZE_LEN + header_size_ + begin);
+                file.read(reinterpret_cast<char*>(&scale), sizeof(float));
+                if (!file) {
+                    LOG_ERROR("read fp8 weight scale failed: '%s'", name.c_str());
+                    return false;
+                }
+                if (!starts_with(name, prefix)) {
+                    name = prefix + name;
+                }
+                f8_weight_scales[name.substr(0, name.size() - std::string("_scale").size())] = scale;
+            }
+        }
+    }
+
     for (auto& item : header_.items()) {
         std::string name           = item.key();
         nlohmann::json tensor_info = item.value();
@@ -531,6 +575,10 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
         }
 
         if (is_unused_tensor(name)) {
+            continue;
+        }
+
+        if (ends_with(name, ".input_scale") || ends_with(name, ".weight_scale")) {
             continue;
         }
 
@@ -602,6 +650,11 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
             tensor_size_ok = (tensor_storage.nbytes() * 2 == tensor_data_size);
         } else {
             tensor_size_ok = (tensor_storage.nbytes() == tensor_data_size);
+        }
+        auto scale_it = f8_weight_scales.find(tensor_storage.name);
+        if ((tensor_storage.is_f8_e4m3 || tensor_storage.is_f8_e5m2) && scale_it != f8_weight_scales.end()) {
+            tensor_storage.has_f8_weight_scale = true;
+            tensor_storage.f8_weight_scale     = scale_it->second;
         }
         if (!tensor_size_ok) {
             LOG_ERROR("size mismatch for tensor '%s' (%s)\n", name.c_str(), dtype.c_str());
@@ -1505,8 +1558,14 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     t0 = ggml_time_ms();
                     if (tensor_storage.is_f8_e4m3) {
                         f8_e4m3_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
+                        if (tensor_storage.has_f8_weight_scale) {
+                            scale_f16_vec((uint16_t*)target_buf, tensor_storage.nelements(), tensor_storage.f8_weight_scale);
+                        }
                     } else if (tensor_storage.is_f8_e5m2) {
                         f8_e5m2_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
+                        if (tensor_storage.has_f8_weight_scale) {
+                            scale_f16_vec((uint16_t*)target_buf, tensor_storage.nelements(), tensor_storage.f8_weight_scale);
+                        }
                     } else if (tensor_storage.is_f64) {
                         f64_to_f32_vec((double*)read_buf, (float*)target_buf, tensor_storage.nelements());
                     } else if (tensor_storage.is_i64) {
