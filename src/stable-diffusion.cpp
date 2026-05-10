@@ -3012,6 +3012,10 @@ public:
     ImageVaeAxesGuard& operator=(const ImageVaeAxesGuard&) = delete;
 };
 
+static sd::Tensor<float> encode_image_tensor_for_generation(sd_ctx_t* sd_ctx,
+                                                            const sd::Tensor<float>& image_tensor,
+                                                            const char* label);
+
 static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd_ctx_t* sd_ctx,
                                                                               const sd_img_gen_params_t* sd_img_gen_params,
                                                                               GenerationRequest* request,
@@ -3080,7 +3084,7 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
     if (init_image_tensor.empty()) {
         init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height);
     } else {
-        init_latent = sd_ctx->sd->encode_first_stage(init_image_tensor);
+        init_latent = encode_image_tensor_for_generation(sd_ctx, init_image_tensor, "init_image");
         if (init_latent.empty()) {
             LOG_ERROR("failed to encode init image");
             return std::nullopt;
@@ -3089,7 +3093,7 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
 
     if (!control_image_tensor.empty() && !sd_ctx->sd->vae_decode_only && sd_version_is_control(sd_ctx->sd->version)) {
         int64_t control_encode_start = ggml_time_ms();
-        control_latent = sd_ctx->sd->encode_first_stage(control_image_tensor);
+        control_latent = encode_image_tensor_for_generation(sd_ctx, control_image_tensor, "control_image");
         if (control_latent.empty()) {
             LOG_ERROR("failed to encode control image");
             return std::nullopt;
@@ -3140,9 +3144,9 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
                       resized_ref_img.shape()[1],
                       resized_ref_img.shape()[0]);
 
-            ref_latent = sd_ctx->sd->encode_first_stage(resized_ref_img);
+            ref_latent = encode_image_tensor_for_generation(sd_ctx, resized_ref_img, "reference_image");
         } else {
-            ref_latent = sd_ctx->sd->encode_first_stage(ref_images[i]);
+            ref_latent = encode_image_tensor_for_generation(sd_ctx, ref_images[i], "reference_image");
         }
         if (ref_latent.empty()) {
             LOG_ERROR("failed to encode reference image %d", static_cast<int>(i));
@@ -3160,7 +3164,7 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         if (sd_ctx->sd->version != VERSION_FLEX_2) {
             if (!init_image_tensor.empty()) {
                 auto masked_image  = ((1.0f - mask_image_tensor) * (init_image_tensor - 0.5f)) + 0.5f;
-                masked_init_latent = sd_ctx->sd->encode_first_stage(masked_image);
+                masked_init_latent = encode_image_tensor_for_generation(sd_ctx, masked_image, "masked_init_image");
                 if (masked_init_latent.empty()) {
                     LOG_ERROR("failed to encode masked init image");
                     return std::nullopt;
@@ -3562,14 +3566,36 @@ static bool sd_gpu_resource_is_cuda(const sd_gpu_resource_private_t& resource) {
            !ggml_backend_buffer_is_host(resource.tensor->buffer);
 }
 
-static bool sd_gpu_latent_shape_is_supported(const sd_gpu_resource_private_t& resource) {
+static uint32_t expected_diffusion_latent_channels(SDVersion version) {
+    if (sd_version_is_flux2(version)) {
+        return 128;
+    }
+    if (sd_version_is_flux(version) ||
+        sd_version_is_z_image(version) ||
+        sd_version_is_sd3(version) ||
+        sd_version_is_qwen_image(version) ||
+        sd_version_is_anima(version)) {
+        return 16;
+    }
+    return 4;
+}
+
+static bool sd_model_supports_gpu_latent_decode(SDVersion version) {
+    return sd_version_is_sdxl(version) ||
+           sd_version_is_flux(version) ||
+           sd_version_is_flux2(version) ||
+           sd_version_is_z_image(version);
+}
+
+static bool sd_gpu_latent_shape_is_supported(SDVersion version, const sd_gpu_resource_private_t& resource) {
     if (resource.tensor == nullptr || resource.tensor->empty()) {
         return false;
     }
     ggml_tensor* tensor = resource.tensor->tensor;
+    const uint32_t expected_channels = expected_diffusion_latent_channels(version);
     return tensor != nullptr &&
            tensor->type == GGML_TYPE_F32 &&
-           tensor->ne[2] == 4 &&
+           tensor->ne[2] == expected_channels &&
            tensor->ne[3] == 1;
 }
 
@@ -3669,7 +3695,11 @@ static sd_vae_exec_mode_t resolve_vae_exec_mode(StableDiffusionGGML* sd, sd_vae_
         return SD_VAE_EXEC_DIRECT_GRAPH;
     }
 #ifdef SD_USE_CUDA
-    if (sd != nullptr && sd_version_is_sdxl(sd->version)) {
+    if (sd != nullptr &&
+        (sd_version_is_sdxl(sd->version) ||
+         sd_version_is_flux(sd->version) ||
+         sd_version_is_flux2(sd->version) ||
+         sd_version_is_z_image(sd->version))) {
         return SD_VAE_EXEC_COMFY_NORMAL;
     }
 #endif
@@ -3864,6 +3894,126 @@ private:
     bool had_previous_ = false;
     std::string previous_;
 };
+
+static bool should_use_normal_vae_for_generation_encode(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_ctx->sd->first_stage_model == nullptr) {
+        return false;
+    }
+#ifdef SD_USE_CUDA
+    return sd_version_is_sdxl(sd_ctx->sd->version) ||
+           sd_version_is_flux(sd_ctx->sd->version) ||
+           sd_version_is_flux2(sd_ctx->sd->version) ||
+           sd_version_is_z_image(sd_ctx->sd->version);
+#else
+    return false;
+#endif
+}
+
+static sd::Tensor<float> encode_image_tensor_normal_internal(sd_ctx_t* sd_ctx,
+                                                             const sd::Tensor<float>& image_tensor,
+                                                             const sd_vae_run_options_t* options,
+                                                             sd_vae_memory_report_t* report,
+                                                             const char* label,
+                                                             bool free_params_after) {
+    if (report != nullptr) {
+        sd_vae_memory_report_init(report);
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image_tensor.empty()) {
+        return {};
+    }
+    if (sd_ctx->sd->vae_decode_only) {
+        LOG_ERROR("%s normal VAE encode requires a VAE encode-capable context; recreate with vae_decode_only=false",
+                  label == nullptr ? "image" : label);
+        return {};
+    }
+    if (sd_ctx->sd->first_stage_model == nullptr) {
+        LOG_ERROR("%s normal VAE encode requires a loaded VAE", label == nullptr ? "image" : label);
+        return {};
+    }
+
+    sd_vae_run_options_t effective = effective_vae_options(options);
+    sd_vae_exec_mode_t resolved_mode = SD_VAE_EXEC_AUTO;
+    bool used_taesd = false;
+    if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
+        return {};
+    }
+    ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
+
+    int64_t t0 = ggml_time_ms();
+    auto vae_output = sd_ctx->sd->first_stage_model->encode(sd_ctx->sd->n_threads,
+                                                            image_tensor,
+                                                            sd_ctx->sd->vae_tiling_params,
+                                                            sd_ctx->sd->circular_x,
+                                                            sd_ctx->sd->circular_y);
+    if (vae_output.empty()) {
+        LOG_ERROR("%s normal VAE encode failed during VAE encode", label == nullptr ? "image" : label);
+        return {};
+    }
+
+    sd_vae_memory_report_t graph_report = sd_ctx->sd->first_stage_model->get_last_graph_report();
+    sd_vae_memory_report_t full_report;
+    sd_vae_memory_report_init(&full_report);
+    copy_vae_report(&full_report, graph_report, effective, resolved_mode, false, used_taesd);
+    log_vae_report(label == nullptr ? "encode" : label, full_report);
+    if (report != nullptr) {
+        *report = full_report;
+    }
+    if (vae_report_large_im2col_disallowed(graph_report, effective)) {
+        LOG_ERROR("%s normal VAE encode refused oversized IM2COL tensor: largest=%" PRIu64 " threshold=%" PRIu64,
+                  label == nullptr ? "image" : label,
+                  graph_report.largest_tensor_bytes,
+                  effective.im2col_warn_bytes);
+        return {};
+    }
+    if (vae_report_comfy_guard_failed(full_report, resolved_mode)) {
+        return {};
+    }
+
+    sd::Tensor<float> latent = sd_ctx->sd->first_stage_model->vae_output_to_latents(vae_output, sd_ctx->sd->rng);
+    if (sd_ctx->sd->version != VERSION_SD1_PIX2PIX) {
+        latent = sd_ctx->sd->first_stage_model->vae_to_diffusion_latents(latent);
+    }
+    if (free_params_after && sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
+        sd_ctx->sd->first_stage_model->free_params_buffer();
+    }
+    if (latent.empty()) {
+        LOG_ERROR("%s normal VAE encode failed during latent conversion", label == nullptr ? "image" : label);
+        return {};
+    }
+    int64_t t1 = ggml_time_ms();
+    LOG_INFO("%s normal VAE encode completed, taking %.2fs",
+             label == nullptr ? "image" : label,
+             (t1 - t0) * 1.0f / 1000);
+    return latent;
+}
+
+static sd::Tensor<float> encode_image_tensor_for_generation(sd_ctx_t* sd_ctx,
+                                                            const sd::Tensor<float>& image_tensor,
+                                                            const char* label) {
+    if (!should_use_normal_vae_for_generation_encode(sd_ctx)) {
+        return sd_ctx->sd->encode_first_stage(image_tensor);
+    }
+
+    sd_vae_run_options_t options;
+    sd_vae_run_options_init(&options);
+    options.mode = SD_VAE_EXEC_AUTO;
+    options.allow_tiling = false;
+    options.allow_taesd = false;
+    options.fail_on_large_im2col = true;
+
+    sd::Tensor<float> latent = encode_image_tensor_normal_internal(sd_ctx,
+                                                                   image_tensor,
+                                                                   &options,
+                                                                   nullptr,
+                                                                   label,
+                                                                   false);
+    if (latent.empty()) {
+        LOG_ERROR("%s normal VAE encode failed; refusing legacy fallback for COMFY_NORMAL-capable model version %d",
+                  label == nullptr ? "image" : label,
+                  static_cast<int>(sd_ctx->sd->version));
+    }
+    return latent;
+}
 
 static bool validate_init_latent_shape(sd_ctx_t* sd_ctx,
                                        const GenerationRequest& request,
@@ -4082,55 +4232,15 @@ SD_API sd_latent_t* sd_encode_image_normal(sd_ctx_t* sd_ctx,
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image == nullptr || image->data == nullptr) {
         return nullptr;
     }
-    if (sd_ctx->sd->vae_decode_only) {
-        LOG_ERROR("sd_encode_image_normal requires a VAE encode-capable context; recreate with vae_decode_only=false");
-        return nullptr;
-    }
-
-    sd_vae_run_options_t effective = effective_vae_options(options);
-    sd_vae_exec_mode_t resolved_mode = SD_VAE_EXEC_AUTO;
-    bool used_taesd = false;
-    if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
-        return nullptr;
-    }
-    ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
 
     int64_t t0 = ggml_time_ms();
     sd::Tensor<float> image_tensor = sd_image_to_tensor(*image);
-    auto vae_output = sd_ctx->sd->first_stage_model->encode(sd_ctx->sd->n_threads,
-                                                            image_tensor,
-                                                            sd_ctx->sd->vae_tiling_params,
-                                                            sd_ctx->sd->circular_x,
-                                                            sd_ctx->sd->circular_y);
-    if (vae_output.empty()) {
-        LOG_ERROR("sd_encode_image_normal failed during VAE encode");
-        return nullptr;
-    }
-    sd_vae_memory_report_t graph_report = sd_ctx->sd->first_stage_model->get_last_graph_report();
-    sd_vae_memory_report_t full_report;
-    sd_vae_memory_report_init(&full_report);
-    copy_vae_report(&full_report, graph_report, effective, resolved_mode, false, used_taesd);
-    log_vae_report("encode", full_report);
-    if (report != nullptr) {
-        *report = full_report;
-    }
-    if (vae_report_large_im2col_disallowed(graph_report, effective)) {
-        LOG_ERROR("sd_encode_image_normal refused oversized IM2COL tensor: largest=%" PRIu64 " threshold=%" PRIu64,
-                  graph_report.largest_tensor_bytes,
-                  effective.im2col_warn_bytes);
-        return nullptr;
-    }
-    if (vae_report_comfy_guard_failed(full_report, resolved_mode)) {
-        return nullptr;
-    }
-
-    sd::Tensor<float> latent = sd_ctx->sd->first_stage_model->vae_output_to_latents(vae_output, sd_ctx->sd->rng);
-    if (sd_ctx->sd->version != VERSION_SD1_PIX2PIX) {
-        latent = sd_ctx->sd->first_stage_model->vae_to_diffusion_latents(latent);
-    }
-    if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
-        sd_ctx->sd->first_stage_model->free_params_buffer();
-    }
+    sd::Tensor<float> latent = encode_image_tensor_normal_internal(sd_ctx,
+                                                                   image_tensor,
+                                                                   options,
+                                                                   report,
+                                                                   "encode",
+                                                                   true);
     if (latent.empty()) {
         LOG_ERROR("sd_encode_image_normal failed");
         return nullptr;
@@ -4428,9 +4538,10 @@ SD_API bool sd_estimate_vae_normal_memory(sd_ctx_t* sd_ctx,
             LOG_ERROR("sd_estimate_vae_normal_memory decode dimensions must be divisible by VAE scale factor %d", scale_factor);
             return false;
         }
+        const uint32_t latent_channels = expected_diffusion_latent_channels(sd_ctx->sd->version);
         input = sd::zeros<float>({static_cast<int64_t>(width / scale_factor),
                                   static_cast<int64_t>(height / scale_factor),
-                                  4,
+                                  static_cast<int64_t>(latent_channels),
                                   1});
         input = sd_ctx->sd->first_stage_model->diffusion_to_vae_latents(input);
     } else {
@@ -4479,7 +4590,11 @@ SD_API bool sd_get_vae_capabilities(sd_ctx_t* sd_ctx, sd_vae_capabilities_t* cap
     capabilities->supports_normal_decode = true;
     capabilities->supports_memory_report = true;
     capabilities->supports_no_im2col_guard = true;
-    if (sd_ctx != nullptr && sd_ctx->sd != nullptr && !sd_version_is_sdxl(sd_ctx->sd->version)) {
+    if (sd_ctx != nullptr && sd_ctx->sd != nullptr &&
+        !(sd_version_is_sdxl(sd_ctx->sd->version) ||
+          sd_version_is_flux(sd_ctx->sd->version) ||
+          sd_version_is_flux2(sd_ctx->sd->version) ||
+          sd_version_is_z_image(sd_ctx->sd->version))) {
         capabilities->supports_comfy_normal = false;
     }
     return true;
@@ -4509,6 +4624,143 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_cuda_pointer_borrow = true;
     capabilities->supports_cuda_ipc_export = false;
     capabilities->supports_external_memory_interop = false;
+    return true;
+}
+
+static sd_model_family_t sd_model_family_from_version(SDVersion version) {
+    if (sd_version_is_sd1(version)) {
+        return SD_MODEL_FAMILY_SD1;
+    }
+    if (sd_version_is_sd2(version)) {
+        return SD_MODEL_FAMILY_SD2;
+    }
+    if (sd_version_is_sdxl(version)) {
+        return SD_MODEL_FAMILY_SDXL;
+    }
+    if (sd_version_is_sd3(version)) {
+        return SD_MODEL_FAMILY_SD3;
+    }
+    if (sd_version_is_flux2(version)) {
+        return SD_MODEL_FAMILY_FLUX2;
+    }
+    if (sd_version_is_flux(version)) {
+        return SD_MODEL_FAMILY_FLUX;
+    }
+    if (sd_version_is_z_image(version)) {
+        return SD_MODEL_FAMILY_Z_IMAGE;
+    }
+    if (sd_version_is_wan(version)) {
+        return SD_MODEL_FAMILY_WAN;
+    }
+    if (sd_version_is_qwen_image(version)) {
+        return SD_MODEL_FAMILY_QWEN_IMAGE;
+    }
+    return SD_MODEL_FAMILY_UNKNOWN;
+}
+
+static const char* sd_model_family_name(sd_model_family_t family) {
+    switch (family) {
+        case SD_MODEL_FAMILY_SD1:
+            return "sd1";
+        case SD_MODEL_FAMILY_SD2:
+            return "sd2";
+        case SD_MODEL_FAMILY_SDXL:
+            return "sdxl";
+        case SD_MODEL_FAMILY_SD3:
+            return "sd3";
+        case SD_MODEL_FAMILY_FLUX:
+            return "flux";
+        case SD_MODEL_FAMILY_FLUX2:
+            return "flux2";
+        case SD_MODEL_FAMILY_Z_IMAGE:
+            return "z_image";
+        case SD_MODEL_FAMILY_WAN:
+            return "wan";
+        case SD_MODEL_FAMILY_QWEN_IMAGE:
+            return "qwen_image";
+        case SD_MODEL_FAMILY_UNKNOWN:
+        default:
+            return "unknown";
+    }
+}
+
+static bool sd_model_supports_reference_images(SDVersion version) {
+    return sd_version_is_unet_edit(version) ||
+           sd_version_is_flux2(version) ||
+           sd_version_is_z_image(version) ||
+           sd_version_is_qwen_image(version);
+}
+
+SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeline_capabilities_t* capabilities) {
+    if (capabilities == nullptr) {
+        return false;
+    }
+    *capabilities = {};
+    capabilities->struct_size = sizeof(sd_model_pipeline_capabilities_t);
+    capabilities->version = SD_VAE_API_VERSION;
+    capabilities->family = SD_MODEL_FAMILY_UNKNOWN;
+    std::snprintf(capabilities->family_name, sizeof(capabilities->family_name), "%s", "unknown");
+    capabilities->latent_channels = 4;
+    capabilities->vae_scale_factor = 8;
+    capabilities->default_sample_method = EULER_A_SAMPLE_METHOD;
+    capabilities->default_scheduler = DISCRETE_SCHEDULER;
+    capabilities->default_cfg_scale = 7.0f;
+    capabilities->default_steps = 20;
+    capabilities->supports_text_to_image = true;
+    capabilities->supports_image_to_image = true;
+    capabilities->supports_gpu_sample_bridge_output = false;
+    capabilities->supports_gpu_latent_decode = false;
+    capabilities->supports_gpu_image_output = false;
+    capabilities->supports_vae_encode = true;
+    capabilities->supports_vae_encode_gpu_output = false;
+    capabilities->supports_reference_images = false;
+    capabilities->supports_edit_mode = false;
+    capabilities->supports_edit_reference_conditioning = false;
+    capabilities->supports_comfy_reference_vae_encode = false;
+    capabilities->strict_gpu_sample_is_true_resident = false;
+
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return true;
+    }
+
+    SDVersion version = sd_ctx->sd->version;
+    capabilities->family = sd_model_family_from_version(version);
+    std::snprintf(capabilities->family_name,
+                  sizeof(capabilities->family_name),
+                  "%s",
+                  sd_model_family_name(capabilities->family));
+    capabilities->latent_channels = expected_diffusion_latent_channels(version);
+    if (sd_ctx->sd->first_stage_model != nullptr) {
+        capabilities->vae_scale_factor = static_cast<uint32_t>(sd_ctx->sd->first_stage_model->get_scale_factor());
+    }
+    capabilities->default_sample_method = sd_get_default_sample_method(sd_ctx);
+    capabilities->default_scheduler = sd_get_default_scheduler(sd_ctx, capabilities->default_sample_method);
+    capabilities->default_flow_shift = std::isfinite(sd_ctx->sd->default_flow_shift) ? sd_ctx->sd->default_flow_shift : 0.0f;
+    capabilities->supports_gpu_sample_bridge_output = true;
+    capabilities->supports_gpu_latent_decode = sd_model_supports_gpu_latent_decode(version);
+    capabilities->supports_gpu_image_output = capabilities->supports_gpu_latent_decode;
+    capabilities->supports_reference_images = sd_model_supports_reference_images(version);
+    capabilities->supports_edit_mode = sd_model_supports_reference_images(version);
+    capabilities->supports_edit_reference_conditioning = sd_model_supports_reference_images(version);
+    capabilities->supports_comfy_reference_vae_encode =
+        capabilities->supports_edit_reference_conditioning &&
+        should_use_normal_vae_for_generation_encode(sd_ctx);
+
+    if (sd_version_is_dit(version)) {
+        capabilities->default_cfg_scale = 1.0f;
+        capabilities->default_steps = sd_version_is_z_image(version) ? 9 : 4;
+        capabilities->requires_llm = sd_version_is_flux2(version) || sd_version_is_z_image(version);
+        capabilities->requires_clip_l = sd_version_is_flux(version) && !sd_version_is_flux2(version);
+        capabilities->requires_t5xxl = sd_version_is_flux(version) && !sd_version_is_flux2(version);
+    }
+    if (sd_version_is_z_image(version)) {
+        capabilities->requires_llm = true;
+        capabilities->requires_clip_l = false;
+        capabilities->requires_t5xxl = false;
+    }
+    if (sd_version_is_flux2(version)) {
+        capabilities->requires_llm = true;
+    }
     return true;
 }
 
@@ -4844,8 +5096,25 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         LOG_ERROR("sd_decode_gpu_latent_normal_gpu requires a CUDA latent handle");
         return false;
     }
-    if (!sd_gpu_latent_shape_is_supported(*resource)) {
-        LOG_ERROR("sd_decode_gpu_latent_normal_gpu unsupported latent shape/type");
+    if (!sd_model_supports_gpu_latent_decode(sd_ctx->sd->version)) {
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu unsupported for model version %d; capability supports_gpu_latent_decode=false",
+                  static_cast<int>(sd_ctx->sd->version));
+        return false;
+    }
+    if (!sd_gpu_latent_shape_is_supported(sd_ctx->sd->version, *resource)) {
+        sd_gpu_tensor_desc_t desc;
+        if (sd_gpu_fill_desc(*resource, &desc)) {
+            LOG_ERROR("sd_decode_gpu_latent_normal_gpu unsupported latent shape/type for model version %d: dtype=%d shape_nchw=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " expected_channels=%u",
+                      static_cast<int>(sd_ctx->sd->version),
+                      static_cast<int>(desc.dtype),
+                      desc.n,
+                      desc.c,
+                      desc.h,
+                      desc.w,
+                      expected_diffusion_latent_channels(sd_ctx->sd->version));
+        } else {
+            LOG_ERROR("sd_decode_gpu_latent_normal_gpu unsupported latent shape/type");
+        }
         return false;
     }
     if ((resource->flags & SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT) != 0) {

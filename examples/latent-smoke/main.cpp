@@ -10,11 +10,21 @@
 
 struct Args {
     std::string model;
+    std::string diffusion_model;
+    std::string vae;
+    std::string clip_l;
+    std::string t5xxl;
+    std::string llm;
     std::string image;
+    std::string ref_image;
     std::string output = "latent_smoke.png";
+    std::string prompt = "a detailed fantasy orc portrait, high quality";
+    std::string negative_prompt = "blurry, low quality, noisy";
     int image_channels = 4;
     int width          = 0;
     int height         = 0;
+    int steps          = 0;
+    float cfg_scale    = 0.0f;
     bool sample        = false;
     bool sample_without_init = false;
     bool decode        = true;
@@ -39,10 +49,20 @@ struct Args {
 
 static void usage(const char* argv0) {
     std::cerr
-        << "Usage: " << argv0 << " --model <model> --image <image> [options]\n"
+        << "Usage: " << argv0 << " (--model <model> | --diffusion-model <path> --vae <path> ...) --image <image> [options]\n"
         << "Options:\n"
+        << "  --diffusion-model <path> split diffusion model path for Flux/Z/Wan style contexts\n"
+        << "  --vae <path>             external VAE/AE path for split model contexts\n"
+        << "  --clip-l <path>          CLIP-L text encoder path\n"
+        << "  --t5xxl <path>           T5XXL text encoder path\n"
+        << "  --llm <path>             LLM text encoder path\n"
         << "  --output <path>          decoded output path (default: latent_smoke.png)\n"
+        << "  --prompt <text>          prompt for sampler smoke\n"
+        << "  --negative-prompt <text> negative prompt for sampler smoke\n"
+        << "  --steps <int>            sampler steps override\n"
+        << "  --cfg-scale <float>      text/image CFG override\n"
         << "  --image-channels <3|4>   channel count to load and pass into sd_encode_image (default: 4)\n"
+        << "  --ref-image <path>       reference image for edit/reference-conditioning smoke\n"
         << "  --width <int>            optional target width for sample/decode path\n"
         << "  --height <int>           optional target height for sample/decode path\n"
         << "  --vae-conv-direct        enable direct VAE convolution\n"
@@ -82,14 +102,54 @@ static bool parse_args(int argc, char** argv, Args& args) {
             const char* value = need_value("--model");
             if (value == nullptr) return false;
             args.model = value;
+        } else if (arg == "--diffusion-model") {
+            const char* value = need_value("--diffusion-model");
+            if (value == nullptr) return false;
+            args.diffusion_model = value;
+        } else if (arg == "--vae") {
+            const char* value = need_value("--vae");
+            if (value == nullptr) return false;
+            args.vae = value;
+        } else if (arg == "--clip-l") {
+            const char* value = need_value("--clip-l");
+            if (value == nullptr) return false;
+            args.clip_l = value;
+        } else if (arg == "--t5xxl") {
+            const char* value = need_value("--t5xxl");
+            if (value == nullptr) return false;
+            args.t5xxl = value;
+        } else if (arg == "--llm") {
+            const char* value = need_value("--llm");
+            if (value == nullptr) return false;
+            args.llm = value;
         } else if (arg == "--image") {
             const char* value = need_value("--image");
             if (value == nullptr) return false;
             args.image = value;
+        } else if (arg == "--ref-image") {
+            const char* value = need_value("--ref-image");
+            if (value == nullptr) return false;
+            args.ref_image = value;
         } else if (arg == "--output") {
             const char* value = need_value("--output");
             if (value == nullptr) return false;
             args.output = value;
+        } else if (arg == "--prompt") {
+            const char* value = need_value("--prompt");
+            if (value == nullptr) return false;
+            args.prompt = value;
+        } else if (arg == "--negative-prompt") {
+            const char* value = need_value("--negative-prompt");
+            if (value == nullptr) return false;
+            args.negative_prompt = value;
+        } else if (arg == "--steps") {
+            const char* value = need_value("--steps");
+            if (value == nullptr) return false;
+            args.steps = std::atoi(value);
+        } else if (arg == "--cfg-scale") {
+            const char* value = need_value("--cfg-scale");
+            if (value == nullptr) return false;
+            args.cfg_scale = static_cast<float>(std::atof(value));
         } else if (arg == "--image-channels") {
             const char* value = need_value("--image-channels");
             if (value == nullptr) return false;
@@ -153,7 +213,7 @@ static bool parse_args(int argc, char** argv, Args& args) {
         }
     }
 
-    if (args.model.empty() || args.image.empty()) {
+    if ((args.model.empty() && args.diffusion_model.empty()) || args.image.empty()) {
         return false;
     }
     if (args.image_channels != 3 && args.image_channels != 4) {
@@ -174,7 +234,12 @@ static void set_env_value(const char* name, const char* value) {
 static sd_ctx_t* create_context(const Args& args, bool vae_decode_only) {
     sd_ctx_params_t ctx_params;
     sd_ctx_params_init(&ctx_params);
-    ctx_params.model_path            = args.model.c_str();
+    ctx_params.model_path            = args.model.empty() ? nullptr : args.model.c_str();
+    ctx_params.diffusion_model_path  = args.diffusion_model.empty() ? nullptr : args.diffusion_model.c_str();
+    ctx_params.vae_path              = args.vae.empty() ? nullptr : args.vae.c_str();
+    ctx_params.clip_l_path           = args.clip_l.empty() ? nullptr : args.clip_l.c_str();
+    ctx_params.t5xxl_path            = args.t5xxl.empty() ? nullptr : args.t5xxl.c_str();
+    ctx_params.llm_path              = args.llm.empty() ? nullptr : args.llm.c_str();
     ctx_params.vae_decode_only       = vae_decode_only;
     ctx_params.diffusion_flash_attn  = true;
     ctx_params.vae_conv_direct       = args.vae_conv_direct;
@@ -267,6 +332,36 @@ static void print_gpu_desc(sd_ctx_t* ctx, const char* label, sd_gpu_handle_t han
               << " refcount=" << desc.refcount << "\n";
 }
 
+static void print_model_capabilities(sd_ctx_t* ctx) {
+    sd_model_pipeline_capabilities_t caps{};
+    if (!sd_get_model_pipeline_capabilities(ctx, &caps)) {
+        std::cout << "model_capabilities unavailable\n";
+        return;
+    }
+    std::cout << "model_capabilities family=" << caps.family_name
+              << " family_id=" << caps.family
+              << " latent_channels=" << caps.latent_channels
+              << " vae_scale=" << caps.vae_scale_factor
+              << " default_sample=" << sd_sample_method_name(caps.default_sample_method)
+              << " default_scheduler=" << sd_scheduler_name(caps.default_scheduler)
+              << " default_cfg=" << caps.default_cfg_scale
+              << " default_steps=" << caps.default_steps
+              << " default_flow_shift=" << caps.default_flow_shift
+              << " requires_clip_l=" << (caps.requires_clip_l ? "true" : "false")
+              << " requires_t5xxl=" << (caps.requires_t5xxl ? "true" : "false")
+              << " requires_llm=" << (caps.requires_llm ? "true" : "false")
+              << " gpu_sample_bridge=" << (caps.supports_gpu_sample_bridge_output ? "true" : "false")
+              << " gpu_latent_decode=" << (caps.supports_gpu_latent_decode ? "true" : "false")
+              << " gpu_image_output=" << (caps.supports_gpu_image_output ? "true" : "false")
+              << " gpu_vae_encode=" << (caps.supports_vae_encode_gpu_output ? "true" : "false")
+              << " reference_images=" << (caps.supports_reference_images ? "true" : "false")
+              << " edit_mode=" << (caps.supports_edit_mode ? "true" : "false")
+              << " edit_reference_conditioning=" << (caps.supports_edit_reference_conditioning ? "true" : "false")
+              << " comfy_reference_vae_encode=" << (caps.supports_comfy_reference_vae_encode ? "true" : "false")
+              << " strict_sampler_true_resident=" << (caps.strict_gpu_sample_is_true_resident ? "true" : "false")
+              << "\n";
+}
+
 static void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
     (void)data;
     log_print(level, log, true, false);
@@ -291,6 +386,7 @@ int main(int argc, char** argv) {
         std::cerr << "new_sd_ctx failed\n";
         return 1;
     }
+    print_model_capabilities(ctx);
 
     sd_image_t image{};
     if (!load_sd_image_from_file(&image, args.image.c_str(), 0, 0, args.image_channels)) {
@@ -390,25 +486,42 @@ int main(int argc, char** argv) {
     sd_latent_t* latent_to_decode = encoded;
     sd_gpu_handle_t sampled_gpu_latent = 0;
     if (args.sample) {
+        sd_image_t ref_image{};
         sd_img_gen_params_t gen_params;
         sd_img_gen_params_init(&gen_params);
-        gen_params.prompt          = "a detailed fantasy orc portrait, high quality";
-        gen_params.negative_prompt = "blurry, low quality, noisy";
+        sd_model_pipeline_capabilities_t caps{};
+        sd_get_model_pipeline_capabilities(ctx, &caps);
+        gen_params.prompt          = args.prompt.c_str();
+        gen_params.negative_prompt = args.negative_prompt.c_str();
         gen_params.width           = args.width > 0 ? args.width : static_cast<int>(image.width);
         gen_params.height          = args.height > 0 ? args.height : static_cast<int>(image.height);
         gen_params.seed            = 12345;
         gen_params.strength        = 0.65f;
-        gen_params.sample_params.sample_steps          = 8;
-        gen_params.sample_params.guidance.txt_cfg      = 1.2f;
-        gen_params.sample_params.guidance.img_cfg      = 1.2f;
-        gen_params.sample_params.sample_method         = EULER_SAMPLE_METHOD;
-        gen_params.sample_params.scheduler             = KARRAS_SCHEDULER;
+        gen_params.sample_params.sample_steps          = args.steps > 0 ? args.steps : (caps.default_steps > 0 ? caps.default_steps : 8);
+        gen_params.sample_params.guidance.txt_cfg      = args.cfg_scale > 0.0f ? args.cfg_scale : (caps.default_cfg_scale > 0.0f ? caps.default_cfg_scale : 1.2f);
+        gen_params.sample_params.guidance.img_cfg      = gen_params.sample_params.guidance.txt_cfg;
+        gen_params.sample_params.sample_method         = caps.default_sample_method;
+        gen_params.sample_params.scheduler             = caps.default_scheduler;
+        gen_params.sample_params.flow_shift            = caps.default_flow_shift;
         gen_params.vae_tiling_params                   = tiling;
+        if (!args.ref_image.empty()) {
+            if (!load_sd_image_from_file(&ref_image, args.ref_image.c_str(), 0, 0, 3)) {
+                std::cerr << "failed to load reference image: " << args.ref_image << "\n";
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            gen_params.ref_images = &ref_image;
+            gen_params.ref_images_count = 1;
+            gen_params.auto_resize_ref_image = true;
+            std::cout << "loaded reference image " << ref_image.width << "x" << ref_image.height << "x" << ref_image.channel << "\n";
+        }
 
         if (args.gpu_sample_output) {
             std::cout << "calling sd_sample_latent_gpu\n";
             if (!sd_sample_latent_gpu(ctx, &gen_params, args.sample_without_init ? nullptr : encoded, &sampled_gpu_latent)) {
                 std::cerr << "sd_sample_latent_gpu failed\n";
+                if (ref_image.data != nullptr) free(ref_image.data);
                 if (encoded != nullptr) free_sd_latent(encoded);
                 free_sd_ctx(ctx);
                 return 1;
@@ -435,6 +548,7 @@ int main(int argc, char** argv) {
             sd_latent_t* sampled = sd_sample_latent(ctx, &gen_params, args.sample_without_init ? nullptr : encoded);
             if (sampled == nullptr) {
                 std::cerr << "sd_sample_latent failed\n";
+                if (ref_image.data != nullptr) free(ref_image.data);
                 if (encoded != nullptr) free_sd_latent(encoded);
                 free_sd_ctx(ctx);
                 return 1;
@@ -442,6 +556,9 @@ int main(int argc, char** argv) {
             std::cout << "sampled latent " << sampled->width << "x" << sampled->height << "x"
                       << sampled->channel << " elements=" << sampled->element_count << "\n";
             latent_to_decode = sampled;
+        }
+        if (ref_image.data != nullptr) {
+            free(ref_image.data);
         }
     }
 

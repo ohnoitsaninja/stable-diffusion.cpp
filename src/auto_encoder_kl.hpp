@@ -801,6 +801,9 @@ struct AutoEncoderKL : public VAE {
     float shift_factor = 0.f;
     bool decode_only   = true;
     bool comfy_normal_enabled = false;
+    float diffusion_to_vae_shift_input = 0.f;
+    std::vector<float> diffusion_to_vae_flux2_mean_input;
+    std::vector<float> diffusion_to_vae_flux2_std_scaled_input;
     AutoEncoderKLModel ae;
 
     AutoEncoderKL(ggml_backend_t backend,
@@ -901,12 +904,43 @@ struct AutoEncoderKL : public VAE {
         return gf;
     }
 
+    void prepare_flux2_diffusion_to_vae_inputs() {
+        if (diffusion_to_vae_flux2_mean_input.size() == 128 &&
+            diffusion_to_vae_flux2_std_scaled_input.size() == 128) {
+            return;
+        }
+        sd::Tensor<float> dummy({1, 1, 128, 1});
+        auto [mean_tensor, std_tensor] = get_latents_mean_std(dummy, 2);
+        diffusion_to_vae_flux2_mean_input.assign(mean_tensor.data(), mean_tensor.data() + mean_tensor.numel());
+        diffusion_to_vae_flux2_std_scaled_input.resize(static_cast<size_t>(std_tensor.numel()));
+        for (int64_t i = 0; i < std_tensor.numel(); ++i) {
+            diffusion_to_vae_flux2_std_scaled_input[static_cast<size_t>(i)] = std_tensor[i] / scale_factor;
+        }
+    }
+
     ggml_cgraph* build_diffusion_to_vae_latent_graph(ggml_tensor* z) {
         ggml_cgraph* gf = ggml_new_graph(compute_ctx);
-        ggml_tensor* out = ggml_scale(compute_ctx, z, 1.0f / scale_factor);
-        if (shift_factor != 0.0f) {
-            ggml_tensor* shift = ggml_new_f32(compute_ctx, shift_factor);
-            out = ggml_add1(compute_ctx, out, shift);
+
+        ggml_tensor* out = nullptr;
+        if (sd_version_is_flux2(version)) {
+            prepare_flux2_diffusion_to_vae_inputs();
+
+            ggml_tensor* std_scaled = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 128, 1);
+            set_backend_tensor_data(std_scaled, diffusion_to_vae_flux2_std_scaled_input.data());
+            out = ggml_mul(compute_ctx, z, std_scaled);
+
+            ggml_tensor* mean_base = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 128, 1);
+            set_backend_tensor_data(mean_base, diffusion_to_vae_flux2_mean_input.data());
+            ggml_tensor* mean = ggml_repeat(compute_ctx, mean_base, out);
+            out = ggml_add(compute_ctx, out, mean);
+        } else {
+            out = ggml_scale(compute_ctx, z, 1.0f / scale_factor);
+            if (shift_factor != 0.0f) {
+                diffusion_to_vae_shift_input = shift_factor;
+                ggml_tensor* shift = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_F32, 1);
+                set_backend_tensor_data(shift, &diffusion_to_vae_shift_input);
+                out = ggml_add1(compute_ctx, out, shift);
+            }
         }
         ggml_build_forward_expand(gf, out);
         return gf;
@@ -1137,10 +1171,6 @@ struct AutoEncoderKL : public VAE {
         SD_UNUSED(circular_x);
         SD_UNUSED(circular_y);
         if (!comfy_normal_enabled || tiling_params.enabled || x == nullptr || x->empty()) {
-            return nullptr;
-        }
-        if (sd_version_is_flux2(version)) {
-            LOG_ERROR("GPU latent VAE decode currently does not support Flux2 latent mean/std transforms");
             return nullptr;
         }
         int64_t t0 = ggml_time_ms();
