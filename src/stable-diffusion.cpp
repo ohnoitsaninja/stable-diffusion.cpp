@@ -1712,6 +1712,8 @@ public:
         SamplePreviewContext preview = prepare_sample_preview_context();
 
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::Tensor<float> {
+            const bool trace_controlnet = env_flag_enabled("SDCPP_TRACE_CONTROLNET");
+            const int64_t step_start_ms = trace_controlnet ? ggml_time_ms() : 0;
             if (step == 1 || step == -1) {
                 pretty_progress(0, (int)steps, 0);
             }
@@ -1778,6 +1780,7 @@ public:
                                     "cond");
 
             auto run_condition = [&](const SDCondition& condition,
+                                     const char* pass_name,
                                      const sd::Tensor<float>* c_concat_override = nullptr,
                                      const std::vector<int>* local_skip_layers  = nullptr) -> sd::Tensor<float> {
                 diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
@@ -1789,13 +1792,30 @@ public:
 
                 sd::Tensor<float> cached_output;
                 if (step_cache.before_condition(&condition, noised_input, &cached_output)) {
+                    if (trace_controlnet) {
+                        LOG_INFO("[Denoise] step=%d pass=%s cache_hit=true backend_controls=%zu host_controls=%zu",
+                                 step,
+                                 pass_name ? pass_name : "unknown",
+                                 backend_controls.size(),
+                                 controls.size());
+                    }
                     return std::move(cached_output);
                 }
 
+                int64_t unet_start_ms = trace_controlnet ? ggml_time_ms() : 0;
                 auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
+                int64_t unet_ms = trace_controlnet ? ggml_time_ms() - unet_start_ms : 0;
                 if (output_opt.empty()) {
                     LOG_ERROR("diffusion model compute failed");
                     return sd::Tensor<float>();
+                }
+                if (trace_controlnet) {
+                    LOG_INFO("[Denoise] step=%d pass=%s unet_compute=%" PRId64 "ms backend_controls=%zu host_controls=%zu",
+                             step,
+                             pass_name ? pass_name : "unknown",
+                             unet_ms,
+                             backend_controls.size(),
+                             controls.size());
                 }
 
                 step_cache.after_condition(&condition, noised_input, output_opt);
@@ -1803,13 +1823,14 @@ public:
             };
 
             if (start_merge_step == -1 || step <= start_merge_step) {
-                cond_out = run_condition(cond);
+                cond_out = run_condition(cond, "cond");
                 if (cond_out.empty()) {
                     return {};
                 }
             } else {
                 GGML_ASSERT(!id_cond.empty());
                 cond_out = run_condition(id_cond,
+                                         "id_cond",
                                          cond.c_concat.empty() ? nullptr : &cond.c_concat);
                 if (cond_out.empty()) {
                     return {};
@@ -1826,13 +1847,14 @@ public:
                                             &backend_controls,
                                             "uncond");
                 }
-                uncond_out = run_condition(uncond);
+                uncond_out = run_condition(uncond, "uncond");
                 if (uncond_out.empty()) {
                     return {};
                 }
             }
             if (!img_cond.empty()) {
                 img_cond_out = run_condition(img_cond,
+                                             "img_cond",
                                              cond.c_concat.empty() ? nullptr : &cond.c_concat);
                 if (img_cond_out.empty()) {
                     return {};
@@ -1845,6 +1867,7 @@ public:
                 LOG_DEBUG("Skipping layers at step %d\n", step);
                 if (!step_cache.is_step_skipped()) {
                     skip_cond_out = run_condition(cond,
+                                                  "skip_cond",
                                                   cond.c_concat.empty() ? nullptr : &cond.c_concat,
                                                   &skip_layers);
                     if (skip_cond_out.empty()) {
@@ -1879,6 +1902,9 @@ public:
             }
             if (sd_should_preview_denoised() && preview.callback != nullptr) {
                 preview_image(step, denoised, version, preview.mode, preview.callback, preview.data, false);
+            }
+            if (trace_controlnet) {
+                LOG_INFO("[Denoise] step=%d total=%" PRId64 "ms", step, ggml_time_ms() - step_start_ms);
             }
             report_sample_progress(step, steps, t0);
             return denoised;
