@@ -1246,7 +1246,7 @@ ArgOptions SDGenerationParams::get_options() {
          on_dpmpp_sde_solver_arg},
         {"",
          "--scheduler",
-         "denoiser sigma scheduler, one of [discrete, karras, exponential, ays, gits, smoothstep, sgm_uniform, simple, kl_optimal, lcm, bong_tangent], default: discrete",
+         "denoiser sigma scheduler, one of [discrete, karras, exponential, ays, gits, smoothstep, sgm_uniform, simple, kl_optimal, lcm, bong_tangent, beta], default: discrete",
          on_scheduler_arg},
         {"",
          "--sigmas",

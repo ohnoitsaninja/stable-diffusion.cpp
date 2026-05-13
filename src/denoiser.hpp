@@ -355,6 +355,117 @@ struct SmoothStepScheduler : SigmaScheduler {
     }
 };
 
+struct BetaScheduler : SigmaScheduler {
+    static double beta_continued_fraction(double a, double b, double x) {
+        constexpr int max_iter = 200;
+        constexpr double eps = 3.0e-14;
+        constexpr double fpmin = 1.0e-300;
+
+        double qab = a + b;
+        double qap = a + 1.0;
+        double qam = a - 1.0;
+        double c = 1.0;
+        double d = 1.0 - qab * x / qap;
+        if (std::fabs(d) < fpmin) {
+            d = fpmin;
+        }
+        d = 1.0 / d;
+        double h = d;
+
+        for (int m = 1; m <= max_iter; ++m) {
+            int m2 = 2 * m;
+            double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+            d = 1.0 + aa * d;
+            if (std::fabs(d) < fpmin) {
+                d = fpmin;
+            }
+            c = 1.0 + aa / c;
+            if (std::fabs(c) < fpmin) {
+                c = fpmin;
+            }
+            d = 1.0 / d;
+            h *= d * c;
+
+            aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+            d = 1.0 + aa * d;
+            if (std::fabs(d) < fpmin) {
+                d = fpmin;
+            }
+            c = 1.0 + aa / c;
+            if (std::fabs(c) < fpmin) {
+                c = fpmin;
+            }
+            d = 1.0 / d;
+            double del = d * c;
+            h *= del;
+            if (std::fabs(del - 1.0) <= eps) {
+                break;
+            }
+        }
+        return h;
+    }
+
+    static double regularized_incomplete_beta(double a, double b, double x) {
+        if (x <= 0.0) {
+            return 0.0;
+        }
+        if (x >= 1.0) {
+            return 1.0;
+        }
+
+        double bt = std::exp(std::lgamma(a + b) - std::lgamma(a) - std::lgamma(b) +
+                             a * std::log(x) + b * std::log1p(-x));
+        if (x < (a + 1.0) / (a + b + 2.0)) {
+            return bt * beta_continued_fraction(a, b, x) / a;
+        }
+        return 1.0 - bt * beta_continued_fraction(b, a, 1.0 - x) / b;
+    }
+
+    static double beta_ppf(double p, double a = 0.6, double b = 0.6) {
+        if (p <= 0.0) {
+            return 0.0;
+        }
+        if (p >= 1.0) {
+            return 1.0;
+        }
+
+        double lo = 0.0;
+        double hi = 1.0;
+        for (int i = 0; i < 80; ++i) {
+            double mid = (lo + hi) * 0.5;
+            double cdf = regularized_incomplete_beta(a, b, mid);
+            if (cdf < p) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return (lo + hi) * 0.5;
+    }
+
+    std::vector<float> get_sigmas(uint32_t n, float /*sigma_min*/, float /*sigma_max*/, t_to_sigma_t t_to_sigma) override {
+        std::vector<float> result;
+        if (n == 0) {
+            return result;
+        }
+
+        result.reserve(n + 1);
+        const int total_timesteps = TIMESTEPS - 1;
+        int last_t = -1;
+        for (uint32_t i = 0; i < n; ++i) {
+            double p = 1.0 - static_cast<double>(i) / static_cast<double>(n);
+            int t = static_cast<int>(std::llround(beta_ppf(p) * total_timesteps));
+            t = std::max(0, std::min(total_timesteps, t));
+            if (t != last_t) {
+                result.push_back(t_to_sigma(static_cast<float>(t)));
+            }
+            last_t = t;
+        }
+        result.push_back(0.0f);
+        return result;
+    }
+};
+
 struct BongTangentScheduler : SigmaScheduler {
     static constexpr float kPi = 3.14159265358979323846f;
 
@@ -530,6 +641,10 @@ struct Denoiser {
             case BONG_TANGENT_SCHEDULER:
                 LOG_INFO("get_sigmas with bong_tangent scheduler");
                 scheduler = std::make_shared<BongTangentScheduler>();
+                break;
+            case BETA_SCHEDULER:
+                LOG_INFO("get_sigmas with beta scheduler");
+                scheduler = std::make_shared<BetaScheduler>();
                 break;
             case KL_OPTIMAL_SCHEDULER:
                 LOG_INFO("get_sigmas with KL Optimal scheduler");
