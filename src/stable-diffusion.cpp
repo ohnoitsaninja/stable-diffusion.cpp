@@ -73,6 +73,7 @@ const char* sampling_methods_str[] = {
     "TCD",
     "Res Multistep",
     "Res 2s",
+    "ER-SDE",
     "DPM++ SDE",
     "DPM++ SDE GPU",
     "DPM++ 2M SDE",
@@ -2102,6 +2103,7 @@ const char* sample_method_to_str[] = {
     "tcd",
     "res_multistep",
     "res_2s",
+    "er_sde",
     "dpmpp_sde",
     "dpmpp_sde_gpu",
     "dpmpp_2m_sde",
@@ -2583,6 +2585,9 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
 
 enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx) {
     if (sd_ctx != nullptr && sd_ctx->sd != nullptr) {
+        if (sd_version_is_anima(sd_ctx->sd->version)) {
+            return ER_SDE_SAMPLE_METHOD;
+        }
         if (sd_version_is_dit(sd_ctx->sd->version)) {
             return EULER_SAMPLE_METHOD;
         }
@@ -2637,6 +2642,7 @@ static float resolve_eta(sd_ctx_t* sd_ctx,
             case RES_MULTISTEP_SAMPLE_METHOD:
             case RES_2S_SAMPLE_METHOD:
                 return 0.0f;
+            case ER_SDE_SAMPLE_METHOD:
             case EULER_A_SAMPLE_METHOD:
             case DPMPP2S_A_SAMPLE_METHOD:
             case DPMPP_SDE_SAMPLE_METHOD:
@@ -3585,7 +3591,12 @@ static bool sd_model_supports_gpu_latent_decode(SDVersion version) {
     return sd_version_is_sdxl(version) ||
            sd_version_is_flux(version) ||
            sd_version_is_flux2(version) ||
-           sd_version_is_z_image(version);
+           sd_version_is_z_image(version) ||
+           sd_version_is_anima(version);
+}
+
+static bool sd_model_uses_gpu_latent_decode_bridge(SDVersion version) {
+    return sd_version_is_anima(version);
 }
 
 static bool sd_gpu_latent_shape_is_supported(SDVersion version, const sd_gpu_resource_private_t& resource) {
@@ -3848,7 +3859,11 @@ static bool prepare_normal_vae_run(sd_ctx_t* sd_ctx,
                  fallback_reason.c_str());
     } else {
         sd_ctx->sd->first_stage_model->set_comfy_normal_enabled(false);
-        sd_ctx->sd->first_stage_model->set_conv2d_direct_enabled(true);
+        const bool use_direct_conv = !sd_version_is_anima(sd_ctx->sd->version);
+        sd_ctx->sd->first_stage_model->set_conv2d_direct_enabled(use_direct_conv);
+        if (!use_direct_conv) {
+            LOG_INFO("[VAE] direct graph using legacy convolution for Anima Wan/Qwen VAE compatibility");
+        }
     }
     return true;
 }
@@ -3959,7 +3974,8 @@ static sd::Tensor<float> encode_image_tensor_normal_internal(sd_ctx_t* sd_ctx,
     if (report != nullptr) {
         *report = full_report;
     }
-    if (vae_report_large_im2col_disallowed(graph_report, effective)) {
+    if (!sd_version_is_anima(sd_ctx->sd->version) &&
+        vae_report_large_im2col_disallowed(graph_report, effective)) {
         LOG_ERROR("%s normal VAE encode refused oversized IM2COL tensor: largest=%" PRIu64 " threshold=%" PRIu64,
                   label == nullptr ? "image" : label,
                   graph_report.largest_tensor_bytes,
@@ -4165,11 +4181,12 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
 SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
                                     const sd_image_t* image,
                                     const sd_tiling_params_t* vae_tiling_params) {
-    if (vae_tiling_params == nullptr || !vae_tiling_params->enabled) {
-        return sd_encode_image_normal(sd_ctx, image, nullptr, nullptr);
-    }
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image == nullptr || image->data == nullptr) {
         return nullptr;
+    }
+    if ((vae_tiling_params == nullptr || !vae_tiling_params->enabled) &&
+        !sd_version_is_anima(sd_ctx->sd->version)) {
+        return sd_encode_image_normal(sd_ctx, image, nullptr, nullptr);
     }
     if (sd_ctx->sd->vae_decode_only) {
         LOG_ERROR("sd_encode_image requires a VAE encode-capable context; recreate with vae_decode_only=false");
@@ -4231,6 +4248,10 @@ SD_API sd_latent_t* sd_encode_image_normal(sd_ctx_t* sd_ctx,
         sd_vae_memory_report_init(report);
     }
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image == nullptr || image->data == nullptr) {
+        return nullptr;
+    }
+    if (sd_version_is_anima(sd_ctx->sd->version)) {
+        LOG_ERROR("sd_encode_image_normal is disabled for Anima; separated VAE Encode -> KSampler -> Decode is not safe with the current Wan/Qwen VAE path");
         return nullptr;
     }
 
@@ -4408,11 +4429,12 @@ SD_API bool sd_sample_latent_gpu(sd_ctx_t* sd_ctx,
 SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
                                     const sd_latent_t* latent,
                                     const sd_tiling_params_t* vae_tiling_params) {
-    if (vae_tiling_params == nullptr || !vae_tiling_params->enabled) {
-        return sd_decode_latent_normal(sd_ctx, latent, nullptr, nullptr);
-    }
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
         return nullptr;
+    }
+    if ((vae_tiling_params == nullptr || !vae_tiling_params->enabled) &&
+        !sd_version_is_anima(sd_ctx->sd->version)) {
+        return sd_decode_latent_normal(sd_ctx, latent, nullptr, nullptr);
     }
     if (sd_ctx->sd->first_stage_model == nullptr) {
         LOG_ERROR("sd_decode_latent requires a loaded VAE");
@@ -4656,6 +4678,9 @@ static sd_model_family_t sd_model_family_from_version(SDVersion version) {
     if (sd_version_is_qwen_image(version)) {
         return SD_MODEL_FAMILY_QWEN_IMAGE;
     }
+    if (sd_version_is_anima(version)) {
+        return SD_MODEL_FAMILY_ANIMA;
+    }
     return SD_MODEL_FAMILY_UNKNOWN;
 }
 
@@ -4679,6 +4704,8 @@ static const char* sd_model_family_name(sd_model_family_t family) {
             return "wan";
         case SD_MODEL_FAMILY_QWEN_IMAGE:
             return "qwen_image";
+        case SD_MODEL_FAMILY_ANIMA:
+            return "anima";
         case SD_MODEL_FAMILY_UNKNOWN:
         default:
             return "unknown";
@@ -4761,6 +4788,16 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
     }
     if (sd_version_is_flux2(version)) {
         capabilities->requires_llm = true;
+    }
+    if (sd_version_is_anima(version)) {
+        capabilities->default_sample_method = ER_SDE_SAMPLE_METHOD;
+        capabilities->default_scheduler = DISCRETE_SCHEDULER;
+        capabilities->default_cfg_scale = 4.5f;
+        capabilities->default_steps = 30;
+        capabilities->requires_llm = true;
+        capabilities->requires_clip_l = false;
+        capabilities->requires_t5xxl = false;
+        capabilities->supports_vae_encode = false;
     }
     return true;
 }
@@ -5122,6 +5159,102 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         LOG_ERROR("sd_decode_gpu_latent_normal_gpu refuses VAE-encoded latent handle=%" PRIu64 "; capability supports_vae_encode_gpu_latent_output=false",
                   gpu_latent);
         return false;
+    }
+
+    if (sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version)) {
+        if (sd_strict_gpu_resident_enabled()) {
+            LOG_ERROR("sd_decode_gpu_latent_normal_gpu strict mode refused Anima bridge decode; this VAE path downloads the latent for legacy decode and re-uploads the image handle");
+            return false;
+        }
+
+        LOG_INFO("sd_decode_gpu_latent_normal_gpu using Anima bridge for handle=%" PRIu64, gpu_latent);
+        sd_vae_run_options_t effective = effective_vae_options(options);
+        int64_t t0 = ggml_time_ms();
+        if (trace_gpu_handles_enabled()) {
+            LOG_INFO("sd_decode_gpu_latent_normal_gpu Anima bridge downloading latent");
+        }
+        sd::Tensor<float> latent = sd::make_sd_tensor_from_ggml<float>(resource->tensor->tensor);
+        int64_t t1 = ggml_time_ms();
+        if (latent.empty()) {
+            LOG_ERROR("sd_decode_gpu_latent_normal_gpu Anima bridge failed to download latent handle=%" PRIu64,
+                      gpu_latent);
+            return false;
+        }
+        if (latent.dim() == 3) {
+            latent.reshape_({latent.shape()[0], latent.shape()[1], latent.shape()[2], 1});
+        }
+        if (trace_gpu_handles_enabled()) {
+            LOG_INFO("sd_decode_gpu_latent_normal_gpu Anima bridge downloaded latent shape=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
+                     latent.shape().size() > 0 ? latent.shape()[0] : 0,
+                     latent.shape().size() > 1 ? latent.shape()[1] : 0,
+                     latent.shape().size() > 2 ? latent.shape()[2] : 0,
+                     latent.shape().size() > 3 ? latent.shape()[3] : 0);
+        }
+
+        sd_ctx->sd->vae_tiling_params = {false, 0, 0, 0.5f, 0, 0};
+        sd_ctx->sd->first_stage_model->set_conv2d_direct_enabled(false);
+        sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(latent);
+        int64_t t2 = ggml_time_ms();
+        if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
+            sd_ctx->sd->first_stage_model->free_params_buffer();
+        }
+        if (image.empty()) {
+            LOG_ERROR("sd_decode_gpu_latent_normal_gpu Anima bridge decode failed after %.2fs",
+                      (t2 - t0) * 1.0f / 1000);
+            return false;
+        }
+
+        if (trace_gpu_handles_enabled()) {
+            LOG_INFO("sd_decode_gpu_latent_normal_gpu Anima bridge uploading decoded image shape=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
+                     image.shape().size() > 0 ? image.shape()[0] : 0,
+                     image.shape().size() > 1 ? image.shape()[1] : 0,
+                     image.shape().size() > 2 ? image.shape()[2] : 0,
+                     image.shape().size() > 3 ? image.shape()[3] : 0);
+        }
+        auto gpu_image = sd_upload_tensor_to_backend_resource(sd_ctx, image, "vae_decode_rgb_f32_anima_bridge");
+        int64_t t3 = ggml_time_ms();
+        if (gpu_image == nullptr || gpu_image->empty()) {
+            LOG_ERROR("sd_decode_gpu_latent_normal_gpu Anima bridge failed to upload decoded image");
+            return false;
+        }
+
+        sd_vae_memory_report_t graph_report = sd_ctx->sd->first_stage_model->get_last_graph_report();
+        sd_vae_memory_report_t full_report;
+        sd_vae_memory_report_init(&full_report);
+        copy_vae_report(&full_report, graph_report, effective, SD_VAE_EXEC_DIRECT_GRAPH, false, false);
+        full_report.stage_boundary_host_copies += 1;
+        full_report.stage_boundary_device_copies += 1;
+        full_report.device_resident_stages = false;
+        std::snprintf(full_report.fallback_reason,
+                      sizeof(full_report.fallback_reason),
+                      "%s",
+                      "Anima uses the Wan/Qwen VAE bridge: GPU latent is downloaded for legacy decode and decoded image is re-uploaded");
+        log_vae_report("decode_gpu_latent_anima_bridge", full_report);
+        if (report != nullptr) {
+            *report = full_report;
+        }
+
+        sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
+                                                          std::move(gpu_image),
+                                                          SD_GPU_RESOURCE_IMAGE,
+                                                          SD_LAYOUT_WHCN_GGML,
+                                                          SD_GPU_RESOURCE_FLAG_VAE_DECODE_OUTPUT |
+                                                              SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_DOWNLOAD |
+                                                              SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD,
+                                                          "vae_decode_rgb_f32_anima_bridge");
+        if (handle == 0) {
+            LOG_ERROR("sd_decode_gpu_latent_normal_gpu Anima bridge failed to register GPU image handle");
+            return false;
+        }
+        *out_gpu_image = handle;
+        LOG_INFO("sd_decode_gpu_latent_normal_gpu Anima bridge completed, total=%.2fs download=%.2fs decode=%.2fs upload=%.2fs input_handle=%" PRIu64 " output_handle=%" PRIu64,
+                 (t3 - t0) * 1.0f / 1000,
+                 (t1 - t0) * 1.0f / 1000,
+                 (t2 - t1) * 1.0f / 1000,
+                 (t3 - t2) * 1.0f / 1000,
+                 gpu_latent,
+                 handle);
+        return true;
     }
 
     sd_vae_run_options_t effective = effective_vae_options(options);

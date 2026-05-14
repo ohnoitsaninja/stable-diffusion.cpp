@@ -84,6 +84,9 @@ static enum sample_method_t get_sdapi_sample_method(std::string name) {
         {"k_res_multistep", RES_MULTISTEP_SAMPLE_METHOD},
         {"res 2s", RES_2S_SAMPLE_METHOD},
         {"k_res_2s", RES_2S_SAMPLE_METHOD},
+        {"er_sde", ER_SDE_SAMPLE_METHOD},
+        {"er sde", ER_SDE_SAMPLE_METHOD},
+        {"k_er_sde", ER_SDE_SAMPLE_METHOD},
     };
     auto it = hardcoded.find(name);
     return it != hardcoded.end() ? it->second : SAMPLE_METHOD_COUNT;

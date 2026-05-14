@@ -50,6 +50,7 @@ enum sample_method_t {
     TCD_SAMPLE_METHOD,
     RES_MULTISTEP_SAMPLE_METHOD,
     RES_2S_SAMPLE_METHOD,
+    ER_SDE_SAMPLE_METHOD,
     DPMPP_SDE_SAMPLE_METHOD,
     DPMPP_SDE_GPU_SAMPLE_METHOD,
     DPMPP2M_SDE_SAMPLE_METHOD,
@@ -421,6 +422,7 @@ enum sd_model_family_t {
     SD_MODEL_FAMILY_Z_IMAGE = 7,
     SD_MODEL_FAMILY_WAN = 8,
     SD_MODEL_FAMILY_QWEN_IMAGE = 9,
+    SD_MODEL_FAMILY_ANIMA = 10,
 };
 
 typedef struct sd_model_pipeline_capabilities_t {
