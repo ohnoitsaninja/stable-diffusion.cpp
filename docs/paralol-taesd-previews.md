@@ -6,6 +6,7 @@ intermediate images while KSampler is still running.
 The verified targets are:
 
 - SDXL with TAESDXL.
+- Flux.1 with TAEF1.
 - Flux.2 / Flux2 Klein with TAEF2.
 
 The context must be created with `taesd_path` pointing at a compatible tiny
@@ -83,6 +84,22 @@ shape when the loaded model version is Flux.2:
 Keep TAeF2 as preview-only until final image quality is explicitly accepted for
 the workflow.
 
+For Flux.1, use:
+
+- `taesd_path = %models%/VAE/taef1.safetensors`
+- the normal Flux.1 AE path for final decode, e.g. `ae.safetensors`
+- the CLIP-L and T5XXL text encoders already required by Flux.1
+
+The fork's tiny autoencoder implementation uses the standard Flux/DiT TAE
+shape for Flux.1:
+
+- latent channels: 16
+- diffusion latent shape at 512: `1x16x64x64`
+- no Flux.2 32-channel patch/unpatch path
+
+Keep TAEF1 as preview-only until final image quality is explicitly accepted for
+the workflow.
+
 ## Verification
 
 Local SDXL smoke:
@@ -143,3 +160,27 @@ Expected previews:
 
 - `flux2_1024_step2_denoised_frame0.png`
 - `flux2_1024_step4_denoised_frame0.png`
+
+Flux.1 + TAEF1 smoke:
+
+```powershell
+.\build\codex\bin\sd-latent-smoke.exe `
+  --diffusion-model "F:\automatic1111\Stability\Models\DiffusionModels\flux1-kontext-dev-Q5_K_M.gguf" `
+  --vae "F:\automatic1111\Stability\Models\VAE\ae.safetensors" `
+  --clip-l "F:\automatic1111\Stability\Models\TextEncoders\clip_l.safetensors" `
+  --t5xxl "F:\automatic1111\Stability\Models\TextEncoders\t5-v1_1-xxl-encoder-Q3_K_L.gguf" `
+  --taesd "F:\automatic1111\Stability\Models\VAE\taef1.safetensors" `
+  --image "F:\Paralol\examples\orc.png" `
+  --image-channels 3 `
+  --prompt "a lovely cat" `
+  --negative-prompt "" `
+  --steps 1 --cfg-scale 1.0 --width 512 --height 512 `
+  --sample-without-init --gpu-sample-output `
+  --preview-tae --preview-every 1 `
+  --preview-prefix "C:\tmp\stable-diffusion.cpp-paralol\build\taef1-smoke\flux1" `
+  --skip-estimate --no-decode
+```
+
+Expected preview:
+
+- `flux1_step1_denoised_frame0.png`
