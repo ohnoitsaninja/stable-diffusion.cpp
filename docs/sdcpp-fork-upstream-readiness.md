@@ -9,6 +9,10 @@ code. It was built quickly to unblock Paralol's native SD node graph. It proves
 several useful ideas, but the branch is too broad and too Paralol-shaped to send
 as one pull request.
 
+For the operational maintenance checklist, release packaging rules, and future
+upstream-sync process, see
+`docs/paralol-fork-maintenance.md`.
+
 ## Current Baseline
 
 - Fork repo: `ohnoitsaninja/stable-diffusion.cpp`

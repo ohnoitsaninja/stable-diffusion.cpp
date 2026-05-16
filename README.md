@@ -24,6 +24,8 @@ The current branch is a working integration fork, not a single upstream-ready
 pull request. See [docs/sdcpp-fork-upstream-readiness.md](./docs/sdcpp-fork-upstream-readiness.md)
 for the full fork delta, current limitations, validation notes, and the
 recommended sequence for splitting the work into upstreamable pieces.
+See [docs/paralol-fork-maintenance.md](./docs/paralol-fork-maintenance.md) for
+the maintenance, validation, release, and upstream-sync playbook.
 
 ## 🔥Important News
 
