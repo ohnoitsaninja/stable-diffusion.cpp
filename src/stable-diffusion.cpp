@@ -2548,11 +2548,126 @@ struct sd_gpu_resource_private_t {
     std::unique_ptr<GgmlBackendTensorResource> tensor;
 };
 
+struct sd_ctx_params_snapshot_t {
+    sd_ctx_params_t params{};
+    std::string model_path;
+    std::string clip_l_path;
+    std::string clip_g_path;
+    std::string clip_vision_path;
+    std::string t5xxl_path;
+    std::string llm_path;
+    std::string llm_vision_path;
+    std::string diffusion_model_path;
+    std::string high_noise_diffusion_model_path;
+    std::string vae_path;
+    std::string taesd_path;
+    std::string control_net_path;
+    std::string photo_maker_path;
+    std::string tensor_type_rules;
+    bool valid = false;
+};
+
 struct sd_ctx_t {
     StableDiffusionGGML* sd = nullptr;
     sd_gpu_handle_t next_gpu_handle = 1;
     std::unordered_map<sd_gpu_handle_t, std::shared_ptr<sd_gpu_resource_private_t>> gpu_resources;
+    sd_ctx_params_snapshot_t init_params;
+    sd_ctx_t* vae_decode_bridge_ctx = nullptr;
 };
+
+static const char* snapshot_c_str(const std::string& value) {
+    return value.empty() ? nullptr : value.c_str();
+}
+
+static void sd_ctx_snapshot_bind_strings(sd_ctx_params_snapshot_t* snapshot) {
+    if (snapshot == nullptr) {
+        return;
+    }
+    snapshot->params.model_path = snapshot_c_str(snapshot->model_path);
+    snapshot->params.clip_l_path = snapshot_c_str(snapshot->clip_l_path);
+    snapshot->params.clip_g_path = snapshot_c_str(snapshot->clip_g_path);
+    snapshot->params.clip_vision_path = snapshot_c_str(snapshot->clip_vision_path);
+    snapshot->params.t5xxl_path = snapshot_c_str(snapshot->t5xxl_path);
+    snapshot->params.llm_path = snapshot_c_str(snapshot->llm_path);
+    snapshot->params.llm_vision_path = snapshot_c_str(snapshot->llm_vision_path);
+    snapshot->params.diffusion_model_path = snapshot_c_str(snapshot->diffusion_model_path);
+    snapshot->params.high_noise_diffusion_model_path = snapshot_c_str(snapshot->high_noise_diffusion_model_path);
+    snapshot->params.vae_path = snapshot_c_str(snapshot->vae_path);
+    snapshot->params.taesd_path = snapshot_c_str(snapshot->taesd_path);
+    snapshot->params.control_net_path = snapshot_c_str(snapshot->control_net_path);
+    snapshot->params.photo_maker_path = snapshot_c_str(snapshot->photo_maker_path);
+    snapshot->params.tensor_type_rules = snapshot_c_str(snapshot->tensor_type_rules);
+}
+
+static void sd_ctx_capture_init_params(sd_ctx_t* sd_ctx, const sd_ctx_params_t* params) {
+    if (sd_ctx == nullptr || params == nullptr) {
+        return;
+    }
+    auto& snapshot = sd_ctx->init_params;
+    snapshot = {};
+    snapshot.params = *params;
+    snapshot.model_path = SAFE_STR(params->model_path);
+    snapshot.clip_l_path = SAFE_STR(params->clip_l_path);
+    snapshot.clip_g_path = SAFE_STR(params->clip_g_path);
+    snapshot.clip_vision_path = SAFE_STR(params->clip_vision_path);
+    snapshot.t5xxl_path = SAFE_STR(params->t5xxl_path);
+    snapshot.llm_path = SAFE_STR(params->llm_path);
+    snapshot.llm_vision_path = SAFE_STR(params->llm_vision_path);
+    snapshot.diffusion_model_path = SAFE_STR(params->diffusion_model_path);
+    snapshot.high_noise_diffusion_model_path = SAFE_STR(params->high_noise_diffusion_model_path);
+    snapshot.vae_path = SAFE_STR(params->vae_path);
+    snapshot.taesd_path = SAFE_STR(params->taesd_path);
+    snapshot.control_net_path = SAFE_STR(params->control_net_path);
+    snapshot.photo_maker_path = SAFE_STR(params->photo_maker_path);
+    snapshot.tensor_type_rules = SAFE_STR(params->tensor_type_rules);
+    snapshot.params.embeddings = nullptr;
+    snapshot.params.embedding_count = 0;
+    sd_ctx_snapshot_bind_strings(&snapshot);
+    snapshot.valid = true;
+}
+
+static bool sd_ctx_make_vae_decode_bridge_params(sd_ctx_t* sd_ctx, sd_ctx_params_t* out) {
+    if (sd_ctx == nullptr || out == nullptr || !sd_ctx->init_params.valid) {
+        return false;
+    }
+    sd_ctx_snapshot_bind_strings(&sd_ctx->init_params);
+    *out = sd_ctx->init_params.params;
+    out->vae_decode_only = true;
+    out->free_params_immediately = false;
+    out->clip_l_path = nullptr;
+    out->clip_g_path = nullptr;
+    out->clip_vision_path = nullptr;
+    out->t5xxl_path = nullptr;
+    out->llm_path = nullptr;
+    out->llm_vision_path = nullptr;
+    out->high_noise_diffusion_model_path = nullptr;
+    out->taesd_path = nullptr;
+    out->control_net_path = nullptr;
+    out->photo_maker_path = nullptr;
+    out->embeddings = nullptr;
+    out->embedding_count = 0;
+    return true;
+}
+
+static sd_ctx_t* sd_ctx_get_vae_decode_bridge_ctx(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr) {
+        return nullptr;
+    }
+    if (sd_ctx->vae_decode_bridge_ctx != nullptr) {
+        return sd_ctx->vae_decode_bridge_ctx;
+    }
+    sd_ctx_params_t bridge_params;
+    if (!sd_ctx_make_vae_decode_bridge_params(sd_ctx, &bridge_params)) {
+        LOG_ERROR("VAE encoded-latent bridge could not recreate a decode-only context; original context parameters were not captured");
+        return nullptr;
+    }
+    LOG_INFO("VAE encoded-latent bridge creating cached decode-only context");
+    sd_ctx->vae_decode_bridge_ctx = new_sd_ctx(&bridge_params);
+    if (sd_ctx->vae_decode_bridge_ctx == nullptr) {
+        LOG_ERROR("VAE encoded-latent bridge failed to create decode-only context");
+    }
+    return sd_ctx->vae_decode_bridge_ctx;
+}
 
 sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_t* sd_ctx = new (std::nothrow) sd_ctx_t();
@@ -2572,10 +2687,19 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
         delete sd_ctx;
         return nullptr;
     }
+    sd_ctx_capture_init_params(sd_ctx, sd_ctx_params);
     return sd_ctx;
 }
 
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr) {
+        return;
+    }
+    if (sd_ctx->vae_decode_bridge_ctx != nullptr) {
+        free_sd_ctx(sd_ctx->vae_decode_bridge_ctx);
+        sd_ctx->vae_decode_bridge_ctx = nullptr;
+    }
+    sd_ctx->gpu_resources.clear();
     if (sd_ctx->sd != nullptr) {
         delete sd_ctx->sd;
         sd_ctx->sd = nullptr;
@@ -4491,11 +4615,6 @@ SD_API bool sd_decode_latent_normal_gpu(sd_ctx_t* sd_ctx,
         return false;
     }
     const sd_latent_source_t source = sd_latent_source(latent);
-    if (source == sd_latent_source_t::vae_encode) {
-        LOG_ERROR("sd_decode_latent_normal_gpu refuses VAE-encoded latent source=%s; encoded-latent GPU handoff is disabled after CUDA memcheck found an unsafe decode path",
-                  sd_latent_source_name(source));
-        return false;
-    }
     if (trace_gpu_handles_enabled()) {
         LOG_INFO("[GPU] CPU latent decode upload source=%s elements=%" PRIu64,
                  sd_latent_source_name(source),
@@ -4636,8 +4755,8 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_gpu_latent_input = true;
     capabilities->supports_sampler_gpu_latent_output = false;
     capabilities->supports_vae_gpu_latent_input = true;
-    capabilities->supports_vae_encode_gpu_latent_output = false;
-    capabilities->supports_vae_encode_gpu_latent_bridge_output = false;
+    capabilities->supports_vae_encode_gpu_latent_output = true;
+    capabilities->supports_vae_encode_gpu_latent_bridge_output = true;
     capabilities->supports_gpu_image_output = true;
     capabilities->supports_gpu_image_to_rgba8 = false;
     capabilities->supports_gpu_download = true;
@@ -4647,6 +4766,10 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_cuda_pointer_borrow = true;
     capabilities->supports_cuda_ipc_export = false;
     capabilities->supports_external_memory_interop = false;
+    if (sd_ctx != nullptr && sd_ctx->sd != nullptr && sd_version_is_anima(sd_ctx->sd->version)) {
+        capabilities->supports_vae_encode_gpu_latent_output = false;
+        capabilities->supports_vae_encode_gpu_latent_bridge_output = false;
+    }
     return true;
 }
 
@@ -4767,6 +4890,9 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
     capabilities->supports_gpu_sample_bridge_output = true;
     capabilities->supports_gpu_latent_decode = sd_model_supports_gpu_latent_decode(version);
     capabilities->supports_gpu_image_output = capabilities->supports_gpu_latent_decode;
+    capabilities->supports_vae_encode_gpu_output =
+        capabilities->supports_vae_encode &&
+        should_use_normal_vae_for_generation_encode(sd_ctx);
     capabilities->supports_reference_images = sd_model_supports_reference_images(version);
     capabilities->supports_edit_mode = sd_model_supports_reference_images(version);
     capabilities->supports_edit_reference_conditioning = sd_model_supports_reference_images(version);
@@ -4798,6 +4924,7 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
         capabilities->requires_clip_l = false;
         capabilities->requires_t5xxl = false;
         capabilities->supports_vae_encode = false;
+        capabilities->supports_vae_encode_gpu_output = false;
     }
     return true;
 }
@@ -4943,16 +5070,13 @@ SD_API bool sd_cpu_latent_upload(sd_ctx_t* sd_ctx,
         return false;
     }
     const sd_latent_source_t source = sd_latent_source(cpu_latent);
-    if (source == sd_latent_source_t::vae_encode) {
-        LOG_ERROR("sd_cpu_latent_upload refuses VAE-encoded latent GPU handoff; encoded-latent GPU decode is capability-gated off in this build");
-        return false;
-    }
     auto resource = sd_upload_tensor_to_backend_resource(sd_ctx, *tensor, "uploaded_latent_f32");
     sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
                                                       std::move(resource),
                                                       SD_GPU_RESOURCE_LATENT,
                                                       SD_LAYOUT_WHCN_GGML,
                                                       SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD |
+                                                          (source == sd_latent_source_t::vae_encode ? SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT : 0u) |
                                                           (source == sd_latent_source_t::sampler ? SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT : 0u),
                                                       "uploaded_latent_f32");
     if (handle == 0) {
@@ -5094,22 +5218,195 @@ SD_API bool sd_gpu_image_download_to_buffer(sd_ctx_t* sd_ctx,
     return true;
 }
 
+static bool sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx_t* sd_ctx,
+                                                    sd_gpu_handle_t gpu_latent,
+                                                    const std::shared_ptr<sd_gpu_resource_private_t>& resource,
+                                                    const sd_vae_run_options_t* options,
+                                                    sd_gpu_handle_t* out_gpu_image,
+                                                    sd_vae_memory_report_t* report) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || resource == nullptr || out_gpu_image == nullptr) {
+        return false;
+    }
+    if (sd_strict_gpu_resident_enabled()) {
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu strict mode refused VAE-encoded latent bridge; this safe path downloads the encoded latent, decodes in an isolated VAE context, then uploads the GPU image handle");
+        return false;
+    }
+    if (sd_version_is_anima(sd_ctx->sd->version)) {
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu refuses VAE-encoded Anima latent; Anima VAE Encode remains capability-gated off");
+        return false;
+    }
+
+    sd_gpu_tensor_desc_t input_desc{};
+    if (trace_gpu_handles_enabled() && sd_gpu_fill_desc(*resource, &input_desc)) {
+        LOG_INFO("[GPU] VAE encoded-latent bridge input handle=%" PRIu64 " backend=%d dtype=%d layout=%d shape_nchw=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " bytes=%" PRIu64 " flags=%u refcount=%u",
+                 gpu_latent,
+                 static_cast<int>(input_desc.backend),
+                 static_cast<int>(input_desc.dtype),
+                 static_cast<int>(input_desc.layout),
+                 input_desc.n,
+                 input_desc.c,
+                 input_desc.h,
+                 input_desc.w,
+                 input_desc.byte_size,
+                 input_desc.flags,
+                 input_desc.refcount);
+    }
+
+    int64_t t0 = ggml_time_ms();
+    sd::Tensor<float> latent = sd::make_sd_tensor_from_ggml<float>(resource->tensor->tensor);
+    int64_t t1 = ggml_time_ms();
+    if (latent.empty()) {
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu VAE encoded-latent bridge failed to download latent handle=%" PRIu64,
+                  gpu_latent);
+        return false;
+    }
+    if (latent.dim() == 3) {
+        latent.reshape_({latent.shape()[0], latent.shape()[1], latent.shape()[2], 1});
+    }
+
+    sd_ctx_t* decode_ctx = sd_ctx_get_vae_decode_bridge_ctx(sd_ctx);
+    if (decode_ctx == nullptr || decode_ctx->sd == nullptr) {
+        return false;
+    }
+
+    sd_vae_run_options_t effective = effective_vae_options(options);
+    sd_vae_exec_mode_t resolved_mode = SD_VAE_EXEC_AUTO;
+    bool used_taesd = false;
+    if (!prepare_normal_vae_run(decode_ctx, effective, &resolved_mode, &used_taesd)) {
+        return false;
+    }
+    if (resolved_mode != SD_VAE_EXEC_COMFY_NORMAL) {
+        LOG_ERROR("VAE encoded-latent bridge currently requires COMFY_NORMAL");
+        return false;
+    }
+    ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
+
+    sd::Tensor<float> image = decode_ctx->sd->decode_first_stage(latent);
+    int64_t t2 = ggml_time_ms();
+    if (image.empty()) {
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu VAE encoded-latent bridge decode failed after %.2fs",
+                  (t2 - t0) * 1.0f / 1000);
+        return false;
+    }
+
+    sd_vae_memory_report_t graph_report = decode_ctx->sd->first_stage_model->get_last_graph_report();
+    sd_vae_memory_report_t full_report;
+    sd_vae_memory_report_init(&full_report);
+    copy_vae_report(&full_report, graph_report, effective, resolved_mode, false, used_taesd);
+    if (vae_report_large_im2col_disallowed(graph_report, effective)) {
+        LOG_ERROR("VAE encoded-latent bridge refused oversized IM2COL tensor: largest=%" PRIu64 " threshold=%" PRIu64,
+                  graph_report.largest_tensor_bytes,
+                  effective.im2col_warn_bytes);
+        return false;
+    }
+    if (vae_report_comfy_guard_failed(full_report, resolved_mode)) {
+        return false;
+    }
+
+    auto gpu_image = sd_upload_tensor_to_backend_resource(sd_ctx, image, "vae_decode_rgb_f32_from_vae_encode_bridge");
+    int64_t t3 = ggml_time_ms();
+    if (gpu_image == nullptr || gpu_image->empty()) {
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu VAE encoded-latent bridge failed to upload decoded image");
+        return false;
+    }
+
+    full_report.stage_boundary_host_copies += 1;
+    full_report.stage_boundary_device_copies += 1;
+    full_report.device_resident_stages = false;
+    std::snprintf(full_report.fallback_reason,
+                  sizeof(full_report.fallback_reason),
+                  "%s",
+                  "VAE Encode GPU handoff uses a safe bridge: encoded latent is downloaded, decoded in an isolated VAE context, and image is re-uploaded");
+    log_vae_report("decode_gpu_latent_vae_encode_bridge", full_report);
+    if (report != nullptr) {
+        *report = full_report;
+    }
+
+    sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
+                                                      std::move(gpu_image),
+                                                      SD_GPU_RESOURCE_IMAGE,
+                                                      SD_LAYOUT_WHCN_GGML,
+                                                      SD_GPU_RESOURCE_FLAG_VAE_DECODE_OUTPUT |
+                                                          SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_DOWNLOAD |
+                                                          SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD,
+                                                      "vae_decode_rgb_f32_from_vae_encode_bridge");
+    if (handle == 0) {
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu VAE encoded-latent bridge failed to register GPU image handle");
+        return false;
+    }
+    *out_gpu_image = handle;
+    LOG_INFO("sd_decode_gpu_latent_normal_gpu VAE encoded-latent bridge completed, total=%.2fs download=%.2fs decode=%.2fs upload=%.2fs input_handle=%" PRIu64 " output_handle=%" PRIu64,
+             (t3 - t0) * 1.0f / 1000,
+             (t1 - t0) * 1.0f / 1000,
+             (t2 - t1) * 1.0f / 1000,
+             (t3 - t2) * 1.0f / 1000,
+             gpu_latent,
+             handle);
+    return true;
+}
+
 SD_API bool sd_encode_image_normal_gpu(sd_ctx_t* sd_ctx,
                                        const sd_image_t* image,
                                        const sd_vae_run_options_t* options,
                                        sd_gpu_handle_t* out_gpu_latent,
                                        sd_vae_memory_report_t* report) {
-    SD_UNUSED(sd_ctx);
-    SD_UNUSED(image);
-    SD_UNUSED(options);
     if (report != nullptr) {
         sd_vae_memory_report_init(report);
     }
     if (out_gpu_latent != nullptr) {
         *out_gpu_latent = 0;
     }
-    LOG_ERROR("sd_encode_image_normal_gpu is disabled in this build; VAE-encoded latent GPU handoff is not yet safe");
-    return false;
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image == nullptr || image->data == nullptr || out_gpu_latent == nullptr) {
+        return false;
+    }
+    if (sd_strict_gpu_resident_enabled()) {
+        LOG_ERROR("sd_encode_image_normal_gpu strict mode refused VAE Encode GPU bridge output; current encode materializes the latent on CPU before uploading a GPU handle");
+        return false;
+    }
+
+    sd_vae_memory_report_t encode_report;
+    sd_latent_t* encoded = sd_encode_image_normal(sd_ctx, image, options, &encode_report);
+    if (encoded == nullptr) {
+        LOG_ERROR("sd_encode_image_normal_gpu failed during normal VAE encode");
+        return false;
+    }
+    const sd::Tensor<float>* tensor = sd_latent_tensor(encoded);
+    if (tensor == nullptr) {
+        free_sd_latent(encoded);
+        return false;
+    }
+
+    auto resource = sd_upload_tensor_to_backend_resource(sd_ctx, *tensor, "vae_encode_latent_f32_bridge");
+    free_sd_latent(encoded);
+    if (resource == nullptr || resource->empty()) {
+        LOG_ERROR("sd_encode_image_normal_gpu failed to upload encoded latent");
+        return false;
+    }
+
+    sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
+                                                      std::move(resource),
+                                                      SD_GPU_RESOURCE_LATENT,
+                                                      SD_LAYOUT_WHCN_GGML,
+                                                      SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD |
+                                                          SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT,
+                                                      "vae_encode_latent_f32_bridge");
+    if (handle == 0) {
+        return false;
+    }
+    encode_report.stage_boundary_host_copies += 1;
+    encode_report.stage_boundary_device_copies += 1;
+    encode_report.device_resident_stages = false;
+    std::snprintf(encode_report.fallback_reason,
+                  sizeof(encode_report.fallback_reason),
+                  "%s",
+                  "VAE Encode GPU output is bridge-uploaded after CPU latent conversion");
+    log_vae_report("encode_gpu_latent_bridge", encode_report);
+    if (report != nullptr) {
+        *report = encode_report;
+    }
+    *out_gpu_latent = handle;
+    LOG_INFO("sd_encode_image_normal_gpu completed bridge-uploaded latent handle=%" PRIu64, handle);
+    return true;
 }
 
 SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
@@ -5156,9 +5453,12 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         return false;
     }
     if ((resource->flags & SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT) != 0) {
-        LOG_ERROR("sd_decode_gpu_latent_normal_gpu refuses VAE-encoded latent handle=%" PRIu64 "; capability supports_vae_encode_gpu_latent_output=false",
-                  gpu_latent);
-        return false;
+        return sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx,
+                                                       gpu_latent,
+                                                       resource,
+                                                       options,
+                                                       out_gpu_image,
+                                                       report);
     }
 
     if (sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version)) {
@@ -5330,6 +5630,16 @@ SD_API bool sd_encode_gpu_image_normal_gpu(sd_ctx_t* sd_ctx,
                                            const sd_vae_run_options_t* options,
                                            sd_gpu_handle_t* out_gpu_latent,
                                            sd_vae_memory_report_t* report) {
+    if (sd_strict_gpu_resident_enabled()) {
+        LOG_ERROR("sd_encode_gpu_image_normal_gpu strict mode refused GPU image encode bridge; current path downloads the image before CPU VAE encode");
+        if (out_gpu_latent != nullptr) {
+            *out_gpu_latent = 0;
+        }
+        if (report != nullptr) {
+            sd_vae_memory_report_init(report);
+        }
+        return false;
+    }
     auto resource = sd_gpu_resource_lookup(sd_ctx, gpu_image);
     if (resource == nullptr || resource->kind != SD_GPU_RESOURCE_IMAGE || resource->tensor == nullptr || resource->tensor->empty()) {
         return false;

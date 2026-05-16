@@ -12,6 +12,8 @@ Implemented now:
 - Refcounted retain/release/get-desc/debug-name APIs
 - CUDA pointer borrow API for same-process native consumers
 - `sd_decode_latent_normal_gpu`
+- `sd_encode_image_normal_gpu`
+- `sd_decode_gpu_latent_normal_gpu`
 - `sd_gpu_image_download`
 - `sd_gpu_tensor_download`
 - `sd_get_gpu_capabilities`
@@ -65,13 +67,23 @@ The first useful zero-copy path is VAE decode output:
 
 `CPU latent -> GPU RGB tensor handle -> explicit download only when requested`
 
-`sd_encode_image_normal_gpu` currently preserves the API shape by running the
-existing CPU image encode path and uploading the resulting latent into a GPU
-handle. It is not yet a fully GPU-resident image encode path.
+`sd_encode_image_normal_gpu` preserves the API shape by running the existing
+normal VAE encode path and uploading the resulting latent into a GPU handle.
+That handle is safe to pass to `sd_decode_gpu_latent_normal_gpu`, but it is
+marked as a bridge with `SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD` and
+`SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT`. It is not yet a fully GPU-resident
+image encode path.
 
-`sd_decode_gpu_latent_normal_gpu` and `sd_encode_gpu_image_normal_gpu` are
-compatibility bridges that materialize through the existing CPU tensor/image
-paths when needed. They are not the final all-GPU KSampler/Image path.
+For VAE-encoded latent handles, `sd_decode_gpu_latent_normal_gpu` uses a cached
+VAE decode-only context internally. This avoids the unsafe same-context decode
+path found during CUDA memcheck while preserving the Paralol GPU-handle
+contract. The VAE report marks the bridge with `host_copies=1`,
+`device_copies=1`, and a fallback reason. `SDCPP_STRICT_GPU_RESIDENT=1` refuses
+this path.
+
+`sd_encode_gpu_image_normal_gpu` is still a compatibility bridge that downloads
+the GPU image before encode. It is useful for API symmetry, but not a final
+all-GPU image encode path.
 
 GPU RGBA packing, DLPack, CUDA IPC, and graphics interop are intentionally
 deferred. `sd_get_gpu_capabilities` reports those as unsupported until they are
@@ -86,7 +98,14 @@ $env:SDCPP_STRICT_GPU_RESIDENT='1'
 ```
 
 For `sd_decode_latent_normal_gpu`, strict mode fails if COMFY_NORMAL reports a
-host stage boundary or non-device-resident VAE stage output.
+host stage boundary or non-device-resident VAE stage output. Strict mode also
+refuses bridge paths that knowingly materialize CPU values:
+
+- `sd_sample_latent_gpu`
+- `sd_encode_image_normal_gpu`
+- `sd_decode_gpu_latent_normal_gpu` when the latent handle was produced by VAE
+  Encode
+- `sd_encode_gpu_image_normal_gpu`
 
 Set:
 
@@ -114,5 +133,9 @@ Paralol handoff:
 
 - Latent Decode can move to `sd_decode_latent_normal_gpu` when the worker value
   protocol can carry an opaque same-process GPU handle.
+- VAE Encode can move to `sd_encode_image_normal_gpu` for model families that
+  report `supports_vae_encode_gpu_latent_output=true`, with the understanding
+  that the current implementation is bridge-uploaded rather than true
+  resident.
 - Preview/Save nodes should explicitly call download or a future GPU RGBA path
   only when CPU/display bytes are actually required.

@@ -101,6 +101,7 @@ Then confirm the DLL exports that Paralol depends on:
 - `sd_gpu_image_download`
 - `sd_gpu_image_download_to_buffer`
 - `sd_free_downloaded_image`
+- `sd_encode_image_normal_gpu`
 - `sd_get_gpu_capabilities`
 - `sd_get_model_pipeline_capabilities`
 
@@ -135,7 +136,10 @@ Validate:
 - `sd_decode_gpu_latent_normal_gpu` consumes supported CUDA latent handles
 - GPU image output can be downloaded with `sd_gpu_image_download_to_buffer`
 - DLL-owned downloads are releasable with `sd_free_downloaded_image`
-- VAE-encoded GPU latent handoff remains refused until it is specifically fixed
+- VAE-encoded GPU latent handoff works in non-strict mode through the safe
+  decode-only bridge and reports the bridge honestly
+- `SDCPP_STRICT_GPU_RESIDENT=1` refuses VAE Encode GPU output because the encode
+  path still materializes and uploads a CPU latent
 
 ### Flux2 and Z-Image
 
@@ -261,8 +265,9 @@ candidate branches.
   GPU handle registry, VAE normal execution, and capability reporting should be
   split into focused files before upstream review.
 - `sd_sample_latent_gpu` is a bridge upload, not a true GPU-native sampler.
-- VAE Encode GPU latent handoff is disabled because the encoded-latent decode
-  path was unsafe in testing.
+- VAE Encode GPU latent handoff is a safe bridge, not true resident. It avoids
+  the unsafe same-context decode path by downloading the encoded latent and
+  decoding in a cached VAE decode-only context.
 - Anima VAE decode uses a Wan/Qwen compatibility bridge with host/device copies.
 - Capability structs are useful but should be reviewed for minimal stable
   upstream API shape.

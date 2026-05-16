@@ -287,6 +287,16 @@ back into a GPU image handle. The report marks this with `host_copies=1`,
 `device_copies=1`, and bridge flags. `SDCPP_STRICT_GPU_RESIDENT=1` refuses this
 path.
 
+VAE Encode GPU latent handoff is supported as a compatibility bridge for
+families where public normal VAE encode is enabled. `sd_encode_image_normal_gpu`
+returns an owned CUDA latent handle, but the encode path still materializes the
+latent as a host `sd::Tensor<float>` before uploading it. Handles marked
+`SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT` decode through a cached VAE
+decode-only context because the earlier same-context decode route hit CUDA
+illegal memory access in testing. The bridge is safe for Paralol's node contract
+and reports `host_copies=1` / `device_copies=1`, but strict GPU-resident mode
+refuses it because it is not zero-copy.
+
 Current upstream-readiness issue: this API is the most likely to need redesign
 before upstreaming. Upstream may prefer a different abstraction such as a
 ggml-backed tensor handle, DLPack-style export, or backend buffer ownership
@@ -298,20 +308,19 @@ The current DLL refuses several paths on purpose:
 
 - strict mode refuses `sd_sample_latent_gpu` because sampler internals are not
   true GPU-resident
-- VAE Encode GPU latent output is disabled
-- VAE-encoded CPU latent upload into GPU decode is disabled
-- GPU decode refuses handles marked as VAE-encoded latents
+- strict mode refuses VAE Encode GPU latent output because it is a bridge-upload
+  path, not true GPU-resident encode
 - Anima modular VAE Encode is disabled through model capabilities because the
   separated `VAE Encode -> KSampler -> Decode` path is not safe with the current
   Wan/Qwen VAE implementation
 - strict mode refuses Anima's compatibility bridge because it contains an
   explicit latent download and decoded-image upload
 
-This came from testing that found an unsafe VAE-encoded latent GPU handoff path.
-The current behavior is conservative: T2I sampled-latent handoff works, I2I VAE
-Encode GPU handoff does not pretend to work. Direct one-shot `sd-cli`
-image-to-image remains available for model families where upstream supports it,
-but Paralol's modular VAE Encode node should follow the capability report.
+This came from testing that found an unsafe same-context VAE-encoded latent GPU
+decode path. The current behavior is conservative: T2I sampled-latent handoff
+works, I2I VAE Encode GPU handoff works through a clearly reported bridge, and
+strict mode refuses both fake-resident sampler output and bridge-uploaded VAE
+Encode output.
 
 Current upstream-readiness issue: these refusals are good engineering behavior,
 but they are also evidence that the GPU API is not mature enough to upstream as a
@@ -344,7 +353,7 @@ The current fork should not be submitted as-is because:
 - it includes names and docs that are explicitly Paralol-specific
 - GPU handles are same-process only and not yet a complete interop story
 - the sampler GPU path is a bridge upload, not true GPU-resident sampling
-- VAE Encode GPU handoff is known unsupported
+- VAE Encode GPU handoff is a bridge, not true GPU-resident encode
 - strict modes and environment flags are useful for development but need a
   cleaner upstream configuration story
 - the VAE path, GPU handle registry, and public API are concentrated in
