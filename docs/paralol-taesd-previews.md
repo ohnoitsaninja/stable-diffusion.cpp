@@ -3,10 +3,14 @@
 This fork exposes TAESD/TAE previews during sampling so Paralol can publish
 intermediate images while KSampler is still running.
 
-The first supported target is SDXL. The context must be created with
-`taesd_path` pointing at a compatible TAESDXL checkpoint and
-`tae_preview_only=true` if TAESD should be used for previews without replacing
-the final model VAE.
+The verified targets are:
+
+- SDXL with TAESDXL.
+- Flux.2 / Flux2 Klein with TAEF2.
+
+The context must be created with `taesd_path` pointing at a compatible tiny
+autoencoder checkpoint and `tae_preview_only=true` if the tiny autoencoder
+should be used for previews without replacing the final model VAE.
 
 ## API
 
@@ -63,6 +67,22 @@ Paralol SD native worker runs one SD sample at a time inside the worker process,
 so this is acceptable. If the worker later allows concurrent in-process samples,
 the callback must become per-context or protected by a run token.
 
+For Flux.2 / Flux2 Klein, use:
+
+- `taesd_path = %models%/VAE/taef2.safetensors`
+- the normal Flux2 VAE path for final decode, e.g. `flux2-vae.safetensors`
+- the Flux2/Klein LLM text encoder already required by the model
+
+The fork's tiny autoencoder implementation automatically switches to the TAEF2
+shape when the loaded model version is Flux.2:
+
+- latent channels: 32 inside TAEF2
+- diffusion latent shape at 1024: `1x128x64x64`
+- patch/unpatch scale: 2
+
+Keep TAeF2 as preview-only until final image quality is explicitly accepted for
+the workflow.
+
 ## Verification
 
 Local SDXL smoke:
@@ -99,3 +119,27 @@ Expected previews:
 
 - `pct50_step2_denoised_frame0.png`
 - `pct50_step4_denoised_frame0.png`
+
+Flux2 Klein + TAEF2 smoke:
+
+```powershell
+.\build\codex\bin\sd-latent-smoke.exe `
+  --diffusion-model "F:\automatic1111\Stability\Models\DiffusionModels\flux-2-klein-4b-fp8.safetensors" `
+  --vae "F:\automatic1111\Stability\Models\VAE\flux2-vae.safetensors" `
+  --llm "F:\automatic1111\Stability\Models\TextEncoders\Qwen3-4B-Q5_K_M.gguf" `
+  --taesd "F:\automatic1111\Stability\Models\VAE\taef2.safetensors" `
+  --image "F:\Paralol\examples\orc.png" `
+  --image-channels 3 `
+  --prompt "a lovely cat" `
+  --negative-prompt "" `
+  --steps 4 --cfg-scale 1.0 --width 1024 --height 1024 `
+  --sample-without-init --gpu-sample-output `
+  --preview-tae --preview-every 2 `
+  --preview-prefix "C:\tmp\stable-diffusion.cpp-paralol\build\taef2-smoke\flux2_1024" `
+  --skip-estimate --no-decode
+```
+
+Expected previews:
+
+- `flux2_1024_step2_denoised_frame0.png`
+- `flux2_1024_step4_denoised_frame0.png`
