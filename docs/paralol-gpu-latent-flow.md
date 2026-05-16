@@ -49,16 +49,22 @@ bridge honestly:
 
 This bridge does not change Anima image semantics; it uses the same
 `decode_first_stage(...)` path as direct `sd-cli` generation. Anima public
-normal VAE encode/decode keeps the Wan/Qwen VAE on the legacy convolution path
-because direct-conv state is not safe across a separate public VAE encode,
-KSampler, and decode sequence. The Anima public VAE encode/decode path reports
-large IM2COL workspaces instead of failing the SDXL COMFY_NORMAL guard because
-that legacy graph is currently the known-good Anima path.
+normal VAE encode/decode keeps the Wan/Qwen VAE on the legacy convolution path.
+The Anima public VAE encode/decode path reports large IM2COL workspaces instead
+of failing the SDXL COMFY_NORMAL guard because that legacy graph is currently
+the known-good Anima path.
 
-Separated `sd_encode_image_normal(...)` is capability-gated off for Anima. Direct
-one-shot `generate_image(...)` image-to-image still works, but the modular
-Paralol path `VAE Encode -> KSampler -> Latent Decode` needs a dedicated Wan/Qwen
-VAE fix before it should be exposed.
+Separated `sd_encode_image_normal(...)` and `sd_encode_image_normal_gpu(...)`
+are enabled for Anima as compatibility bridges. The modular Paralol path
+`VAE Encode -> KSampler -> Latent Decode` can therefore pass a 16-channel Anima
+latent through the same `SD_GPU_RESOURCE_LATENT` contract. The implementation is
+not true GPU-resident encode: it materializes the encoded latent as a CPU
+`sd::Tensor<float>`, uploads an owned CUDA latent handle, and marks the report
+with `host_copies=1`, `device_copies=1`, and
+`fallback_reason="VAE Encode GPU output is bridge-uploaded after CPU latent conversion"`.
+At 1024x1024 this Wan/Qwen VAE path currently plans about 7702 MB for encode and
+7493 MB for decode, with IM2COL present. That is expected for Anima today and is
+reported rather than hidden.
 
 `sd_sample_latent_gpu(...)` is intentionally marked as a compatibility bridge today. It calls the existing host-side sampler and uploads the final latent to CUDA. It sets `SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT | SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD` on the returned handle. With `SDCPP_STRICT_GPU_RESIDENT=1`, it fails instead of hiding the CPU materialization.
 
@@ -107,8 +113,9 @@ The VAE report marks this honestly:
 The resulting handle is safe for Paralol's node contract, but the bridge is
 still a compatibility lane. A future true-resident implementation would need
 GPU-side VAE encode latent sampling/scaling plus a same-context decode fix.
-Anima remains excluded: `supports_vae_encode=false`, and VAE-encoded Anima
-latent handles are refused.
+Anima uses the Wan/Qwen bridge instead of the SDXL cached decode-only bridge;
+the decode report should say
+`fallback_reason="Anima uses the Wan/Qwen VAE bridge: GPU latent is downloaded for legacy decode and decoded image is re-uploaded"`.
 
 ## SDXL 1024 latent descriptor
 
@@ -165,8 +172,8 @@ For the next Paralol worker integration:
 - VAE Encode can request `sd_encode_image_normal_gpu` for model families that
   report `supports_vae_encode_gpu_latent_output=true`. Treat
   `supports_vae_encode_gpu_latent_bridge_output=true` as a sign that the handle
-  is safe but bridge-uploaded, not true zero-copy. For Anima, do not expose
-  modular VAE Encode yet; `supports_vae_encode=false`.
+  is safe but bridge-uploaded, not true zero-copy. Anima reports this bridge as
+  supported, but the Wan/Qwen VAE path uses large IM2COL workspaces at 1024.
 
 ## Supported handoff paths
 
@@ -178,6 +185,8 @@ Supported now:
   `sd_sample_latent -> sd_cpu_latent_upload -> sd_decode_gpu_latent_normal_gpu`
 - Anima sampled-latent bridge:
   `sd_sample_latent_gpu -> legacy Wan/Qwen VAE decode bridge -> SD_GPU_RESOURCE_IMAGE`
+- Anima VAE Encode bridge:
+  `sd_encode_image_normal_gpu -> legacy Wan/Qwen VAE encode bridge -> SD_GPU_RESOURCE_LATENT -> legacy Wan/Qwen VAE decode bridge`
 - GPU image output:
   `sd_decode_gpu_latent_normal_gpu -> SD_GPU_RESOURCE_IMAGE -> sd_gpu_image_download`
 - Caller-owned image output:
@@ -191,8 +200,5 @@ Refused now:
   `SDCPP_STRICT_GPU_RESIDENT=1 sd_sample_latent_gpu`
 - Strict VAE Encode GPU output:
   `SDCPP_STRICT_GPU_RESIDENT=1 sd_encode_image_normal_gpu`
-- Anima modular VAE Encode:
-  `sd_encode_image_normal` reports unsupported through
-  `supports_vae_encode=false`
 
 The real all-GPU KSampler project is a separate sampler backend refactor: the denoiser callback and sampler math need backend tensor/resource variants instead of `sd::Tensor<float>` host values.

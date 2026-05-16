@@ -4374,11 +4374,6 @@ SD_API sd_latent_t* sd_encode_image_normal(sd_ctx_t* sd_ctx,
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image == nullptr || image->data == nullptr) {
         return nullptr;
     }
-    if (sd_version_is_anima(sd_ctx->sd->version)) {
-        LOG_ERROR("sd_encode_image_normal is disabled for Anima; separated VAE Encode -> KSampler -> Decode is not safe with the current Wan/Qwen VAE path");
-        return nullptr;
-    }
-
     int64_t t0 = ggml_time_ms();
     sd::Tensor<float> image_tensor = sd_image_to_tensor(*image);
     sd::Tensor<float> latent = encode_image_tensor_normal_internal(sd_ctx,
@@ -4766,10 +4761,6 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_cuda_pointer_borrow = true;
     capabilities->supports_cuda_ipc_export = false;
     capabilities->supports_external_memory_interop = false;
-    if (sd_ctx != nullptr && sd_ctx->sd != nullptr && sd_version_is_anima(sd_ctx->sd->version)) {
-        capabilities->supports_vae_encode_gpu_latent_output = false;
-        capabilities->supports_vae_encode_gpu_latent_bridge_output = false;
-    }
     return true;
 }
 
@@ -4923,8 +4914,8 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
         capabilities->requires_llm = true;
         capabilities->requires_clip_l = false;
         capabilities->requires_t5xxl = false;
-        capabilities->supports_vae_encode = false;
-        capabilities->supports_vae_encode_gpu_output = false;
+        capabilities->supports_vae_encode = true;
+        capabilities->supports_vae_encode_gpu_output = true;
     }
     return true;
 }
@@ -5232,7 +5223,7 @@ static bool sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx_t* sd_ctx,
         return false;
     }
     if (sd_version_is_anima(sd_ctx->sd->version)) {
-        LOG_ERROR("sd_decode_gpu_latent_normal_gpu refuses VAE-encoded Anima latent; Anima VAE Encode remains capability-gated off");
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu internal bridge mismatch: VAE-encoded Anima latent must route through the Wan/Qwen VAE bridge");
         return false;
     }
 
@@ -5452,7 +5443,8 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         }
         return false;
     }
-    if ((resource->flags & SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT) != 0) {
+    if ((resource->flags & SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT) != 0 &&
+        !sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version)) {
         return sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx,
                                                        gpu_latent,
                                                        resource,

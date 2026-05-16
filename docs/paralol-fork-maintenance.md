@@ -164,11 +164,14 @@ Validate:
 - default sampler is `er_sde`
 - default scheduler is `discrete`
 - `supports_gpu_latent_decode=true`
-- `supports_vae_encode=false`
+- `supports_vae_encode=true`
+- `supports_vae_encode_gpu_output=true`
 - sampled latent descriptor is `1x16x128x128` for 1024 output
 - decode reports the Wan/Qwen bridge with `host_copies=1` and `device_copies=1`
-- `SDCPP_STRICT_GPU_RESIDENT=1` refuses the bridge
-- modular Anima VAE Encode remains disabled
+- VAE Encode reports the Wan/Qwen bridge with `host_copies=1` and `device_copies=1`
+- `SDCPP_STRICT_GPU_RESIDENT=1` refuses the sampler, decode, and encode bridges
+- 1024 Anima VAE Encode/Decode currently uses the legacy Wan/Qwen IM2COL graph
+  and plans roughly 7702 MB encode / 7493 MB decode workspace
 
 ### ControlNet
 

@@ -310,11 +310,12 @@ The current DLL refuses several paths on purpose:
   true GPU-resident
 - strict mode refuses VAE Encode GPU latent output because it is a bridge-upload
   path, not true GPU-resident encode
-- Anima modular VAE Encode is disabled through model capabilities because the
-  separated `VAE Encode -> KSampler -> Decode` path is not safe with the current
-  Wan/Qwen VAE implementation
 - strict mode refuses Anima's compatibility bridge because it contains an
   explicit latent download and decoded-image upload
+- Anima modular VAE Encode is enabled only as a compatibility bridge. It uses
+  the Wan/Qwen legacy VAE graph, returns a 16-channel bridge-uploaded GPU latent,
+  and reports the large IM2COL workspace instead of pretending to be a
+  COMFY_NORMAL zero-copy path.
 
 This came from testing that found an unsafe same-context VAE-encoded latent GPU
 decode path. The current behavior is conservative: T2I sampled-latent handoff
