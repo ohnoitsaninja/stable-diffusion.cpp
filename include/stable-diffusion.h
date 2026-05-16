@@ -450,6 +450,7 @@ enum sd_model_family_t {
     SD_MODEL_FAMILY_WAN = 8,
     SD_MODEL_FAMILY_QWEN_IMAGE = 9,
     SD_MODEL_FAMILY_ANIMA = 10,
+    SD_MODEL_FAMILY_MARIGOLD_IID = 11,
 };
 
 typedef struct sd_model_pipeline_capabilities_t {
@@ -480,8 +481,31 @@ typedef struct sd_model_pipeline_capabilities_t {
     bool supports_edit_reference_conditioning;
     bool supports_comfy_reference_vae_encode;
     bool strict_gpu_sample_is_true_resident;
-    uint32_t reserved[12];
+    bool supports_intrinsic_image_decomposition;
+    uint32_t intrinsic_target_count;
+    uint32_t reserved[10];
 } sd_model_pipeline_capabilities_t;
+
+typedef struct sd_marigold_iid_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    uint32_t processing_width;
+    uint32_t processing_height;
+    uint32_t steps;
+    int64_t seed;
+    bool match_input_resolution;
+    uint32_t reserved[8];
+} sd_marigold_iid_options_t;
+
+typedef struct sd_marigold_iid_result_t {
+    uint32_t struct_size;
+    uint32_t version;
+    uint32_t target_count;
+    sd_image_t* targets;
+    const char** target_names;
+    sd_latent_t* latent;
+    uint32_t reserved[8];
+} sd_marigold_iid_result_t;
 
 typedef struct sd_download_options_t {
     uint32_t struct_size;
@@ -711,6 +735,11 @@ SD_API bool sd_estimate_vae_normal_memory(sd_ctx_t* sd_ctx,
 SD_API bool sd_get_vae_capabilities(sd_ctx_t* sd_ctx, sd_vae_capabilities_t* capabilities);
 SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* capabilities);
 SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeline_capabilities_t* capabilities);
+SD_API void sd_marigold_iid_options_init(sd_marigold_iid_options_t* options);
+SD_API sd_marigold_iid_result_t* sd_marigold_iid_predict(sd_ctx_t* sd_ctx,
+                                                         const sd_image_t* image,
+                                                         const sd_marigold_iid_options_t* options);
+SD_API void free_sd_marigold_iid_result(sd_marigold_iid_result_t* result);
 SD_API bool sd_gpu_handle_retain(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle);
 SD_API bool sd_gpu_handle_release(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle);
 SD_API bool sd_gpu_handle_get_desc(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle, sd_gpu_tensor_desc_t* desc);

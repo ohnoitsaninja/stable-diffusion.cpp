@@ -677,19 +677,35 @@ bool ModelLoader::init_from_diffusers_file(const std::string& file_path, const s
     std::string clip_path   = path_join(file_path, "text_encoder/model.safetensors");
     std::string clip_g_path = path_join(file_path, "text_encoder_2/model.safetensors");
 
-    if (!init_from_safetensors_file(unet_path, "unet.")) {
+    auto load_diffusers_safetensors = [&](const std::string& primary_path,
+                                          const std::string& tensor_prefix) -> bool {
+        if (init_from_safetensors_file(primary_path, tensor_prefix)) {
+            return true;
+        }
+        std::string fp16_path = primary_path;
+        const std::string suffix = ".safetensors";
+        if (ends_with(fp16_path, suffix)) {
+            fp16_path = fp16_path.substr(0, fp16_path.size() - suffix.size()) + ".fp16.safetensors";
+            if (init_from_safetensors_file(fp16_path, tensor_prefix)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (!load_diffusers_safetensors(unet_path, "unet.")) {
         return false;
     }
 
-    if (!init_from_safetensors_file(vae_path, "vae.")) {
+    if (!load_diffusers_safetensors(vae_path, "vae.")) {
         LOG_WARN("Couldn't find working VAE in %s", file_path.c_str());
         // return false;
     }
-    if (!init_from_safetensors_file(clip_path, "te.")) {
+    if (!load_diffusers_safetensors(clip_path, "te.")) {
         LOG_WARN("Couldn't find working text encoder in %s", file_path.c_str());
         // return false;
     }
-    if (!init_from_safetensors_file(clip_g_path, "te.1.")) {
+    if (!load_diffusers_safetensors(clip_g_path, "te.1.")) {
         LOG_DEBUG("Couldn't find working second text encoder in %s", file_path.c_str());
     }
     return true;
@@ -1072,6 +1088,7 @@ SDVersion ModelLoader::get_sd_version() {
     bool has_middle_block_1          = false;
     bool has_output_block_311        = false;
     bool has_output_block_71         = false;
+    TensorStorage output_block_weight;
 
     for (auto& [name, tensor_storage] : tensor_storage_map) {
         if (!(is_xl)) {
@@ -1156,6 +1173,10 @@ SDVersion ModelLoader::get_sd_version() {
             tensor_storage.name == "unet.conv_in.weight") {
             input_block_weight = tensor_storage;
         }
+        if (tensor_storage.name == "model.diffusion_model.out.2.weight" ||
+            tensor_storage.name == "unet.conv_out.weight") {
+            output_block_weight = tensor_storage;
+        }
     }
     if (is_wan) {
         LOG_DEBUG("patch_embedding_channels %d", patch_embedding_channels);
@@ -1220,6 +1241,9 @@ SDVersion ModelLoader::get_sd_version() {
         }
         return VERSION_SD1;
     } else if (token_embedding_weight.ne[0] == 1024) {
+        if (input_block_weight.ne[2] == 12 && output_block_weight.ne[3] == 8) {
+            return VERSION_MARIGOLD_IID;
+        }
         if (is_inpaint) {
             return VERSION_SD2_INPAINT;
         }

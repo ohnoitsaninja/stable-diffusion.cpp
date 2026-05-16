@@ -820,7 +820,7 @@ struct AutoEncoderKL : public VAE {
                   bool use_video_decoder = false,
                   SDVersion version      = VERSION_SD1)
         : decode_only(decode_only), VAE(version, backend, offload_params_to_cpu) {
-        if (sd_version_is_sd1(version) || sd_version_is_sd2(version)) {
+        if (sd_version_is_sd1(version) || sd_version_is_sd2(version) || sd_version_is_marigold_iid(version)) {
             scale_factor = 0.18215f;
             shift_factor = 0.f;
         } else if (sd_version_is_sdxl(version)) {
@@ -1407,7 +1407,7 @@ struct AutoEncoderKL : public VAE {
     sd::Tensor<float> vae_output_to_latents(const sd::Tensor<float>& vae_output, std::shared_ptr<RNG> rng) override {
         if (sd_version_is_flux2(version)) {
             return vae_output;
-        } else if (version == VERSION_SD1_PIX2PIX) {
+        } else if (version == VERSION_SD1_PIX2PIX || sd_version_is_marigold_iid(version)) {
             return sd::ops::chunk(vae_output, 2, 2)[0];
         } else {
             return gaussian_latent_sample(vae_output, rng);

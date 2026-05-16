@@ -50,6 +50,7 @@ enum SDVersion {
     VERSION_FLUX2_KLEIN,
     VERSION_Z_IMAGE,
     VERSION_OVIS_IMAGE,
+    VERSION_MARIGOLD_IID,
     VERSION_COUNT,
 };
 
@@ -74,10 +75,15 @@ static inline bool sd_version_is_sdxl(SDVersion version) {
     return false;
 }
 
+static inline bool sd_version_is_marigold_iid(SDVersion version) {
+    return version == VERSION_MARIGOLD_IID;
+}
+
 static inline bool sd_version_is_unet(SDVersion version) {
     if (sd_version_is_sd1(version) ||
         sd_version_is_sd2(version) ||
-        sd_version_is_sdxl(version)) {
+        sd_version_is_sdxl(version) ||
+        sd_version_is_marigold_iid(version)) {
         return true;
     }
     return false;

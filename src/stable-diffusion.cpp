@@ -58,6 +58,7 @@ const char* model_version_to_str[] = {
     "Flux.2 klein",
     "Z-Image",
     "Ovis Image",
+    "Marigold IID",
 };
 
 const char* sampling_methods_str[] = {
@@ -955,6 +956,8 @@ public:
                     } else {
                         pred_type = EPS_PRED;
                     }
+                } else if (sd_version_is_marigold_iid(version)) {
+                    pred_type = V_PRED;
                 } else if (sd_version_is_sdxl(version)) {
                     if (tensor_storage_map.find("edm_vpred.sigma_max") != tensor_storage_map.end()) {
                         // CosXL models
@@ -1804,6 +1807,103 @@ public:
         }
 
         int64_t t0                   = ggml_time_us();
+        if (sd_version_is_marigold_iid(version) && method == DDIM_TRAILING_SAMPLE_METHOD && !noise.empty()) {
+            auto build_zero_snr_alphas_cumprod = []() {
+                constexpr double beta_start = 0.00085;
+                constexpr double beta_end   = 0.0120;
+                std::vector<double> alphas_bar_sqrt(TIMESTEPS);
+                double product = 1.0;
+                for (int i = 0; i < TIMESTEPS; ++i) {
+                    const double beta_sqrt = std::sqrt(beta_start) +
+                                             (std::sqrt(beta_end) - std::sqrt(beta_start)) *
+                                                 (static_cast<double>(i) / static_cast<double>(TIMESTEPS - 1));
+                    const double beta = beta_sqrt * beta_sqrt;
+                    product *= (1.0 - beta);
+                    alphas_bar_sqrt[i] = std::sqrt(product);
+                }
+
+                const double alpha0 = alphas_bar_sqrt.front();
+                const double alphaT = alphas_bar_sqrt.back();
+                const double denom  = alpha0 - alphaT;
+                if (denom != 0.0) {
+                    for (double& alpha : alphas_bar_sqrt) {
+                        alpha = (alpha - alphaT) * alpha0 / denom;
+                    }
+                }
+
+                std::vector<double> alphas_cumprod(TIMESTEPS);
+                for (int i = 0; i < TIMESTEPS; ++i) {
+                    alphas_cumprod[i] = alphas_bar_sqrt[i] * alphas_bar_sqrt[i];
+                }
+                return alphas_cumprod;
+            };
+
+            const std::vector<double> alphas_cumprod = build_zero_snr_alphas_cumprod();
+            const int ddim_steps = std::max(1, static_cast<int>(steps));
+            const int prev_step  = std::max(1, TIMESTEPS / ddim_steps);
+            sd::Tensor<float> x  = std::move(noise);
+            LOG_INFO("Marigold IID using direct Diffusers-compatible DDIM v-prediction sampler");
+
+            for (int i = 0; i < ddim_steps; ++i) {
+                if (i == 0) {
+                    pretty_progress(0, ddim_steps, 0);
+                }
+                const int timestep = std::max(0,
+                                              std::min(TIMESTEPS - 1,
+                                                       static_cast<int>(std::round(TIMESTEPS - i * (static_cast<double>(TIMESTEPS) / ddim_steps))) - 1));
+                const int prev_timestep = timestep - prev_step;
+
+                sd::Tensor<float> timesteps_tensor({1}, std::vector<float>{static_cast<float>(timestep)});
+                DiffusionParams diffusion_params;
+                diffusion_params.x         = cond.c_concat.empty() ? &x : &cond.c_concat;
+                diffusion_params.timesteps = &timesteps_tensor;
+                diffusion_params.context   = cond.c_crossattn.empty() ? nullptr : &cond.c_crossattn;
+                diffusion_params.c_concat  = cond.c_concat.empty() ? nullptr : &x;
+                diffusion_params.y         = cond.c_vector.empty() ? nullptr : &cond.c_vector;
+
+                auto model_output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
+                if (model_output_opt.empty()) {
+                    LOG_ERROR("Marigold IID diffusion model compute failed");
+                    if (work_diffusion_model) {
+                        work_diffusion_model->free_compute_buffer();
+                    }
+                    return {};
+                }
+                sd::Tensor<float> model_output = std::move(model_output_opt);
+
+                const double alpha_prod_t      = alphas_cumprod[timestep];
+                const double alpha_prod_t_prev = prev_timestep >= 0 ? alphas_cumprod[prev_timestep] : alphas_cumprod[0];
+                const double beta_prod_t       = 1.0 - alpha_prod_t;
+                sd::Tensor<float> pred_original_sample =
+                    x * static_cast<float>(std::sqrt(alpha_prod_t)) -
+                    model_output * static_cast<float>(std::sqrt(beta_prod_t));
+                sd::Tensor<float> pred_epsilon =
+                    model_output * static_cast<float>(std::sqrt(alpha_prod_t)) +
+                    x * static_cast<float>(std::sqrt(beta_prod_t));
+
+                const double variance =
+                    ((1.0 - alpha_prod_t_prev) / beta_prod_t) *
+                    (1.0 - alpha_prod_t / alpha_prod_t_prev);
+                const double std_dev_t = eta * std::sqrt(std::max(variance, 0.0));
+                const double direction_scale = std::sqrt(std::max(0.0, 1.0 - alpha_prod_t_prev - std_dev_t * std_dev_t));
+
+                x = pred_original_sample * static_cast<float>(std::sqrt(alpha_prod_t_prev)) +
+                    pred_epsilon * static_cast<float>(direction_scale);
+                if (eta > 0.0f && std_dev_t > 0.0) {
+                    x += sd::Tensor<float>::randn_like(x, sampler_rng) * static_cast<float>(std_dev_t);
+                }
+
+                const float avg_step_seconds = (ggml_time_us() - t0) / 1000000.f / static_cast<float>(i + 1);
+                pretty_progress(i + 1, ddim_steps, avg_step_seconds);
+                report_sample_progress(i + 1, ddim_steps, t0);
+            }
+
+            if (work_diffusion_model) {
+                work_diffusion_model->free_compute_buffer();
+            }
+            return x;
+        }
+
         sd::Tensor<float> x_t        = !noise.empty()
                                            ? denoiser->noise_scaling(sigmas[0], noise, init_latent)
                                            : init_latent;
@@ -2065,6 +2165,9 @@ public:
 
     int get_latent_channel() {
         int latent_channel = 4;
+        if (sd_version_is_marigold_iid(version)) {
+            return 8;
+        }
         if (sd_version_is_dit(version)) {
             if (version == VERSION_WAN2_2_TI2V) {
                 latent_channel = 48;
@@ -3310,6 +3413,8 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
 
     sd::Tensor<float> init_latent;
     sd::Tensor<float> control_latent;
+    sd::Tensor<float> concat_latent;
+    sd::Tensor<float> uncond_concat_latent;
     if (init_image_tensor.empty()) {
         init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height);
     } else {
@@ -3318,6 +3423,18 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
             LOG_ERROR("failed to encode init image");
             return std::nullopt;
         }
+    }
+
+    if (sd_version_is_marigold_iid(sd_ctx->sd->version)) {
+        if (init_image_tensor.empty()) {
+            LOG_ERROR("Marigold IID requires an init/control image; text-to-image is not supported");
+            return std::nullopt;
+        }
+        sd::Tensor<float> image_condition_latent = init_latent;
+        init_latent                              = sd_ctx->sd->generate_init_latent(request->width, request->height);
+        concat_latent                           = std::move(image_condition_latent);
+        uncond_concat_latent                    = sd::Tensor<float>::zeros_like(concat_latent);
+        LOG_INFO("Marigold IID latents prepared: image_condition_channels=4 target_channels=8");
     }
 
     if (!control_image_tensor.empty() && !sd_ctx->sd->vae_decode_only && sd_version_is_control(sd_ctx->sd->version)) {
@@ -3385,8 +3502,6 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         ref_latents.push_back(std::move(ref_latent));
     }
 
-    sd::Tensor<float> concat_latent;
-    sd::Tensor<float> uncond_concat_latent;
     if (sd_version_is_inpaint(sd_ctx->sd->version)) {
         sd::Tensor<float> masked_init_latent;
 
@@ -3825,6 +3940,9 @@ static bool sd_gpu_resource_is_cuda(const sd_gpu_resource_private_t& resource) {
 }
 
 static uint32_t expected_diffusion_latent_channels(SDVersion version) {
+    if (sd_version_is_marigold_iid(version)) {
+        return 8;
+    }
     if (sd_version_is_flux2(version)) {
         return 128;
     }
@@ -4928,6 +5046,9 @@ static sd_model_family_t sd_model_family_from_version(SDVersion version) {
     if (sd_version_is_anima(version)) {
         return SD_MODEL_FAMILY_ANIMA;
     }
+    if (sd_version_is_marigold_iid(version)) {
+        return SD_MODEL_FAMILY_MARIGOLD_IID;
+    }
     return SD_MODEL_FAMILY_UNKNOWN;
 }
 
@@ -4953,6 +5074,8 @@ static const char* sd_model_family_name(sd_model_family_t family) {
             return "qwen_image";
         case SD_MODEL_FAMILY_ANIMA:
             return "anima";
+        case SD_MODEL_FAMILY_MARIGOLD_IID:
+            return "marigold_iid";
         case SD_MODEL_FAMILY_UNKNOWN:
         default:
             return "unknown";
@@ -5050,7 +5173,200 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
         capabilities->supports_vae_encode = true;
         capabilities->supports_vae_encode_gpu_output = false;
     }
+    if (sd_version_is_marigold_iid(version)) {
+        capabilities->latent_channels = 8;
+        capabilities->default_sample_method = DDIM_TRAILING_SAMPLE_METHOD;
+        capabilities->default_scheduler = DISCRETE_SCHEDULER;
+        capabilities->default_cfg_scale = 1.0f;
+        capabilities->default_steps = 4;
+        capabilities->supports_text_to_image = false;
+        capabilities->supports_image_to_image = true;
+        capabilities->supports_gpu_sample_bridge_output = false;
+        capabilities->supports_gpu_latent_decode = false;
+        capabilities->supports_gpu_image_output = false;
+        capabilities->supports_intrinsic_image_decomposition = true;
+        capabilities->intrinsic_target_count = 2;
+    }
     return true;
+}
+
+SD_API void sd_marigold_iid_options_init(sd_marigold_iid_options_t* options) {
+    if (options == nullptr) {
+        return;
+    }
+    *options = {};
+    options->struct_size = sizeof(sd_marigold_iid_options_t);
+    options->version = SD_VAE_API_VERSION;
+    options->processing_width = 0;
+    options->processing_height = 0;
+    options->steps = 4;
+    options->seed = -1;
+    options->match_input_resolution = true;
+}
+
+static void resolve_marigold_processing_size(const sd_image_t* image,
+                                             const sd_marigold_iid_options_t* options,
+                                             uint32_t* width,
+                                             uint32_t* height) {
+    uint32_t target_w = options != nullptr ? options->processing_width : 0;
+    uint32_t target_h = options != nullptr ? options->processing_height : 0;
+    if (target_w == 0 && target_h == 0) {
+        const uint32_t max_side = 768;
+        if (image->width >= image->height) {
+            target_w = max_side;
+            target_h = std::max<uint32_t>(8, static_cast<uint32_t>(std::llround(static_cast<double>(image->height) * max_side / image->width)));
+        } else {
+            target_h = max_side;
+            target_w = std::max<uint32_t>(8, static_cast<uint32_t>(std::llround(static_cast<double>(image->width) * max_side / image->height)));
+        }
+    } else if (target_w == 0) {
+        target_w = std::max<uint32_t>(8, static_cast<uint32_t>(std::llround(static_cast<double>(image->width) * target_h / image->height)));
+    } else if (target_h == 0) {
+        target_h = std::max<uint32_t>(8, static_cast<uint32_t>(std::llround(static_cast<double>(image->height) * target_w / image->width)));
+    }
+    auto align_up_u32 = [](uint32_t value, uint32_t multiple) -> uint32_t {
+        return ((value + multiple - 1) / multiple) * multiple;
+    };
+    target_w = std::max<uint32_t>(8, align_up_u32(target_w, 8));
+    target_h = std::max<uint32_t>(8, align_up_u32(target_h, 8));
+    *width = target_w;
+    *height = target_h;
+}
+
+SD_API sd_marigold_iid_result_t* sd_marigold_iid_predict(sd_ctx_t* sd_ctx,
+                                                         const sd_image_t* image,
+                                                         const sd_marigold_iid_options_t* options) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image == nullptr || image->data == nullptr) {
+        return nullptr;
+    }
+    if (!sd_version_is_marigold_iid(sd_ctx->sd->version)) {
+        LOG_ERROR("sd_marigold_iid_predict requires a Marigold IID context");
+        return nullptr;
+    }
+    if (sd_ctx->sd->vae_decode_only ||
+        sd_ctx->sd->cond_stage_model == nullptr ||
+        sd_ctx->sd->diffusion_model == nullptr ||
+        sd_ctx->sd->denoiser == nullptr ||
+        sd_ctx->sd->first_stage_model == nullptr) {
+        LOG_ERROR("sd_marigold_iid_predict requires a full Marigold IID context");
+        return nullptr;
+    }
+
+    sd_marigold_iid_options_t effective;
+    sd_marigold_iid_options_init(&effective);
+    if (options != nullptr) {
+        effective = *options;
+        if (effective.struct_size == 0) {
+            effective.struct_size = sizeof(sd_marigold_iid_options_t);
+        }
+        if (effective.version == 0) {
+            effective.version = SD_VAE_API_VERSION;
+        }
+    }
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    resolve_marigold_processing_size(image, &effective, &width, &height);
+
+    sd_img_gen_params_t gen_params;
+    sd_img_gen_params_init(&gen_params);
+    gen_params.prompt = "";
+    gen_params.negative_prompt = "";
+    gen_params.init_image = *image;
+    gen_params.width = static_cast<int>(width);
+    gen_params.height = static_cast<int>(height);
+    gen_params.seed = effective.seed;
+    gen_params.strength = 1.0f;
+    gen_params.batch_count = 1;
+    gen_params.sample_params.sample_steps = effective.steps > 0 ? static_cast<int>(effective.steps) : 4;
+    gen_params.sample_params.guidance.txt_cfg = 1.0f;
+    gen_params.sample_params.guidance.img_cfg = 1.0f;
+    gen_params.sample_params.sample_method = DDIM_TRAILING_SAMPLE_METHOD;
+    gen_params.sample_params.scheduler = DISCRETE_SCHEDULER;
+    gen_params.sample_params.eta = 0.0f;
+
+    int64_t t0 = ggml_time_ms();
+    sd_latent_t* latent = sd_sample_latent(sd_ctx, &gen_params, nullptr);
+    if (latent == nullptr) {
+        LOG_ERROR("sd_marigold_iid_predict failed during latent sampling");
+        return nullptr;
+    }
+    const sd::Tensor<float>* pred_latent = sd_latent_tensor(latent);
+    if (pred_latent == nullptr || pred_latent->empty() || pred_latent->shape().size() < 3 || pred_latent->shape()[2] != 8) {
+        LOG_ERROR("sd_marigold_iid_predict expected an 8-channel prediction latent");
+        free_sd_latent(latent);
+        return nullptr;
+    }
+
+    std::vector<sd::Tensor<float>> target_latents = sd::ops::chunk(*pred_latent, 2, 2);
+    sd_image_t* target_images = static_cast<sd_image_t*>(calloc(target_latents.size(), sizeof(sd_image_t)));
+    if (target_images == nullptr) {
+        free_sd_latent(latent);
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < target_latents.size(); ++i) {
+        sd::Tensor<float> decoded = sd_ctx->sd->decode_first_stage(target_latents[i]);
+        if (decoded.empty()) {
+            LOG_ERROR("sd_marigold_iid_predict failed decoding target %zu", i);
+            for (size_t j = 0; j < i; ++j) {
+                free(target_images[j].data);
+            }
+            free(target_images);
+            free_sd_latent(latent);
+            return nullptr;
+        }
+        if (effective.match_input_resolution &&
+            (decoded.shape()[0] != static_cast<int64_t>(image->width) ||
+             decoded.shape()[1] != static_cast<int64_t>(image->height))) {
+            decoded = sd::ops::interpolate(decoded,
+                                           {static_cast<int64_t>(image->width),
+                                            static_cast<int64_t>(image->height),
+                                            decoded.shape()[2],
+                                            decoded.shape().size() > 3 ? decoded.shape()[3] : 1});
+        }
+        target_images[i] = tensor_to_sd_image(decoded);
+    }
+
+    sd_marigold_iid_result_t* result = static_cast<sd_marigold_iid_result_t*>(calloc(1, sizeof(sd_marigold_iid_result_t)));
+    if (result == nullptr) {
+        for (size_t i = 0; i < target_latents.size(); ++i) {
+            free(target_images[i].data);
+        }
+        free(target_images);
+        free_sd_latent(latent);
+        return nullptr;
+    }
+    static const char* kTargetNames[] = {"albedo", "material"};
+    result->struct_size = sizeof(sd_marigold_iid_result_t);
+    result->version = SD_VAE_API_VERSION;
+    result->target_count = static_cast<uint32_t>(target_latents.size());
+    result->targets = target_images;
+    result->target_names = kTargetNames;
+    result->latent = latent;
+    LOG_INFO("sd_marigold_iid_predict completed targets=%u processing=%ux%u total=%.2fs",
+             result->target_count,
+             width,
+             height,
+             (ggml_time_ms() - t0) * 1.0f / 1000);
+    return result;
+}
+
+SD_API void free_sd_marigold_iid_result(sd_marigold_iid_result_t* result) {
+    if (result == nullptr) {
+        return;
+    }
+    if (result->targets != nullptr) {
+        for (uint32_t i = 0; i < result->target_count; ++i) {
+            free(result->targets[i].data);
+            result->targets[i].data = nullptr;
+        }
+        free(result->targets);
+    }
+    if (result->latent != nullptr) {
+        free_sd_latent(result->latent);
+    }
+    free(result);
 }
 
 SD_API bool sd_gpu_handle_retain(sd_ctx_t* sd_ctx, sd_gpu_handle_t handle) {

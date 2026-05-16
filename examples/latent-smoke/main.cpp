@@ -50,6 +50,7 @@ struct Args {
     bool expect_gpu_encode_refusal = false;
     bool expect_decode_refusal = false;
     bool preview_tae = false;
+    bool marigold_iid = false;
     int preview_every = 0;
     float preview_percent_interval = 0.0f;
     std::vector<float> preview_percents;
@@ -99,6 +100,7 @@ static void usage(const char* argv0) {
         << "  --preview-percent-interval <float> emit preview at percentage increments, e.g. 0.25\n"
         << "  --preview-percent <float> add an explicit preview percentage, repeatable\n"
         << "  --preview-prefix <path>  preview output path prefix\n"
+        << "  --marigold-iid          run Marigold intrinsic decomposition smoke and write target images\n"
         << "  --no-decode              skip sd_decode_latent\n";
 }
 
@@ -242,6 +244,8 @@ static bool parse_args(int argc, char** argv, Args& args) {
             const char* value = need_value("--preview-prefix");
             if (value == nullptr) return false;
             args.preview_prefix = value;
+        } else if (arg == "--marigold-iid") {
+            args.marigold_iid = true;
         } else if (arg == "--no-decode") {
             args.decode = false;
         } else {
@@ -513,6 +517,51 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "loaded image " << image.width << "x" << image.height << "x" << image.channel << "\n";
+
+    if (args.marigold_iid) {
+        sd_marigold_iid_options_t iid_options;
+        sd_marigold_iid_options_init(&iid_options);
+        iid_options.processing_width = args.width > 0 ? static_cast<uint32_t>(args.width) : 0;
+        iid_options.processing_height = args.height > 0 ? static_cast<uint32_t>(args.height) : 0;
+        iid_options.steps = args.steps > 0 ? static_cast<uint32_t>(args.steps) : 4;
+        iid_options.seed = 12345;
+        iid_options.match_input_resolution = true;
+
+        std::cout << "calling sd_marigold_iid_predict\n";
+        sd_marigold_iid_result_t* iid = sd_marigold_iid_predict(ctx, &image, &iid_options);
+        if (iid == nullptr) {
+            std::cerr << "sd_marigold_iid_predict failed\n";
+            free(image.data);
+            free_sd_ctx(ctx);
+            return 1;
+        }
+        std::cout << "marigold_iid_result targets=" << iid->target_count
+                  << " latent=" << (iid->latent != nullptr ? "true" : "false") << "\n";
+        std::string stem = args.output;
+        size_t dot = stem.find_last_of('.');
+        std::string ext = ".png";
+        if (dot != std::string::npos) {
+            ext = stem.substr(dot);
+            stem = stem.substr(0, dot);
+        }
+        for (uint32_t i = 0; i < iid->target_count; ++i) {
+            const char* target_name = (iid->target_names != nullptr && iid->target_names[i] != nullptr) ? iid->target_names[i] : "target";
+            std::string path = stem + "_" + target_name + ext;
+            if (!write_image_to_file(path, iid->targets[i].data, iid->targets[i].width, iid->targets[i].height, iid->targets[i].channel)) {
+                std::cerr << "failed to write " << path << "\n";
+                free_sd_marigold_iid_result(iid);
+                free(image.data);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            std::cout << "wrote " << path << " " << iid->targets[i].width << "x" << iid->targets[i].height
+                      << "x" << iid->targets[i].channel << "\n";
+        }
+        free_sd_marigold_iid_result(iid);
+        free(image.data);
+        free_sd_ctx(ctx);
+        return 0;
+    }
 
     sd_tiling_params_t tiling{};
     tiling.enabled        = false;

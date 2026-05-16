@@ -118,7 +118,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                                       const std::map<std::string, std::string>& orig_embedding_map,
                                       SDVersion version = VERSION_SD1,
                                       PMVersion pv      = PM_VERSION_1)
-        : version(version), pm_version(pv), tokenizer(sd_version_is_sd2(version) ? 0 : 49407) {
+        : version(version), pm_version(pv), tokenizer((sd_version_is_sd2(version) || sd_version_is_marigold_iid(version)) ? 0 : 49407) {
         for (const auto& kv : orig_embedding_map) {
             std::string name = kv.first;
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -128,7 +128,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         bool force_clip_f32 = !embedding_map.empty();
         if (sd_version_is_sd1(version)) {
             text_model = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, true, force_clip_f32);
-        } else if (sd_version_is_sd2(version)) {
+        } else if (sd_version_is_sd2(version) || sd_version_is_marigold_iid(version)) {
             text_model = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPEN_CLIP_VIT_H_14, true, force_clip_f32);
         } else if (sd_version_is_sdxl(version)) {
             text_model  = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, false, force_clip_f32);
@@ -377,7 +377,23 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         // tokens.insert(tokens.begin(), tokenizer.BOS_TOKEN_ID);
         // weights.insert(weights.begin(), 1.0);
 
-        tokenizer.pad_tokens(tokens, weights, max_length, padding);
+        if (!padding && sd_version_is_marigold_iid(version)) {
+            std::vector<int> unpadded_tokens;
+            std::vector<float> unpadded_weights;
+            unpadded_tokens.reserve(tokens.size() + 2);
+            unpadded_weights.reserve(weights.size() + 2);
+            unpadded_tokens.push_back(tokenizer.BOS_TOKEN_ID);
+            unpadded_weights.push_back(1.0f);
+            const size_t body_limit = max_length > 1 ? std::min(tokens.size(), max_length - 2) : tokens.size();
+            unpadded_tokens.insert(unpadded_tokens.end(), tokens.begin(), tokens.begin() + body_limit);
+            unpadded_weights.insert(unpadded_weights.end(), weights.begin(), weights.begin() + body_limit);
+            unpadded_tokens.push_back(tokenizer.EOS_TOKEN_ID);
+            unpadded_weights.push_back(1.0f);
+            tokens = std::move(unpadded_tokens);
+            weights = std::move(unpadded_weights);
+        } else {
+            tokenizer.pad_tokens(tokens, weights, max_length, padding);
+        }
         int offset = pm_version == PM_VERSION_2 ? 2 * num_input_imgs : num_input_imgs;
         for (int i = 0; i < tokens.size(); i++) {
             // if (class_idx + 1 <= i && i < class_idx + 1 + 2*num_input_imgs) // photomaker V2 has num_tokens(=2)*num_input_imgs
@@ -460,7 +476,23 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             weights.insert(weights.end(), curr_tokens.size(), curr_weight);
         }
 
-        tokenizer.pad_tokens(tokens, weights, max_length, padding);
+        if (!padding && sd_version_is_marigold_iid(version)) {
+            std::vector<int> unpadded_tokens;
+            std::vector<float> unpadded_weights;
+            unpadded_tokens.reserve(tokens.size() + 2);
+            unpadded_weights.reserve(weights.size() + 2);
+            unpadded_tokens.push_back(tokenizer.BOS_TOKEN_ID);
+            unpadded_weights.push_back(1.0f);
+            const size_t body_limit = max_length > 1 ? std::min(tokens.size(), max_length - 2) : tokens.size();
+            unpadded_tokens.insert(unpadded_tokens.end(), tokens.begin(), tokens.begin() + body_limit);
+            unpadded_weights.insert(unpadded_weights.end(), weights.begin(), weights.begin() + body_limit);
+            unpadded_tokens.push_back(tokenizer.EOS_TOKEN_ID);
+            unpadded_weights.push_back(1.0f);
+            tokens = std::move(unpadded_tokens);
+            weights = std::move(unpadded_weights);
+        } else {
+            tokenizer.pad_tokens(tokens, weights, max_length, padding);
+        }
 
         // for (int i = 0; i < tokens.size(); i++) {
         //     std::cout << tokens[i] << ":" << weights[i] << ", ";
@@ -483,10 +515,10 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         sd::Tensor<float> pooled;
 
         if (clip_skip <= 0) {
-            clip_skip = (sd_version_is_sd2(version) || sd_version_is_sdxl(version)) ? 2 : 1;
+            clip_skip = sd_version_is_marigold_iid(version) ? 1 : ((sd_version_is_sd2(version) || sd_version_is_sdxl(version)) ? 2 : 1);
         }
 
-        size_t chunk_len   = 77;
+        size_t chunk_len   = sd_version_is_marigold_iid(version) ? std::max<size_t>(1, tokens.size()) : 77;
         size_t chunk_count = tokens.size() / chunk_len;
         for (int chunk_idx = 0; chunk_idx < chunk_count; chunk_idx++) {
             std::vector<int> chunk_tokens(tokens.begin() + chunk_idx * chunk_len,
@@ -640,7 +672,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
 
     SDCondition get_learned_condition(int n_threads,
                                       const ConditionerParams& conditioner_params) override {
-        auto tokens_and_weights     = tokenize(conditioner_params.text, true);
+        auto tokens_and_weights     = tokenize(conditioner_params.text, !sd_version_is_marigold_iid(version));
         std::vector<int>& tokens    = tokens_and_weights.first;
         std::vector<float>& weights = tokens_and_weights.second;
         return get_learned_condition_common(n_threads,

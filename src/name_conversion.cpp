@@ -713,7 +713,7 @@ std::string convert_other_dit_to_original_anima(std::string name) {
 }
 
 std::string convert_diffusion_model_name(std::string name, std::string prefix, SDVersion version) {
-    if (sd_version_is_sd1(version) || sd_version_is_sd2(version)) {
+    if (sd_version_is_sd1(version) || sd_version_is_sd2(version) || sd_version_is_marigold_iid(version)) {
         name = convert_diffusers_unet_to_original_sd1(name);
     } else if (sd_version_is_sdxl(version)) {
         name = convert_diffusers_unet_to_original_sdxl(name);

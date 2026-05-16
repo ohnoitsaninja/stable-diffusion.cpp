@@ -608,7 +608,16 @@ public:
         auto token_embed_weight    = params["token_embedding.weight"];
         auto position_embed_weight = params["position_embedding.weight"];
 
-        GGML_ASSERT(input_ids->ne[0] == position_embed_weight->ne[1]);
+        GGML_ASSERT(input_ids->ne[0] <= position_embed_weight->ne[1]);
+        ggml_tensor* position_embedding = position_embed_weight;
+        if (input_ids->ne[0] != position_embed_weight->ne[1]) {
+            position_embedding = ggml_view_2d(ctx->ggml_ctx,
+                                              position_embed_weight,
+                                              position_embed_weight->ne[0],
+                                              input_ids->ne[0],
+                                              position_embed_weight->nb[1],
+                                              0);
+        }
         input_ids            = ggml_reshape_3d(ctx->ggml_ctx, input_ids, input_ids->ne[0], 1, input_ids->ne[1]);
         auto token_embedding = ggml_get_rows(ctx->ggml_ctx, custom_embed_weight != nullptr ? custom_embed_weight : token_embed_weight, input_ids);
         token_embedding      = ggml_reshape_3d(ctx->ggml_ctx, token_embedding, token_embedding->ne[0], token_embedding->ne[1], token_embedding->ne[3]);
@@ -616,7 +625,7 @@ public:
         // token_embedding + position_embedding
         auto x = ggml_add(ctx->ggml_ctx,
                           token_embedding,
-                          position_embed_weight);  // [N, n_token, embed_dim]
+                          position_embedding);  // [N, n_token, embed_dim]
         return x;
     }
 };
