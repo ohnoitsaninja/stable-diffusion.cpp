@@ -172,15 +172,19 @@ Flux.1 + TAEF1 smoke:
   --taesd "F:\automatic1111\Stability\Models\VAE\taef1.safetensors" `
   --image "F:\Paralol\examples\orc.png" `
   --image-channels 3 `
-  --prompt "a lovely cat" `
+  --prompt "a lovely cat, detailed, sharp, high quality" `
   --negative-prompt "" `
-  --steps 1 --cfg-scale 1.0 --width 512 --height 512 `
+  --steps 4 --cfg-scale 1.0 --width 512 --height 512 `
   --sample-without-init --gpu-sample-output `
-  --preview-tae --preview-every 1 `
-  --preview-prefix "C:\tmp\stable-diffusion.cpp-paralol\build\taef1-smoke\flux1" `
+  --preview-tae --preview-every 4 `
+  --preview-prefix "C:\tmp\stable-diffusion.cpp-paralol\build\taef1-smoke\flux1_4step" `
   --skip-estimate --no-decode
 ```
 
 Expected preview:
 
-- `flux1_step1_denoised_frame0.png`
+- `flux1_4step_step4_denoised_frame0.png`
+
+This is a preview decoder, not the final Flux AE. The verified 4-step preview is
+coherent but has visible tiny-autoencoder artifacts; final image quality should
+still be judged through the full Flux AE decode.
