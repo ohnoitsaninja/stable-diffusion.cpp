@@ -13,6 +13,18 @@ Diffusion model(SD,Flux,Wan,...) inference in pure C/C++
 ***Note that this project is under active development. \
 API and command-line option may change frequently.***
 
+## Paralol Fork Note
+
+This fork carries an integration branch for Paralol's native Stable Diffusion
+worker. The branch adds modular latent APIs, GPU handoff handles,
+COMFY_NORMAL VAE execution, ControlNet fixes, and Flux/Z/Anima pipeline
+capability reporting on top of upstream `leejet/stable-diffusion.cpp`.
+
+The current branch is a working integration fork, not a single upstream-ready
+pull request. See [docs/sdcpp-fork-upstream-readiness.md](./docs/sdcpp-fork-upstream-readiness.md)
+for the full fork delta, current limitations, validation notes, and the
+recommended sequence for splitting the work into upstreamable pieces.
+
 ## 🔥Important News
 
 * **2026/01/18** 🚀 stable-diffusion.cpp now supports **FLUX.2-klein**  

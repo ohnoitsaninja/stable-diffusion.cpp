@@ -13,15 +13,18 @@ as one pull request.
 
 - Fork repo: `ohnoitsaninja/stable-diffusion.cpp`
 - Upstream parent: `leejet/stable-diffusion.cpp`
-- Current released fork commit:
-  `2fac608a63f380261edfb7493659ff0d6a083007`
-- Current release tag: `paralol-gpu-handoff-2fac608`
-- Release asset:
-  `sd-master-2fac608-paralol-gpu-handoff-bin-win-cuda-x64.zip`
-- Release archive SHA256:
-  `ee06b44d0d15803b0353deb53408630b6fb6e33b4fce1bb5da9b621963e89a21`
+- Current fork branch commit:
+  `6f5fbee988bc239eabadac59b805711b09ee78b0`
+- Latest tagged release observed on this branch:
+  `paralol-z-anime-beta-ca9050db3`
+- Latest tagged release commit:
+  `ca9050db3`
+- Latest tagged release asset:
+  `sd-master-ca9050db3-paralol-z-anime-beta-bin-win-cuda-x64.zip`
+- Latest local staged DLL:
+  `F:\Paralol\build\runtime\stable-diffusion-paralol-latent\stable-diffusion.dll`
 - Staged DLL SHA256:
-  `0FB3BB9B3F9C5F7B756CC700F02F704D43CAC1F402C225D1142344E213B9B68C`
+  `490165FA25FB4293B6B7C112D4CA4D7EC566D0205BDEF31EC15293685A5FD54B`
 - Local fork branch observed:
   `paralol/comfy-normal-vae-cudnn`
 
@@ -37,9 +40,16 @@ The current branch stack is roughly:
 8. `2e351a349` - Add GPU latent handle sampler handoff
 9. `4e26875d3` - Harden GPU latent handoff contract
 10. `2fac608a6` - Add caller-owned GPU image download API
+11. `2061b5a8f` - Fix ControlNet dtype-aware loading
+12. `855068ba4` - Keep ControlNet outputs on backend
+13. `a8e80ee0a` - Add ControlNet denoise timing trace
+14. `4eb47e64c` - Support scaled FP8 safetensors loading
+15. `e96f1ba6d` - Add Flux and Z pipeline handoff capabilities
+16. `ca9050db3` - Add beta sigma scheduler
+17. `6f5fbee98` - Add Anima latent handoff support
 
 Measured against the upstream base commit we started from, the current fork
-changes about 31 files with roughly 6,680 insertions and 281 deletions. That is
+changes about 40 files with roughly 8,623 insertions and 320 deletions. That is
 not a reviewable upstream PR shape.
 
 ## Goals
@@ -64,6 +74,11 @@ The main goals were:
   DPM++ SDE variants
 - make normal full-frame SDXL VAE encode/decode fast and memory-bounded without
   secretly substituting tiled VAE or TAESD
+- load SDXL ControlNet weights with the intended dtype and avoid needless
+  per-step backend-to-host roundtrips
+- expose Flux2, Z-Image, and Anima model-family metadata so Paralol can route
+  non-SDXL latent shapes and text encoder requirements from capabilities rather
+  than filename guesses
 - make memory behavior diagnosable through reports, capability flags, strict
   modes, and smoke tools
 - keep unsupported GPU paths honest rather than hiding unsafe partial behavior
@@ -107,14 +122,44 @@ implementations for DPM++ SDE variants:
 - `dpmpp_2m_sde_heun_gpu`
 - `dpmpp_3m_sde`
 - `dpmpp_3m_sde_gpu`
+- `er_sde`
 
 This was done because the SDXL Lightning model we were testing expected a
 ComfyUI sampler named `dpm_sde`, and the upstream sampler list did not match
-that workflow well enough.
+that workflow well enough. Later Anima testing also needed `er_sde`, and
+Flux/Z testing needed flow-aware SDE logSNR handling plus beta sigma scheduler
+plumbing.
 
 Current upstream-readiness issue: this is probably the easiest part to separate,
 but it still needs review against upstream sampler naming, ComfyUI/k-diffusion
 parity, RNG/noise behavior, and CPU/GPU suffix semantics.
+
+### Model Pipeline Capabilities
+
+The fork added `sd_get_model_pipeline_capabilities(...)` so Paralol can ask the
+context what a loaded model family needs instead of hard-coding SDXL-shaped
+assumptions.
+
+The capability report includes:
+
+- model family and `family_name`
+- latent channel count and VAE scale factor
+- default sampler, scheduler, CFG, step count, and flow shift
+- required text encoder lanes such as CLIP-L, T5XXL, or Qwen/Qwen3 LLM
+- reference/edit-mode support
+- GPU sampled-latent bridge support
+- GPU latent decode and GPU image output support
+- whether VAE Encode is safe for the family
+
+This was added for Flux2 Klein, Z-Image/Z-Anime, and Anima, whose latent shapes
+and conditioning paths do not match SDXL. Flux2 uses 128-channel latents and
+reference/edit conditioning. Z-Image uses 16-channel latents with a Qwen LLM and
+Flux-style AE path. Anima uses 16-channel latents and a Wan/Qwen VAE path.
+
+Current upstream-readiness issue: the capability idea is useful outside Paralol,
+but the exact struct fields were selected to unblock the worker. Before
+upstreaming, the API should be narrowed to stable model-family facts and any
+Paralol-specific workflow policy should move out of the fork.
 
 ### Decode-Only and Model Resource Release
 
@@ -130,6 +175,28 @@ Current upstream-readiness issue: upstream may prefer a more general context
 lifetime/resource API rather than Paralol-specific release functions. The code
 should be reframed around "partial context residency" and "explicit component
 release" with documented post-release validity rules.
+
+### ControlNet Loading and Per-Step Handoff
+
+The fork fixed two ControlNet issues that blocked Paralol SDXL workflows:
+
+- ControlNet destination tensor dtypes now honor the context weight type and
+  tensor rules before allocating the parameter buffer. This prevents fp16
+  ControlNet files from being allocated as fp32-sized destination tensors.
+- Diffusers-style ControlNet key mapping was extended for models that use keys
+  such as `controlnet_down_blocks.*`.
+- ControlNet outputs are kept on the backend and fed into UNet without the old
+  per-step host materialization and re-upload path.
+- ControlNet denoise timing and handoff diagnostics were added so the worker can
+  distinguish model load cost from per-step ControlNet compute cost.
+
+Observed local result: the fp16 ControlNet parameter buffer loads around
+`2387.61 MB` instead of the earlier fp32-sized allocation, and the per-step path
+no longer bounces large ControlNet tensors through CPU memory.
+
+Current upstream-readiness issue: the dtype fix is a plausible upstream bug fix,
+but the performance diagnostics and backend-handoff shape should be split from
+the loader fix.
 
 ### COMFY_NORMAL VAE Path
 
@@ -209,6 +276,13 @@ The sampler still materializes the final latent through the existing
 CUDA and marks it with a bridge-upload flag. In strict mode it refuses to run so
 callers cannot claim zero-copy or fully GPU-resident sampling.
 
+For Anima, GPU latent decode is also a compatibility bridge rather than a true
+GPU-resident VAE path. A sampled 16-channel CUDA latent handle is downloaded into
+the known-good Wan/Qwen VAE decode path and the decoded RGB tensor is uploaded
+back into a GPU image handle. The report marks this with `host_copies=1`,
+`device_copies=1`, and bridge flags. `SDCPP_STRICT_GPU_RESIDENT=1` refuses this
+path.
+
 Current upstream-readiness issue: this API is the most likely to need redesign
 before upstreaming. Upstream may prefer a different abstraction such as a
 ggml-backed tensor handle, DLPack-style export, or backend buffer ownership
@@ -223,10 +297,17 @@ The current DLL refuses several paths on purpose:
 - VAE Encode GPU latent output is disabled
 - VAE-encoded CPU latent upload into GPU decode is disabled
 - GPU decode refuses handles marked as VAE-encoded latents
+- Anima modular VAE Encode is disabled through model capabilities because the
+  separated `VAE Encode -> KSampler -> Decode` path is not safe with the current
+  Wan/Qwen VAE implementation
+- strict mode refuses Anima's compatibility bridge because it contains an
+  explicit latent download and decoded-image upload
 
 This came from testing that found an unsafe VAE-encoded latent GPU handoff path.
 The current behavior is conservative: T2I sampled-latent handoff works, I2I VAE
-Encode GPU handoff does not pretend to work.
+Encode GPU handoff does not pretend to work. Direct one-shot `sd-cli`
+image-to-image remains available for model families where upstream supports it,
+but Paralol's modular VAE Encode node should follow the capability report.
 
 Current upstream-readiness issue: these refusals are good engineering behavior,
 but they are also evidence that the GPU API is not mature enough to upstream as a
@@ -242,6 +323,8 @@ The fork added diagnostics and smoke harnesses:
 - capability smoke script
 - fork docs for COMFY_NORMAL VAE, GPU latent flow, GPU resident values, and VAE
   kernel feasibility
+- Flux/Z/Anima handoff capability documentation
+- ControlNet dtype and backend-handoff diagnostics
 
 Current upstream-readiness issue: the tools are useful, but they need cleanup
 and upstream-style names. Anything called `paralol-*` should either stay in our
@@ -389,44 +472,62 @@ Do not send these as one PR. The likely order is:
    - could be useful even without the full GPU handle story
    - document exact allocation/free contract
 
-3. **CPU latent API**
+3. **ControlNet dtype-aware loading**
+   - focused loader fix for destination tensor dtype and allocation ordering
+   - include Diffusers key mapping only if it is needed by the same failing
+     model family
+   - keep per-step performance changes and timing diagnostics out of this PR
+
+4. **ControlNet backend output handoff**
+   - keep ControlNet outputs backend-resident and feed them into UNet without
+     host materialization
+   - include timing counters for ControlNet compute and output upload/download
+   - depends on reviewers accepting the tensor ownership shape
+
+5. **CPU latent API**
    - `sd_sample_latent`, `sd_encode_image`, `sd_decode_latent`, latent
      view/export/import if still needed
    - keep GPU handles out of this PR
    - prove ComfyUI-style node split with CPU-resident values first
 
-4. **Component release / decode-only context cleanup**
+6. **Component release / decode-only context cleanup**
    - generalize CLIP/UNet/VAE residency controls
    - document which APIs remain valid after release
    - avoid naming this around Paralol's `unloadAfterRun`
 
-5. **VAE memory reporting and capabilities**
+7. **Model-family capability reporting**
+   - narrow `sd_get_model_pipeline_capabilities(...)` to stable facts: family,
+     latent channels, VAE scale, required text encoders, edit/reference support
+   - keep Paralol workflow policy and local defaults out of the upstream API
+   - use Flux2/Z-Image/Anima as validation cases
+
+8. **VAE memory reporting and capabilities**
    - add reports and capability discovery without changing the default execution
      path yet
    - this gives reviewers visibility before changing behavior
 
-6. **COMFY_NORMAL full-frame VAE execution**
+9. **COMFY_NORMAL full-frame VAE execution**
    - introduce the staged normal VAE path behind explicit selection or safe auto
      selection
    - include Comfy parity and memory numbers
    - no tiled/TAESD substitution
 
-7. **CUDA implicit-GEMM VAE convolution optimization**
+10. **CUDA implicit-GEMM VAE convolution optimization**
    - backend-specific optimization with benchmark data
    - keep an escape hatch for direct-conv diagnostics
    - prove it does not alter output beyond expected float tolerance
 
-8. **GPU image handle output**
+11. **GPU image handle output**
    - start with VAE decode output only
    - keep final CPU download explicit
    - do not include sampler GPU bridge yet
 
-9. **GPU latent handles and sampled-latent bridge**
+12. **GPU latent handles and sampled-latent bridge**
    - only after upstream agrees on resource-handle shape
    - be honest that this is a CPU-materialized sampled latent upload
    - keep strict mode refusal so it cannot be marketed as zero-copy sampling
 
-10. **True GPU-resident sampler RFC**
+13. **True GPU-resident sampler RFC**
    - likely needs design discussion before code
    - requires changing denoiser callback/sampler math away from host
      `sd::Tensor<float>` materialization
