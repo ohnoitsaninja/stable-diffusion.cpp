@@ -276,6 +276,7 @@ preview_t sd_preview_mode            = PREVIEW_NONE;
 int sd_preview_interval              = 1;
 bool sd_preview_denoised             = true;
 bool sd_preview_noisy                = false;
+sd_preview_options_t sd_preview_options = {};
 
 std::u32string utf8_to_utf32(const std::string& utf8_str) {
     std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> converter;
@@ -461,12 +462,78 @@ void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
     sd_progress_cb_data = data;
 }
 void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode, int interval, bool denoised, bool noisy, void* data) {
+    sd_preview_options_t options;
+    sd_preview_options_init(&options);
+    options.mode          = mode;
+    options.step_interval = interval > 0 ? interval : 1;
+    options.denoised      = denoised;
+    options.noisy         = noisy;
+    sd_set_preview_callback_v2(cb, &options, data);
+}
+
+void sd_preview_options_init(sd_preview_options_t* options) {
+    if (options == nullptr) {
+        return;
+    }
+    *options                     = {};
+    options->struct_size         = sizeof(sd_preview_options_t);
+    options->version             = SD_PREVIEW_API_VERSION;
+    options->mode                = PREVIEW_NONE;
+    options->schedule_mode       = SD_PREVIEW_SCHEDULE_EVERY_N_STEPS;
+    options->step_interval       = 1;
+    options->percent_interval    = 0.0f;
+    options->percent_point_count = 0;
+    options->include_first_step  = false;
+    options->include_final_step  = true;
+    options->denoised            = true;
+    options->noisy               = false;
+}
+
+static sd_preview_options_t normalize_preview_options(const sd_preview_options_t* options) {
+    sd_preview_options_t normalized;
+    sd_preview_options_init(&normalized);
+    if (options != nullptr) {
+        normalized = *options;
+    }
+    normalized.struct_size = sizeof(sd_preview_options_t);
+    normalized.version     = SD_PREVIEW_API_VERSION;
+    if (normalized.mode < PREVIEW_NONE || normalized.mode >= PREVIEW_COUNT) {
+        normalized.mode = PREVIEW_NONE;
+    }
+    if (normalized.schedule_mode < SD_PREVIEW_SCHEDULE_EVERY_N_STEPS ||
+        normalized.schedule_mode > SD_PREVIEW_SCHEDULE_EXPLICIT_PERCENTS) {
+        normalized.schedule_mode = SD_PREVIEW_SCHEDULE_EVERY_N_STEPS;
+    }
+    if (normalized.step_interval <= 0) {
+        normalized.step_interval = 1;
+    }
+    if (normalized.percent_interval < 0.0f) {
+        normalized.percent_interval = 0.0f;
+    }
+    if (normalized.percent_interval > 1.0f) {
+        normalized.percent_interval = 1.0f;
+    }
+    if (normalized.percent_point_count > SD_PREVIEW_MAX_PERCENT_POINTS) {
+        normalized.percent_point_count = SD_PREVIEW_MAX_PERCENT_POINTS;
+    }
+    for (uint32_t i = 0; i < normalized.percent_point_count; ++i) {
+        if (normalized.percent_points[i] < 0.0f) {
+            normalized.percent_points[i] = 0.0f;
+        } else if (normalized.percent_points[i] > 1.0f) {
+            normalized.percent_points[i] = 1.0f;
+        }
+    }
+    return normalized;
+}
+
+void sd_set_preview_callback_v2(sd_preview_cb_t cb, const sd_preview_options_t* options, void* data) {
+    sd_preview_options = normalize_preview_options(options);
     sd_preview_cb       = cb;
     sd_preview_cb_data  = data;
-    sd_preview_mode     = mode;
-    sd_preview_interval = interval;
-    sd_preview_denoised = denoised;
-    sd_preview_noisy    = noisy;
+    sd_preview_mode     = sd_preview_options.mode;
+    sd_preview_interval = sd_preview_options.step_interval;
+    sd_preview_denoised = sd_preview_options.denoised;
+    sd_preview_noisy    = sd_preview_options.noisy;
 }
 
 sd_preview_cb_t sd_get_preview_callback() {
@@ -481,6 +548,17 @@ preview_t sd_get_preview_mode() {
 }
 int sd_get_preview_interval() {
     return sd_preview_interval;
+}
+sd_preview_options_t sd_get_preview_options() {
+    if (sd_preview_options.struct_size != sizeof(sd_preview_options_t) ||
+        sd_preview_options.version != SD_PREVIEW_API_VERSION) {
+        sd_preview_options_init(&sd_preview_options);
+        sd_preview_options.mode          = sd_preview_mode;
+        sd_preview_options.step_interval = sd_preview_interval > 0 ? sd_preview_interval : 1;
+        sd_preview_options.denoised      = sd_preview_denoised;
+        sd_preview_options.noisy         = sd_preview_noisy;
+    }
+    return sd_preview_options;
 }
 bool sd_should_preview_denoised() {
     return sd_preview_denoised;

@@ -1,4 +1,7 @@
 #include <cstdlib>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -12,6 +15,7 @@ struct Args {
     std::string model;
     std::string diffusion_model;
     std::string vae;
+    std::string taesd;
     std::string clip_l;
     std::string t5xxl;
     std::string llm;
@@ -45,6 +49,11 @@ struct Args {
     bool dump_gpu_handle_desc = false;
     bool expect_gpu_encode_refusal = false;
     bool expect_decode_refusal = false;
+    bool preview_tae = false;
+    int preview_every = 0;
+    float preview_percent_interval = 0.0f;
+    std::vector<float> preview_percents;
+    std::string preview_prefix;
 };
 
 static void usage(const char* argv0) {
@@ -53,6 +62,7 @@ static void usage(const char* argv0) {
         << "Options:\n"
         << "  --diffusion-model <path> split diffusion model path for Flux/Z/Wan style contexts\n"
         << "  --vae <path>             external VAE/AE path for split model contexts\n"
+        << "  --taesd <path>           TAESD path for sampling previews\n"
         << "  --clip-l <path>          CLIP-L text encoder path\n"
         << "  --t5xxl <path>           T5XXL text encoder path\n"
         << "  --llm <path>             LLM text encoder path\n"
@@ -84,6 +94,11 @@ static void usage(const char* argv0) {
         << "  --dump-gpu-handle-desc   print GPU handle descriptor after decode\n"
         << "  --expect-gpu-encode-refusal treat sd_encode_image_normal_gpu refusal as a passing smoke result\n"
         << "  --expect-decode-refusal  treat GPU decode refusal as a passing smoke result\n"
+        << "  --preview-tae            enable TAESD sampling previews\n"
+        << "  --preview-every <int>    emit preview every N denoise steps\n"
+        << "  --preview-percent-interval <float> emit preview at percentage increments, e.g. 0.25\n"
+        << "  --preview-percent <float> add an explicit preview percentage, repeatable\n"
+        << "  --preview-prefix <path>  preview output path prefix\n"
         << "  --no-decode              skip sd_decode_latent\n";
 }
 
@@ -110,6 +125,10 @@ static bool parse_args(int argc, char** argv, Args& args) {
             const char* value = need_value("--vae");
             if (value == nullptr) return false;
             args.vae = value;
+        } else if (arg == "--taesd") {
+            const char* value = need_value("--taesd");
+            if (value == nullptr) return false;
+            args.taesd = value;
         } else if (arg == "--clip-l") {
             const char* value = need_value("--clip-l");
             if (value == nullptr) return false;
@@ -205,6 +224,24 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.expect_gpu_encode_refusal = true;
         } else if (arg == "--expect-decode-refusal") {
             args.expect_decode_refusal = true;
+        } else if (arg == "--preview-tae") {
+            args.preview_tae = true;
+        } else if (arg == "--preview-every") {
+            const char* value = need_value("--preview-every");
+            if (value == nullptr) return false;
+            args.preview_every = std::atoi(value);
+        } else if (arg == "--preview-percent-interval") {
+            const char* value = need_value("--preview-percent-interval");
+            if (value == nullptr) return false;
+            args.preview_percent_interval = static_cast<float>(std::atof(value));
+        } else if (arg == "--preview-percent") {
+            const char* value = need_value("--preview-percent");
+            if (value == nullptr) return false;
+            args.preview_percents.push_back(static_cast<float>(std::atof(value)));
+        } else if (arg == "--preview-prefix") {
+            const char* value = need_value("--preview-prefix");
+            if (value == nullptr) return false;
+            args.preview_prefix = value;
         } else if (arg == "--no-decode") {
             args.decode = false;
         } else {
@@ -237,12 +274,14 @@ static sd_ctx_t* create_context(const Args& args, bool vae_decode_only) {
     ctx_params.model_path            = args.model.empty() ? nullptr : args.model.c_str();
     ctx_params.diffusion_model_path  = args.diffusion_model.empty() ? nullptr : args.diffusion_model.c_str();
     ctx_params.vae_path              = args.vae.empty() ? nullptr : args.vae.c_str();
+    ctx_params.taesd_path            = args.taesd.empty() ? nullptr : args.taesd.c_str();
     ctx_params.clip_l_path           = args.clip_l.empty() ? nullptr : args.clip_l.c_str();
     ctx_params.t5xxl_path            = args.t5xxl.empty() ? nullptr : args.t5xxl.c_str();
     ctx_params.llm_path              = args.llm.empty() ? nullptr : args.llm.c_str();
     ctx_params.vae_decode_only       = vae_decode_only;
     ctx_params.diffusion_flash_attn  = true;
     ctx_params.vae_conv_direct       = args.vae_conv_direct;
+    ctx_params.tae_preview_only      = args.preview_tae && !args.taesd.empty();
     ctx_params.wtype                 = args.type_f16 ? SD_TYPE_F16 : SD_TYPE_COUNT;
     ctx_params.offload_params_to_cpu = false;
     ctx_params.keep_clip_on_cpu      = false;
@@ -367,6 +406,36 @@ static void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
     log_print(level, log, true, false);
 }
 
+struct PreviewCapture {
+    std::string prefix;
+    int count = 0;
+};
+
+static void preview_cb(int step, int frame_count, sd_image_t* frames, bool is_noisy, void* data) {
+    PreviewCapture* capture = static_cast<PreviewCapture*>(data);
+    if (capture == nullptr || frames == nullptr || frame_count <= 0) {
+        return;
+    }
+    capture->count++;
+    std::cout << "preview_event step=" << step
+              << " frames=" << frame_count
+              << " noisy=" << (is_noisy ? "true" : "false")
+              << " count=" << capture->count << "\n";
+    if (capture->prefix.empty()) {
+        return;
+    }
+    for (int i = 0; i < frame_count; ++i) {
+        std::string path = capture->prefix + "_step" + std::to_string(std::abs(step)) +
+                           (is_noisy ? "_noisy" : "_denoised") +
+                           "_frame" + std::to_string(i) + ".png";
+        if (!write_image_to_file(path, frames[i].data, frames[i].width, frames[i].height, frames[i].channel)) {
+            std::cerr << "failed to write preview: " << path << "\n";
+        } else {
+            std::cout << "preview_wrote " << path << "\n";
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     Args args;
     if (!parse_args(argc, argv, args)) {
@@ -380,6 +449,34 @@ int main(int argc, char** argv) {
         set_env_value("SDCPP_STRICT_GPU_RESIDENT", "1");
     }
     sd_set_log_callback(sd_log_cb, nullptr);
+
+    PreviewCapture preview_capture;
+    if (args.preview_tae) {
+        if (args.taesd.empty()) {
+            std::cerr << "--preview-tae requires --taesd\n";
+            return 2;
+        }
+        preview_capture.prefix = args.preview_prefix;
+        sd_preview_options_t preview_options;
+        sd_preview_options_init(&preview_options);
+        preview_options.mode = PREVIEW_TAE;
+        preview_options.denoised = true;
+        preview_options.noisy = false;
+        if (args.preview_percent_interval > 0.0f) {
+            preview_options.schedule_mode = SD_PREVIEW_SCHEDULE_PERCENT_INTERVAL;
+            preview_options.percent_interval = args.preview_percent_interval;
+        } else if (!args.preview_percents.empty()) {
+            preview_options.schedule_mode = SD_PREVIEW_SCHEDULE_EXPLICIT_PERCENTS;
+            preview_options.percent_point_count = static_cast<uint32_t>(std::min<size_t>(args.preview_percents.size(), SD_PREVIEW_MAX_PERCENT_POINTS));
+            for (uint32_t i = 0; i < preview_options.percent_point_count; ++i) {
+                preview_options.percent_points[i] = args.preview_percents[i];
+            }
+        } else {
+            preview_options.schedule_mode = SD_PREVIEW_SCHEDULE_EVERY_N_STEPS;
+            preview_options.step_interval = args.preview_every > 0 ? args.preview_every : 1;
+        }
+        sd_set_preview_callback_v2(preview_cb, &preview_options, &preview_capture);
+    }
 
     sd_ctx_t* ctx = create_context(args, false);
     if (ctx == nullptr) {
@@ -770,6 +867,13 @@ int main(int argc, char** argv) {
             free_sd_image(output);
         }
         if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+    }
+
+    if (args.preview_tae) {
+        std::cout << "preview_count=" << preview_capture.count << "\n";
+        sd_preview_options_t disabled;
+        sd_preview_options_init(&disabled);
+        sd_set_preview_callback_v2(nullptr, &disabled, nullptr);
     }
 
     if (latent_to_decode != encoded) {

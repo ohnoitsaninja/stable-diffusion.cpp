@@ -22,6 +22,8 @@
 #include "latent-preview.h"
 #include "name_conversion.h"
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
 #include <new>
 #include <unordered_map>
@@ -1584,13 +1586,109 @@ public:
     struct SamplePreviewContext {
         sd_preview_cb_t callback = nullptr;
         void* data               = nullptr;
-        preview_t mode           = PREVIEW_NONE;
+        sd_preview_options_t options = {};
+        int last_denoised_step       = -1;
+        int last_noisy_step          = -1;
     };
 
     SamplePreviewContext prepare_sample_preview_context() {
-        return SamplePreviewContext{sd_get_preview_callback(),
-                                    sd_get_preview_callback_data(),
-                                    sd_get_preview_mode()};
+        SamplePreviewContext preview;
+        preview.callback = sd_get_preview_callback();
+        preview.data     = sd_get_preview_callback_data();
+        preview.options  = sd_get_preview_options();
+        if (preview.options.struct_size != sizeof(sd_preview_options_t) ||
+            preview.options.version != SD_PREVIEW_API_VERSION) {
+            sd_preview_options_init(&preview.options);
+            preview.options.mode          = sd_get_preview_mode();
+            preview.options.step_interval = sd_get_preview_interval();
+            preview.options.denoised      = sd_should_preview_denoised();
+            preview.options.noisy         = sd_should_preview_noisy();
+        }
+        if (preview.options.step_interval <= 0) {
+            preview.options.step_interval = 1;
+        }
+        if (preview.options.percent_point_count > SD_PREVIEW_MAX_PERCENT_POINTS) {
+            preview.options.percent_point_count = SD_PREVIEW_MAX_PERCENT_POINTS;
+        }
+        return preview;
+    }
+
+    static int preview_percent_to_step(float percent, int total_steps) {
+        if (total_steps <= 0) {
+            return 0;
+        }
+        percent = std::max(0.0f, std::min(1.0f, percent));
+        int step = static_cast<int>(std::ceil(percent * static_cast<float>(total_steps)));
+        return std::max(1, std::min(total_steps, step));
+    }
+
+    static bool preview_step_matches_schedule(const sd_preview_options_t& options,
+                                              int step,
+                                              int total_steps) {
+        if (step <= 0 || total_steps <= 0) {
+            return false;
+        }
+        if (options.include_first_step && step == 1) {
+            return true;
+        }
+        if (options.include_final_step && step == total_steps) {
+            return true;
+        }
+
+        switch (options.schedule_mode) {
+            case SD_PREVIEW_SCHEDULE_PERCENT_INTERVAL: {
+                if (options.percent_interval <= 0.0f) {
+                    return true;
+                }
+                float marker = options.percent_interval;
+                while (marker <= 1.0f + 1e-6f) {
+                    if (step == preview_percent_to_step(marker, total_steps)) {
+                        return true;
+                    }
+                    marker += options.percent_interval;
+                }
+                return false;
+            }
+            case SD_PREVIEW_SCHEDULE_EXPLICIT_PERCENTS:
+                for (uint32_t i = 0; i < options.percent_point_count; ++i) {
+                    if (step == preview_percent_to_step(options.percent_points[i], total_steps)) {
+                        return true;
+                    }
+                }
+                return false;
+            case SD_PREVIEW_SCHEDULE_EVERY_N_STEPS:
+            default:
+                return options.step_interval <= 1 || (step % options.step_interval) == 0;
+        }
+    }
+
+    static bool should_emit_preview(SamplePreviewContext* preview,
+                                    int step,
+                                    size_t total_steps,
+                                    bool is_noisy) {
+        if (preview == nullptr || preview->callback == nullptr || preview->options.mode == PREVIEW_NONE) {
+            return false;
+        }
+        if (is_noisy && !preview->options.noisy) {
+            return false;
+        }
+        if (!is_noisy && !preview->options.denoised) {
+            return false;
+        }
+        int logical_step = std::abs(step);
+        if (logical_step <= 0) {
+            return false;
+        }
+        int total = static_cast<int>(total_steps);
+        if (!preview_step_matches_schedule(preview->options, logical_step, total)) {
+            return false;
+        }
+        int& last_step = is_noisy ? preview->last_noisy_step : preview->last_denoised_step;
+        if (last_step == logical_step) {
+            return false;
+        }
+        last_step = logical_step;
+        return true;
     }
 
     void report_sample_progress(int step, size_t total_steps, int64_t t0) {
@@ -1741,15 +1839,15 @@ public:
                 if (!denoise_mask.empty()) {
                     denoised = denoised * denoise_mask + init_latent * (1.0f - denoise_mask);
                 }
-                if (sd_should_preview_denoised() && preview.callback != nullptr) {
-                    preview_image(step, denoised, version, preview.mode, preview.callback, preview.data, false);
+                if (should_emit_preview(&preview, step, steps, false)) {
+                    preview_image(step, denoised, version, preview.options.mode, preview.callback, preview.data, false);
                 }
                 report_sample_progress(step, steps, t0);
                 return denoised;
             }
 
-            if (sd_should_preview_noisy() && preview.callback != nullptr) {
-                preview_image(step, noised_input, version, preview.mode, preview.callback, preview.data, true);
+            if (should_emit_preview(&preview, step, steps, true)) {
+                preview_image(step, noised_input, version, preview.options.mode, preview.callback, preview.data, true);
             }
 
             sd::Tensor<float> cond_out;
@@ -1901,8 +1999,8 @@ public:
             if (!denoise_mask.empty()) {
                 denoised = denoised * denoise_mask + init_latent * (1.0f - denoise_mask);
             }
-            if (sd_should_preview_denoised() && preview.callback != nullptr) {
-                preview_image(step, denoised, version, preview.mode, preview.callback, preview.data, false);
+            if (should_emit_preview(&preview, step, steps, false)) {
+                preview_image(step, denoised, version, preview.options.mode, preview.callback, preview.data, false);
             }
             if (trace_controlnet) {
                 LOG_INFO("[Denoise] step=%d total=%" PRId64 "ms", step, ggml_time_ms() - step_start_ms);

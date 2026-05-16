@@ -155,6 +155,33 @@ enum preview_t {
     PREVIEW_COUNT
 };
 
+enum sd_preview_schedule_mode_t {
+    SD_PREVIEW_SCHEDULE_EVERY_N_STEPS = 0,
+    SD_PREVIEW_SCHEDULE_PERCENT_INTERVAL = 1,
+    SD_PREVIEW_SCHEDULE_EXPLICIT_PERCENTS = 2,
+};
+
+enum {
+    SD_PREVIEW_API_VERSION = 1,
+    SD_PREVIEW_MAX_PERCENT_POINTS = 16,
+};
+
+typedef struct sd_preview_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    enum preview_t mode;
+    enum sd_preview_schedule_mode_t schedule_mode;
+    int step_interval;
+    float percent_interval;
+    float percent_points[SD_PREVIEW_MAX_PERCENT_POINTS];
+    uint32_t percent_point_count;
+    bool include_first_step;
+    bool include_final_step;
+    bool denoised;
+    bool noisy;
+    uint32_t reserved[8];
+} sd_preview_options_t;
+
 enum lora_apply_mode_t {
     LORA_APPLY_AUTO,
     LORA_APPLY_IMMEDIATELY,
@@ -615,6 +642,8 @@ typedef void (*sd_preview_cb_t)(int step, int frame_count, sd_image_t* frames, b
 SD_API void sd_set_log_callback(sd_log_cb_t sd_log_cb, void* data);
 SD_API void sd_set_progress_callback(sd_progress_cb_t cb, void* data);
 SD_API void sd_set_preview_callback(sd_preview_cb_t cb, enum preview_t mode, int interval, bool denoised, bool noisy, void* data);
+SD_API void sd_preview_options_init(sd_preview_options_t* options);
+SD_API void sd_set_preview_callback_v2(sd_preview_cb_t cb, const sd_preview_options_t* options, void* data);
 SD_API int32_t sd_get_num_physical_cores();
 SD_API const char* sd_get_system_info();
 
