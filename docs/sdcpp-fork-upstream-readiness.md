@@ -287,15 +287,14 @@ back into a GPU image handle. The report marks this with `host_copies=1`,
 `device_copies=1`, and bridge flags. `SDCPP_STRICT_GPU_RESIDENT=1` refuses this
 path.
 
-VAE Encode GPU latent handoff is supported as a compatibility bridge for
-families where public normal VAE encode is enabled. `sd_encode_image_normal_gpu`
-returns an owned CUDA latent handle, but the encode path still materializes the
-latent as a host `sd::Tensor<float>` before uploading it. Handles marked
-`SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT` decode through a cached VAE
-decode-only context because the earlier same-context decode route hit CUDA
-illegal memory access in testing. The bridge is safe for Paralol's node contract
-and reports `host_copies=1` / `device_copies=1`, but strict GPU-resident mode
-refuses it because it is not zero-copy.
+VAE Encode GPU latent handoff is true GPU-resident for COMFY_NORMAL
+AutoencoderKL families. `sd_encode_image_normal_gpu` returns an owned CUDA
+latent handle marked `SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT` without
+`CPU_BRIDGE_UPLOAD`, and the encode report shows `host_copies=0`. Handles marked
+`SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT` decode through a cached VAE decode-only
+context because the earlier same-context decode route hit CUDA illegal memory
+access in testing. The handoff uses device-to-device latent and image copies
+around that isolated decode context, so strict GPU-resident mode allows it.
 
 Current upstream-readiness issue: this API is the most likely to need redesign
 before upstreaming. Upstream may prefer a different abstraction such as a
@@ -308,8 +307,8 @@ The current DLL refuses several paths on purpose:
 
 - strict mode refuses `sd_sample_latent_gpu` because sampler internals are not
   true GPU-resident
-- strict mode refuses VAE Encode GPU latent output because it is a bridge-upload
-  path, not true GPU-resident encode
+- strict mode allows true COMFY_NORMAL VAE Encode GPU latent output and refuses
+  bridge-only VAE Encode paths
 - strict mode refuses Anima's compatibility bridge because it contains an
   explicit latent download and decoded-image upload
 - Anima modular VAE Encode is enabled only as a compatibility bridge. It uses
@@ -319,9 +318,9 @@ The current DLL refuses several paths on purpose:
 
 This came from testing that found an unsafe same-context VAE-encoded latent GPU
 decode path. The current behavior is conservative: T2I sampled-latent handoff
-works, I2I VAE Encode GPU handoff works through a clearly reported bridge, and
-strict mode refuses both fake-resident sampler output and bridge-uploaded VAE
-Encode output.
+works, I2I VAE Encode GPU handoff is true-resident for COMFY_NORMAL
+AutoencoderKL families through a D2D isolated decode context, and strict mode
+still refuses fake-resident sampler output plus bridge-only VAE paths.
 
 Current upstream-readiness issue: these refusals are good engineering behavior,
 but they are also evidence that the GPU API is not mature enough to upstream as a
@@ -354,7 +353,9 @@ The current fork should not be submitted as-is because:
 - it includes names and docs that are explicitly Paralol-specific
 - GPU handles are same-process only and not yet a complete interop story
 - the sampler GPU path is a bridge upload, not true GPU-resident sampling
-- VAE Encode GPU handoff is a bridge, not true GPU-resident encode
+- VAE Encode GPU handoff still relies on an isolated decode context for
+  stability, even though the COMFY_NORMAL AutoencoderKL data path is now
+  GPU-resident
 - strict modes and environment flags are useful for development but need a
   cleaner upstream configuration story
 - the VAE path, GPU handle registry, and public API are concentrated in

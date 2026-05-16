@@ -3,6 +3,8 @@
 
 #include "vae.hpp"
 
+#include <limits>
+
 /*================================================== AutoEncoderKL ===================================================*/
 
 #define VAE_GRAPH_SIZE 20480
@@ -802,8 +804,12 @@ struct AutoEncoderKL : public VAE {
     bool decode_only   = true;
     bool comfy_normal_enabled = false;
     float diffusion_to_vae_shift_input = 0.f;
+    float vae_to_diffusion_shift_input = 0.f;
     std::vector<float> diffusion_to_vae_flux2_mean_input;
     std::vector<float> diffusion_to_vae_flux2_std_scaled_input;
+    std::vector<float> vae_to_diffusion_flux2_mean_input;
+    std::vector<float> vae_to_diffusion_flux2_inv_std_scaled_input;
+    std::vector<float> vae_encode_noise_input;
     AutoEncoderKLModel ae;
 
     AutoEncoderKL(ggml_backend_t backend,
@@ -918,6 +924,20 @@ struct AutoEncoderKL : public VAE {
         }
     }
 
+    void prepare_flux2_vae_to_diffusion_inputs() {
+        if (vae_to_diffusion_flux2_mean_input.size() == 128 &&
+            vae_to_diffusion_flux2_inv_std_scaled_input.size() == 128) {
+            return;
+        }
+        sd::Tensor<float> dummy({1, 1, 128, 1});
+        auto [mean_tensor, std_tensor] = get_latents_mean_std(dummy, 2);
+        vae_to_diffusion_flux2_mean_input.assign(mean_tensor.data(), mean_tensor.data() + mean_tensor.numel());
+        vae_to_diffusion_flux2_inv_std_scaled_input.resize(static_cast<size_t>(std_tensor.numel()));
+        for (int64_t i = 0; i < std_tensor.numel(); ++i) {
+            vae_to_diffusion_flux2_inv_std_scaled_input[static_cast<size_t>(i)] = scale_factor / std_tensor[i];
+        }
+    }
+
     ggml_cgraph* build_diffusion_to_vae_latent_graph(ggml_tensor* z) {
         ggml_cgraph* gf = ggml_new_graph(compute_ctx);
 
@@ -942,6 +962,79 @@ struct AutoEncoderKL : public VAE {
                 out = ggml_add1(compute_ctx, out, shift);
             }
         }
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    bool prepare_vae_encode_noise_input(ggml_tensor* vae_output, std::shared_ptr<RNG> rng) {
+        vae_encode_noise_input.clear();
+        if (vae_output == nullptr || rng == nullptr) {
+            return false;
+        }
+        if (sd_version_is_flux2(version) || version == VERSION_SD1_PIX2PIX) {
+            return true;
+        }
+        if (vae_output->ne[2] <= 0 || (vae_output->ne[2] % 2) != 0) {
+            LOG_ERROR("VAE encode GPU latent transform expected even moments channels, got %" PRId64, vae_output->ne[2]);
+            return false;
+        }
+        const int64_t numel = vae_output->ne[0] * vae_output->ne[1] * (vae_output->ne[2] / 2) * vae_output->ne[3];
+        if (numel <= 0 || numel > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            LOG_ERROR("VAE encode GPU latent transform invalid noise size: %" PRId64, numel);
+            return false;
+        }
+        vae_encode_noise_input = rng->randn(static_cast<uint32_t>(numel));
+        return static_cast<int64_t>(vae_encode_noise_input.size()) == numel;
+    }
+
+    ggml_cgraph* build_vae_output_to_diffusion_latent_graph(ggml_tensor* z) {
+        ggml_cgraph* gf = ggml_new_graph(compute_ctx);
+
+        ggml_tensor* out = nullptr;
+        if (sd_version_is_flux2(version)) {
+            prepare_flux2_vae_to_diffusion_inputs();
+
+            ggml_tensor* mean_base = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 128, 1);
+            set_backend_tensor_data(mean_base, vae_to_diffusion_flux2_mean_input.data());
+            ggml_tensor* mean = ggml_repeat(compute_ctx, mean_base, z);
+
+            ggml_tensor* inv_std_scaled_base = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 128, 1);
+            set_backend_tensor_data(inv_std_scaled_base, vae_to_diffusion_flux2_inv_std_scaled_input.data());
+            ggml_tensor* inv_std_scaled = ggml_repeat(compute_ctx, inv_std_scaled_base, z);
+
+            out = ggml_mul(compute_ctx, ggml_sub(compute_ctx, z, mean), inv_std_scaled);
+        } else {
+            ggml_tensor* latent = nullptr;
+            if (version == VERSION_SD1_PIX2PIX) {
+                latent = ggml_ext_chunk(compute_ctx, z, 2, 2)[0];
+            } else {
+                auto chunks = ggml_ext_chunk(compute_ctx, z, 2, 2);
+                ggml_tensor* mean = chunks[0];
+                ggml_tensor* logvar = ggml_clamp(compute_ctx, chunks[1], -30.0f, 20.0f);
+                ggml_tensor* stddev = ggml_exp(compute_ctx, ggml_scale(compute_ctx, logvar, 0.5f));
+
+                ggml_tensor* noise = ggml_new_tensor_4d(compute_ctx,
+                                                        GGML_TYPE_F32,
+                                                        mean->ne[0],
+                                                        mean->ne[1],
+                                                        mean->ne[2],
+                                                        mean->ne[3]);
+                set_backend_tensor_data(noise, vae_encode_noise_input.data());
+                latent = ggml_add(compute_ctx, mean, ggml_mul(compute_ctx, stddev, noise));
+            }
+
+            out = latent;
+            if (version != VERSION_SD1_PIX2PIX) {
+                if (shift_factor != 0.0f) {
+                    vae_to_diffusion_shift_input = -shift_factor;
+                    ggml_tensor* shift = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_F32, 1);
+                    set_backend_tensor_data(shift, &vae_to_diffusion_shift_input);
+                    out = ggml_add1(compute_ctx, out, shift);
+                }
+                out = ggml_scale(compute_ctx, out, scale_factor);
+            }
+        }
+
         ggml_build_forward_expand(gf, out);
         return gf;
     }
@@ -1161,6 +1254,61 @@ struct AutoEncoderKL : public VAE {
         int64_t t1 = ggml_time_ms();
         LOG_DEBUG("computing vae decode GPU output graph completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
         return output;
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> encode_to_backend_resource(int n_threads,
+                                                                          const sd::Tensor<float>& x,
+                                                                          sd_tiling_params_t tiling_params,
+                                                                          std::shared_ptr<RNG> rng,
+                                                                          bool circular_x = false,
+                                                                          bool circular_y = false) override {
+        SD_UNUSED(circular_x);
+        SD_UNUSED(circular_y);
+        if (!comfy_normal_enabled || tiling_params.enabled || decode_only) {
+            return nullptr;
+        }
+        int64_t t0 = ggml_time_ms();
+        auto vae_output = _compute_staged_resource(n_threads, x, false);
+        sd_vae_memory_report_t aggregate = get_last_graph_report();
+        if (vae_output == nullptr || vae_output->empty()) {
+            LOG_ERROR("vae encode GPU output compute failed");
+            return nullptr;
+        }
+        if (!prepare_vae_encode_noise_input(vae_output->tensor, rng)) {
+            return nullptr;
+        }
+
+        auto diffusion_latent = compute_to_backend_resource_handle(
+            [&]() -> ggml_cgraph* {
+                return build_vae_output_to_diffusion_latent_graph(vae_output->tensor);
+            },
+            n_threads,
+            "vae_encode_diffusion_latent_gpu");
+        sd_vae_memory_report_t transform_report = get_last_graph_report();
+        const int transform_stage = static_cast<int>(aggregate.stage_count);
+        merge_stage_report(&aggregate, transform_report);
+        if (diffusion_latent == nullptr || diffusion_latent->empty()) {
+            LOG_ERROR("VAE encode GPU latent transform failed");
+            return nullptr;
+        }
+        BackendTensorHandle final_view;
+        final_view.tensor = diffusion_latent->tensor;
+        final_view.buffer = diffusion_latent->buffer;
+        record_stage_output(&aggregate, transform_stage, &final_view, true);
+        final_view.tensor = nullptr;
+        final_view.buffer = nullptr;
+        aggregate.device_resident_stages = aggregate.stage_boundary_host_copies == 0 &&
+                                           diffusion_latent->buffer != nullptr &&
+                                           !ggml_backend_buffer_is_host(diffusion_latent->buffer);
+        LOG_INFO("[VAE] COMFY_NORMAL encode latent handoff: device_resident=%s host_copies=%u device_copies=%u dtype_promotions=%u",
+                 aggregate.device_resident_stages ? "true" : "false",
+                 aggregate.stage_boundary_host_copies,
+                 aggregate.stage_boundary_device_copies,
+                 aggregate.stage_boundary_dtype_promotions);
+        last_graph_report = aggregate;
+        int64_t t1 = ggml_time_ms();
+        LOG_DEBUG("computing VAE encode GPU latent completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+        return diffusion_latent;
     }
 
     std::unique_ptr<GgmlBackendTensorResource> decode_latent_resource_to_backend_resource(int n_threads,

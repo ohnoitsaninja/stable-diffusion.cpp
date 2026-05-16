@@ -76,43 +76,46 @@ if the source latent came from `sd_sample_latent(...)`, it also carries
 
 ## VAE-encoded latent handoff
 
-VAE Encode GPU latent handoff is supported as a safe compatibility bridge:
+For COMFY_NORMAL model families that use the AutoencoderKL path, VAE Encode GPU
+latent handoff is now true GPU-resident:
 
 - `supports_vae_encode_gpu_latent_output=true`
-- `supports_vae_encode_gpu_latent_bridge_output=true`
 - `sd_encode_image_normal_gpu(...)` returns an `SD_GPU_RESOURCE_LATENT` handle
-  marked with `SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT |
-  SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD`.
+  marked with `SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT`.
+- The handle is not marked `SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD`.
+- The encode report must show `host_copies=0` and `device_resident=true`.
+- `SDCPP_STRICT_GPU_RESIDENT=1` allows this path.
 
-This is not yet true all-GPU VAE Encode. The current AutoencoderKL encode path
-still materializes the encoded latent in host `sd::Tensor<float>` form for
-Gaussian latent sampling/scaling, then uploads that latent into an owned CUDA
-handle. `SDCPP_STRICT_GPU_RESIDENT=1` refuses this API so callers cannot mistake
-the bridge for a zero-copy GPU encode path.
+The VAE encoder output and latent sampling/scaling remain on CUDA. The only CPU
+input is the source image bytes passed into the public CPU-image API. The
+resulting diffusion latent is an owned backend buffer, not a transient graph
+tensor.
 
 The earlier same-context decode path for VAE-encoded handles was unsafe: it
 could trip a CUDA illegal memory access inside the implicit-GEMM VAE decode
-convolution. The fixed path keeps the public GPU handle contract while avoiding
-that unsafe route:
+convolution after a VAE encode on the same VAE object. The fixed path keeps the
+latent resident while avoiding that unsafe route:
 
 1. `sd_decode_gpu_latent_normal_gpu(...)` detects
    `SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT`.
-2. It downloads the encoded latent into host memory.
-3. It decodes through a cached VAE decode-only context, which is the split
-   context path already proven stable by the SDXL smokes.
-4. It uploads the decoded RGB tensor into the caller's original `sd_ctx_t` and
-   returns an `SD_GPU_RESOURCE_IMAGE` handle.
+2. It copies the CUDA latent device-to-device into a cached VAE decode-only
+   context.
+3. It decodes there using COMFY_NORMAL.
+4. It copies the decoded RGB tensor device-to-device back into the caller's
+   context and returns an `SD_GPU_RESOURCE_IMAGE` handle.
 
 The VAE report marks this honestly:
 
-- `device_resident_stages=false`
-- `host_copies=1`
-- `device_copies=1`
-- `fallback_reason` explains the encoded-latent bridge
+- `device_resident_stages=true`
+- `host_copies=0`
+- `device_copies` includes the two extra D2D context handoff copies
+- `fallback_reason` explains the isolated VAE decode context
 
-The resulting handle is safe for Paralol's node contract, but the bridge is
-still a compatibility lane. A future true-resident implementation would need
-GPU-side VAE encode latent sampling/scaling plus a same-context decode fix.
+This is an all-GPU handoff across the VAE Encode -> Latent Decode boundary. It
+does use an isolated decode context because the same-context VAE reuse path is
+currently unsafe, but it does not download or upload the latent through CPU
+memory.
+
 Anima uses the Wan/Qwen bridge instead of the SDXL cached decode-only bridge;
 the decode report should say
 `fallback_reason="Anima uses the Wan/Qwen VAE bridge: GPU latent is downloaded for legacy decode and decoded image is re-uploaded"`.
@@ -170,10 +173,11 @@ For the next Paralol worker integration:
   `sd_gpu_image_download`, or preferably `sd_gpu_image_download_to_buffer` when
   they already own the output buffer.
 - VAE Encode can request `sd_encode_image_normal_gpu` for model families that
-  report `supports_vae_encode_gpu_latent_output=true`. Treat
-  `supports_vae_encode_gpu_latent_bridge_output=true` as a sign that the handle
-  is safe but bridge-uploaded, not true zero-copy. Anima reports this bridge as
-  supported, but the Wan/Qwen VAE path uses large IM2COL workspaces at 1024.
+  report `supports_vae_encode_gpu_latent_output=true`. If the returned handle
+  lacks `CPU_BRIDGE_UPLOAD`, it is a true CUDA latent handoff and can be used in
+  strict mode. Treat `supports_vae_encode_gpu_latent_bridge_output=true` as a
+  compatibility signal only for model families such as Anima, where the handle
+  is safe but bridge-uploaded, not true resident.
 
 ## Supported handoff paths
 
@@ -193,12 +197,16 @@ Supported now:
   `sd_decode_gpu_latent_normal_gpu -> SD_GPU_RESOURCE_IMAGE -> sd_gpu_image_download_to_buffer`
 - VAE Encode bridge:
   `sd_encode_image_normal_gpu -> SD_GPU_RESOURCE_LATENT -> sd_decode_gpu_latent_normal_gpu -> SD_GPU_RESOURCE_IMAGE`
+  for Anima/Wan-Qwen compatibility only
+- VAE Encode true GPU handoff:
+  `sd_encode_image_normal_gpu -> CUDA latent handle -> D2D isolated COMFY_NORMAL decode -> CUDA image handle`
 
 Refused now:
 
 - Strict sampler GPU output:
   `SDCPP_STRICT_GPU_RESIDENT=1 sd_sample_latent_gpu`
-- Strict VAE Encode GPU output:
-  `SDCPP_STRICT_GPU_RESIDENT=1 sd_encode_image_normal_gpu`
+- Strict VAE Encode compatibility bridge output:
+  `SDCPP_STRICT_GPU_RESIDENT=1 sd_encode_image_normal_gpu` for bridge-only
+  model families such as Anima
 
 The real all-GPU KSampler project is a separate sampler backend refactor: the denoiser callback and sampler math need backend tensor/resource variants instead of `sd::Tensor<float>` host values.

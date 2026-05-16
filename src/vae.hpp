@@ -235,6 +235,21 @@ public:
         return nullptr;
     }
 
+    virtual std::unique_ptr<GgmlBackendTensorResource> encode_to_backend_resource(int n_threads,
+                                                                                  const sd::Tensor<float>& x,
+                                                                                  sd_tiling_params_t tiling_params,
+                                                                                  std::shared_ptr<RNG> rng,
+                                                                                  bool circular_x = false,
+                                                                                  bool circular_y = false) {
+        SD_UNUSED(n_threads);
+        SD_UNUSED(x);
+        SD_UNUSED(tiling_params);
+        SD_UNUSED(rng);
+        SD_UNUSED(circular_x);
+        SD_UNUSED(circular_y);
+        return nullptr;
+    }
+
     virtual std::unique_ptr<GgmlBackendTensorResource> decode_latent_resource_to_backend_resource(int n_threads,
                                                                                                   const GgmlBackendTensorResource* x,
                                                                                                   sd_tiling_params_t tiling_params,

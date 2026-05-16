@@ -136,10 +136,12 @@ Validate:
 - `sd_decode_gpu_latent_normal_gpu` consumes supported CUDA latent handles
 - GPU image output can be downloaded with `sd_gpu_image_download_to_buffer`
 - DLL-owned downloads are releasable with `sd_free_downloaded_image`
-- VAE-encoded GPU latent handoff works in non-strict mode through the safe
-  decode-only bridge and reports the bridge honestly
-- `SDCPP_STRICT_GPU_RESIDENT=1` refuses VAE Encode GPU output because the encode
-  path still materializes and uploads a CPU latent
+- VAE-encoded GPU latent handoff works in strict mode for COMFY_NORMAL
+  AutoencoderKL families: `sd_encode_image_normal_gpu` returns a CUDA latent
+  without `CPU_BRIDGE_UPLOAD`, and `sd_decode_gpu_latent_normal_gpu` decodes it
+  through the isolated VAE-only context with D2D handoff and `host_copies=0`
+- `SDCPP_STRICT_GPU_RESIDENT=1` still refuses bridge-only VAE Encode output for
+  model families that materialize/upload CPU latents
 
 ### Flux2 and Z-Image
 
@@ -268,9 +270,9 @@ candidate branches.
   GPU handle registry, VAE normal execution, and capability reporting should be
   split into focused files before upstream review.
 - `sd_sample_latent_gpu` is a bridge upload, not a true GPU-native sampler.
-- VAE Encode GPU latent handoff is a safe bridge, not true resident. It avoids
-  the unsafe same-context decode path by downloading the encoded latent and
-  decoding in a cached VAE decode-only context.
+- VAE Encode GPU latent handoff is true resident for COMFY_NORMAL AutoencoderKL
+  families, but still needs an isolated VAE-only decode context because
+  same-context encode->resource-decode can trip CUDA in the current graph path.
 - Anima VAE decode uses a Wan/Qwen compatibility bridge with host/device copies.
 - Capability structs are useful but should be reviewed for minimal stable
   upstream API shape.
