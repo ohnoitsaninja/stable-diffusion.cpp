@@ -1,0 +1,855 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ohnoitsaninja <ohnoitsaninja@users.noreply.github.com>
+Date: Sun, 17 May 2026 17:41:48 -0400
+Subject: [PATCH 6/6] Add experimental BF16 CUDA VAE op support
+
+Extends CUDA BF16 coverage for the VAE compact-activation path, including scale/add/unary/pad/groupnorm/nearest-upscale and BF16 graph I/O through implicit-GEMM conv. Keeps conv internal math on the existing f16/f32 path and leaves production behavior gated by the parent stable-diffusion.cpp VAE flags.
+
+diff --git a/src/ggml-cuda/binbcast.cu b/src/ggml-cuda/binbcast.cu
+index 7339fe0c..ca66fba7 100644
+--- a/src/ggml-cuda/binbcast.cu
++++ b/src/ggml-cuda/binbcast.cu
+@@ -1,4 +1,5 @@
+ #include "binbcast.cuh"
++#include "convert.cuh"
+ #include <cstdint>
+ #include <utility>
+ 
+@@ -75,14 +76,14 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
+     for (int i0 = i0s; i0 < ne0; i0 += blockDim.x * gridDim.x) {
+         const uint32_t i10 = fastmodulo(i0, ne10);
+ 
+-        float result = src0_row ? (float) src0_row[i0*s00] : 0.0f;
++        float result = src0_row ? ggml_cuda_cast<float>(src0_row[i0*s00]) : 0.0f;
+         if constexpr (sizeof...(src1_ptrs) > 0) {
+-            result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10*s10])));
++            result = (..., (result = bin_op(result, ggml_cuda_cast<float>(src1s[i_src1 + i10*s10]))));
+         } else {
+-            result = bin_op(result, (float)src1[i_src1 + i10*s10]);
++            result = bin_op(result, ggml_cuda_cast<float>(src1[i_src1 + i10*s10]));
+         }
+ 
+-        dst_row[i0] = (dst_t) result;
++        dst_row[i0] = ggml_cuda_cast<dst_t>(result);
+     }
+ }
+ 
+@@ -141,14 +142,14 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
+ 
+     const int i10 = fastmodulo(i0, ne10);
+ 
+-    float result = src0_row ? (float) src0_row[i0*s00] : 0.0f;
++    float result = src0_row ? ggml_cuda_cast<float>(src0_row[i0*s00]) : 0.0f;
+     if constexpr (sizeof...(src1_ptrs) > 0) {
+-        result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10*s10])));
++        result = (..., (result = bin_op(result, ggml_cuda_cast<float>(src1s[i_src1 + i10*s10]))));
+     } else {
+-        result = bin_op(result, (float)src1[i_src1 + i10*s10]);
++        result = bin_op(result, ggml_cuda_cast<float>(src1[i_src1 + i10*s10]));
+     }
+ 
+-    dst_row[i0] = (dst_t) result;
++    dst_row[i0] = ggml_cuda_cast<dst_t>(result);
+ }
+ 
+ template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t, size_t... I>
+@@ -373,16 +374,34 @@ static void ggml_cuda_op_bin_bcast(
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+     const void * src0_dd, const void * src1_dd, void * dst_dd, cudaStream_t stream) {
+ 
+-    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
++    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
+ 
+-    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         op()(src0, src1, dst, (const float *)src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++        op()(src0, src1, dst, (const float *)src0_dd, (const half *)src1_dd, (float *)dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
++        op()(src0, src1, dst, (const float *)src0_dd, (const nv_bfloat16 *)src1_dd, (float *)dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
++        op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const nv_bfloat16 *)src1_dd, (nv_bfloat16 *) dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
++        op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const float *)src1_dd, (nv_bfloat16 *) dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++        op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_BF16) {
++        op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const half *)src1_dd, (nv_bfloat16 *) dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++        op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const half *)src1_dd, (float *)dst_dd, stream);
+     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+         op()(src0, src1, dst, (const half *) src0_dd, (const half *)src1_dd, (half *) dst_dd, stream);
+     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+         op()(src0, src1, dst, (const half *) src0_dd, (const float *)src1_dd, (half *) dst_dd, stream);
+-    } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         op()(src0, src1, dst, (const half *) src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F16) {
++        op()(src0, src1, dst, (const half *) src0_dd, (const nv_bfloat16 *)src1_dd, (half *) dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
++        op()(src0, src1, dst, (const half *) src0_dd, (const nv_bfloat16 *)src1_dd, (float *)dst_dd, stream);
+     } else {
+         fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__,
+             ggml_type_name(dst->type), ggml_type_name(src0->type), ggml_type_name(src1->type));
+@@ -417,10 +436,22 @@ static void ggml_cuda_op_fused_binbcast_impl(ggml_backend_cuda_context & ctx, gg
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
+-    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         launch_bin_bcast_pack<op, float, float, float>(src0, src1, dst,
+             (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
+             stream, std::make_index_sequence<n_fuse>{});
++    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
++        launch_bin_bcast_pack<op, nv_bfloat16, nv_bfloat16, nv_bfloat16>(src0, src1, dst,
++            (const nv_bfloat16 *) src0->data, (const nv_bfloat16 *) src1->data, (nv_bfloat16 *) dst->data,
++            stream, std::make_index_sequence<n_fuse>{});
++    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
++        launch_bin_bcast_pack<op, nv_bfloat16, float, nv_bfloat16>(src0, src1, dst,
++            (const nv_bfloat16 *) src0->data, (const float *) src1->data, (nv_bfloat16 *) dst->data,
++            stream, std::make_index_sequence<n_fuse>{});
++    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++        launch_bin_bcast_pack<op, nv_bfloat16, float, float>(src0, src1, dst,
++            (const nv_bfloat16 *) src0->data, (const float *) src1->data, (float *) dst->data,
++            stream, std::make_index_sequence<n_fuse>{});
+     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+         launch_bin_bcast_pack<op, half, half, half>(src0, src1, dst,
+             (const half *) src0->data, (const half *) src1->data, (half *) dst->data,
+diff --git a/src/ggml-cuda/conv2d-implicit.cu b/src/ggml-cuda/conv2d-implicit.cu
+index e498dffd..faf31fa6 100644
+--- a/src/ggml-cuda/conv2d-implicit.cu
++++ b/src/ggml-cuda/conv2d-implicit.cu
+@@ -122,13 +122,13 @@ static __global__ void NCHW2NHWC(const src_T *src, dst_T * dst, const int ne, co
+ 
+ 
+ 
+-template<typename T, const int BM, const int BN, const int BK, const int WM, const int WN,
++template<typename input_T, typename T, typename output_T, const int BM, const int BN, const int BK, const int WM, const int WN,
+           const int WNITER, const int TM, const int TN, const int NUM_THREADS,
+           // layout: 0, NHWC; 1, NCHW
+           const int layout, const bool vec_load, const int ksplit, const int PAD=4>
+-static __global__ void conv2d_implicit_kernel(const float * __restrict__ input,
++static __global__ void conv2d_implicit_kernel(const input_T * __restrict__ input,
+                                               const T * __restrict__ kernel,
+-                                              float * __restrict__ output,
++                                              output_T * __restrict__ output,
+                                               const param_t param) {
+ 
+     __shared__ char smem[sizeof(float) * (TM*TN*NUM_THREADS) <= sizeof(float) * 2 * (BM+PAD) * BK +  sizeof(T)*2*BK * (BN+PAD) ?
+@@ -183,7 +183,7 @@ static __global__ void conv2d_implicit_kernel(const float * __restrict__ input,
+        (kernel, smemweight, by, innerRowA, innerColA, weightKOffset,
+         start_k, end_k, param);
+ 
+-    loadInput<BM, rowStrideA, layout, vec_load, ksplit, PAD>
++    loadInput<input_T, BM, rowStrideA, layout, vec_load, ksplit, PAD>
+        (input,  smeminput, bx,  innerRowA, innerColA,
+         start_k, end_k, PQ, CHW, inChannelOffset, param);
+ 
+@@ -251,7 +251,7 @@ static __global__ void conv2d_implicit_kernel(const float * __restrict__ input,
+             (kernel, &smemweight[write_flag * (BN+PAD) * BK], by, innerRowA, innerColA, weightKOffset,
+                 crs+BK, end_k, param);
+ 
+-        loadInput<BM, rowStrideA, layout, vec_load, ksplit, PAD>
++        loadInput<input_T, BM, rowStrideA, layout, vec_load, ksplit, PAD>
+             (input,  &smeminput[write_flag * (BM+PAD) * BK], bx,  innerRowA, innerColA,
+                 crs + BK, end_k, PQ, CHW, inChannelOffset, param);
+ 
+@@ -330,7 +330,7 @@ static __global__ void conv2d_implicit_kernel(const float * __restrict__ input,
+                                 z * param.n * param.k * param.Oh * param.Ow + n * param.k * param.Oh * param.Ow +
+                                 row * param.Oh * param.Ow + col :
+                                 z * param.k * param.Oh * param.Ow + row * param.Oh * param.Ow + col;
+-                    output[outOffset] = smemoutput[output_lds_addr + subk * WARPSIZE] * param.output_scale;
++                    output[outOffset] = ggml_cuda_cast<output_T>(smemoutput[output_lds_addr + subk * WARPSIZE] * param.output_scale);
+                 }
+             }
+         }
+@@ -928,8 +928,8 @@ constexpr static int conv_shapes[][NUM_VARIANTS] = {
+     { 256,  256, 128, 256}	    //  NUM_THREADS
+ };
+ 
+-template <typename T, unsigned int CONV_SHAPE>
+-static void conv2d_implicit_cuda(const float * X_D, const T * K_D, float * Y_D, const param_t P, cudaStream_t st) {
++template <typename input_T, typename T, typename output_T, unsigned int CONV_SHAPE>
++static void conv2d_implicit_cuda(const input_T * X_D, const T * K_D, output_T * Y_D, const param_t P, cudaStream_t st) {
+ 
+     const uint BM = conv_shapes[0][CONV_SHAPE];
+     const uint BN = conv_shapes[1][CONV_SHAPE];
+@@ -948,15 +948,15 @@ static void conv2d_implicit_cuda(const float * X_D, const T * K_D, float * Y_D,
+     dim3 thblock(NUM_THREADS, thready, threadz);
+     dim3 grid(blockx, blocky, blockz);
+ 
+-    conv2d_implicit_kernel<T, BM, BN, BK, WM, WN,
++    conv2d_implicit_kernel<input_T, T, output_T, BM, BN, BK, WM, WN,
+           WNITER, TM, TN, NUM_THREADS, 1, false, 0><<<grid, thblock, 0, st>>>(X_D, K_D, Y_D, P);
+ }
+ 
+-template<const int BM, const int BN, const int BK,
++template<typename output_T, const int BM, const int BN, const int BK,
+         const int WM, const int WN, const int WK,  const int ksplit,
+         const unsigned int ThreadsM, const unsigned int ThreadsN,
+         const int NUM_THREADS>
+-static void launch_conv2d_implicit_split_kernel(ggml_backend_cuda_context & ctx, const half *X_H, const half *K_H, float *Y_D,
++static void launch_conv2d_implicit_split_kernel(ggml_backend_cuda_context & ctx, const half *X_H, const half *K_H, output_T *Y_D,
+                     const unsigned int BlocksM, const unsigned int BlocksN,
+                     const unsigned int shmem_bytes,
+                     param_t P, cudaStream_t st){
+@@ -975,10 +975,11 @@ static void launch_conv2d_implicit_split_kernel(ggml_backend_cuda_context & ctx,
+         const unsigned int blockx = (nrows + 511) / 512;
+         const dim3 block_nums(blockx, 1, 1);
+         const dim3 block_dims(512, 1, 1);
+-        reduce_f32<half, float><<<block_nums, block_dims, 0, st>>>(Y_H.get(), Y_D, nrows, ksplit, P.output_scale);
++        reduce_f32<half, output_T><<<block_nums, block_dims, 0, st>>>(Y_H.get(), Y_D, nrows, ksplit, P.output_scale);
+ }
+ 
+-static void conv2d_implicit_cuda_f16(ggml_backend_cuda_context & ctx, const float * X_D, const half * K_D, float * Y_D, int cc, param_t P, cudaStream_t st) {
++template <typename input_T, typename output_T>
++static void conv2d_implicit_cuda_f16(ggml_backend_cuda_context & ctx, const input_T * X_D, const half * K_D, output_T * Y_D, int cc, param_t P, cudaStream_t st) {
+ 
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ampere_mma_available(cc) && P.c % 8 == 0 && (P.r <= 32 && P.s <= 32)) {
+ 
+@@ -1002,7 +1003,7 @@ static void conv2d_implicit_cuda_f16(ggml_backend_cuda_context & ctx, const floa
+                       (ne00 + CUDA_NCHW_2_NHWC_TILE_DIM - 1) / CUDA_NCHW_2_NHWC_TILE_DIM,
+                       (ne/(ne00*ne01) + CUDA_NCHW_2_NHWC_BLOCK_NM - 1) / CUDA_NCHW_2_NHWC_BLOCK_NM) ;
+         dim3 dimBlock(CUDA_NCHW_2_NHWC_TILE_DIM,CUDA_NCHW_2_NHWC_BLOCK_ROWS, 1);
+-        NCHW2NHWC<float, half><<<dimGrid, dimBlock, 0, st>>>(X_D, input_f16.get(), ne, ne00, ne01, P.input_scale);
++        NCHW2NHWC<input_T, half><<<dimGrid, dimBlock, 0, st>>>(X_D, input_f16.get(), ne, ne00, ne01, P.input_scale);
+ 
+         ne = P.c * P.r * P.s * P.k;
+         ne01 = P.r * P.s;
+@@ -1099,61 +1100,61 @@ static void conv2d_implicit_cuda_f16(ggml_backend_cuda_context & ctx, const floa
+             if(candidate != -1){
+               j = candidate;
+               if (j == 2) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 2,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 2,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 3) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 3,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 3,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 4) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 4,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 4,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 5) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 5,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 5,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 6) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 6,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 6,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 7) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 7,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 7,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 8) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 8,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 8,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 9) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 9,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 9,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 10) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 10,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 10,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 11) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 11,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 11,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 12) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 12,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 12,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 13) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 13,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 13,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 14) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 14,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 14,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 15) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 15,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 15,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 16) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 16,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 16,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 17) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 17,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 17,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 18) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 18,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 18,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 19) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 19,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 19,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               } else if (j == 20) {
+-                launch_conv2d_implicit_split_kernel<BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 20,
++                launch_conv2d_implicit_split_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 20,
+                 ThreadsM, ThreadsN, NumThreads>(ctx, X_H, K_H, Y_D, BlocksM, BlocksN, shmem_bytes, P, st);
+               }
+ 
+@@ -1161,22 +1162,22 @@ static void conv2d_implicit_cuda_f16(ggml_backend_cuda_context & ctx, const floa
+             }
+         }
+ 
+-        CUDA_SET_SHARED_MEMORY_LIMIT((conv2d_implicit_kernel<float, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 0, NumThreads>), 65536);// set shared memory limit to 64KB which is maximum for sm_75
++        CUDA_SET_SHARED_MEMORY_LIMIT((conv2d_implicit_kernel<output_T, BM_dim, BN_dim, BK_dim, WM_dim, WN_dim, WK_dim, 0, NumThreads>), 65536);// set shared memory limit to 64KB which is maximum for sm_75
+ 
+         dim3 gridDim(BlocksN, BlocksM);
+         dim3 blockDim(ThreadsN, ThreadsM);
+ 
+-        conv2d_implicit_kernel<float, BM_dim, BN_dim, BK_dim,
++        conv2d_implicit_kernel<output_T, BM_dim, BN_dim, BK_dim,
+             WM_dim, WN_dim, WK_dim, 0, NumThreads>
+             <<<gridDim, blockDim, shmem_bytes, st>>>(X_H, K_H, Y_D, P);
+     } else {
+-       conv2d_implicit_cuda<half, 1>(X_D, K_D, Y_D, P, st);
++       conv2d_implicit_cuda<input_T, half, output_T, 1>(X_D, K_D, Y_D, P, st);
+     }
+ 
+ }
+ 
+ static void conv2d_implicit_cuda_f32(ggml_backend_cuda_context & ctx, const float * X_D, const float * K_D, float * Y_D, int cc, const param_t P, cudaStream_t st) {
+-    conv2d_implicit_cuda<float, 1>(X_D, K_D, Y_D, P, st);
++    conv2d_implicit_cuda<float, float, float, 1>(X_D, K_D, Y_D, P, st);
+     GGML_UNUSED(ctx);
+     GGML_UNUSED(cc);
+ }
+@@ -1184,12 +1185,10 @@ static void conv2d_implicit_cuda_f32(ggml_backend_cuda_context & ctx, const floa
+ void ggml_cuda_op_conv2d_implicit(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * kernel = dst->src[0];
+     const ggml_tensor * input  = dst->src[1];
+-    float *             K_D    = (float *) kernel->data;
+-    const float *       X_D    = (const float *) input->data;
+-    float *             Y_D    = (float *) dst->data;
+-
+     GGML_ASSERT(ggml_is_contiguous(kernel));
+     GGML_ASSERT(kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32);
++    GGML_ASSERT(input->type == GGML_TYPE_F32 || input->type == GGML_TYPE_BF16);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16);
+ 
+ 
+     cudaStream_t st = ctx.stream();
+@@ -1241,8 +1240,25 @@ void ggml_cuda_op_conv2d_implicit(ggml_backend_cuda_context & ctx, ggml_tensor *
+                       1.0f / fused_scale};
+ 
+     if (kernel->type == GGML_TYPE_F16) {
+-        conv2d_implicit_cuda_f16(ctx, X_D, (half *) K_D, Y_D, cc, params, st);
++        const half * K_D = (const half *) kernel->data;
++        if (input->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
++            conv2d_implicit_cuda_f16(ctx, (const nv_bfloat16 *) input->data, K_D, (nv_bfloat16 *) dst->data, cc, params, st);
++        } else if (input->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
++            conv2d_implicit_cuda_f16(ctx, (const nv_bfloat16 *) input->data, K_D, (float *) dst->data, cc, params, st);
++        } else if (input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
++            conv2d_implicit_cuda_f16(ctx, (const float *) input->data, K_D, (nv_bfloat16 *) dst->data, cc, params, st);
++        } else {
++            conv2d_implicit_cuda_f16(ctx, (const float *) input->data, K_D, (float *) dst->data, cc, params, st);
++        }
+     } else {
+-        conv2d_implicit_cuda_f32(ctx, X_D, K_D, Y_D, cc, params, st);
+-    }
+-}
++        const float * K_D = (const float *) kernel->data;
++        if (input->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
++            conv2d_implicit_cuda<nv_bfloat16, float, nv_bfloat16, 1>((const nv_bfloat16 *) input->data, K_D, (nv_bfloat16 *) dst->data, params, st);
++        } else if (input->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
++            conv2d_implicit_cuda<nv_bfloat16, float, float, 1>((const nv_bfloat16 *) input->data, K_D, (float *) dst->data, params, st);
++        } else if (input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
++            conv2d_implicit_cuda<float, float, nv_bfloat16, 1>((const float *) input->data, K_D, (nv_bfloat16 *) dst->data, params, st);
++        } else {
++            conv2d_implicit_cuda_f32(ctx, (const float *) input->data, K_D, (float *) dst->data, cc, params, st);
++        }
++    }}
+diff --git a/src/ggml-cuda/conv2d-implicit.cuh b/src/ggml-cuda/conv2d-implicit.cuh
+index d7501bb7..499ac1f2 100644
+--- a/src/ggml-cuda/conv2d-implicit.cuh
++++ b/src/ggml-cuda/conv2d-implicit.cuh
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "common.cuh"
++#include "convert.cuh"
+ 
+ constexpr unsigned int SWIZZLE_MASK_1 = 0b10000;
+ constexpr unsigned int SWIZZLE_BITS_1 = 4;
+@@ -647,9 +648,9 @@ __device__ __forceinline__ void loadFilter(const T * __restrict__ kernel,
+ }
+ 
+ 
+-template<const int BM, const int rowStrideA, const int layout,
++template<typename input_T, const int BM, const int rowStrideA, const int layout,
+          const bool vec_load, const int ksplit, const int PAD>
+-__device__ __forceinline__ void loadInput(const float * __restrict__ input,
++__device__ __forceinline__ void loadInput(const input_T * __restrict__ input,
+                                                 float * __restrict__ smeminput,
+                                                 const unsigned int bx,
+                                                 const unsigned int innerRowA,
+@@ -688,11 +689,19 @@ __device__ __forceinline__ void loadInput(const float * __restrict__ input,
+                 int inOffsetTmp = layout == 0 ?
+                                 curH * inChannelOffset + curW * param.c + curC:
+                                 curC * inChannelOffset + curH * param.w + curW;
+-                float4 tmp = reinterpret_cast<const float4 *>(&input[inOffset + inOffsetTmp])[0];
+-                smeminput[input_sts_addr + offset +           0] = tmp.x * param.input_scale;
+-                smeminput[input_sts_addr + offset +      BM+PAD] = tmp.y * param.input_scale;
+-                smeminput[input_sts_addr + offset +  2*(BM+PAD)] = tmp.z * param.input_scale;
+-                smeminput[input_sts_addr + offset +  3*(BM+PAD)] = tmp.w * param.input_scale;
++                if constexpr (std::is_same_v<input_T, float>) {
++                    float4 tmp = reinterpret_cast<const float4 *>(&input[inOffset + inOffsetTmp])[0];
++                    smeminput[input_sts_addr + offset +           0] = tmp.x * param.input_scale;
++                    smeminput[input_sts_addr + offset +      BM+PAD] = tmp.y * param.input_scale;
++                    smeminput[input_sts_addr + offset +  2*(BM+PAD)] = tmp.z * param.input_scale;
++                    smeminput[input_sts_addr + offset +  3*(BM+PAD)] = tmp.w * param.input_scale;
++                } else {
++#pragma unroll
++                    for (int i = 0; i < 4; ++i) {
++                        smeminput[input_sts_addr + offset + i*(BM+PAD)] =
++                            ggml_cuda_cast<float>(input[inOffset + inOffsetTmp + i]) * param.input_scale;
++                    }
++                }
+             } else {
+ #pragma unroll
+                 for (int i = 0; i < 4; ++i)
+@@ -718,7 +727,8 @@ __device__ __forceinline__ void loadInput(const float * __restrict__ input,
+                     int inOffsetTmp = layout == 0 ?
+                                 curH * inChannelOffset + curW * param.c + curC:
+                                 curC * inChannelOffset + curH * param.w + curW;
+-                    smeminput[input_sts_addr + offset + i*(BM+PAD)] = input[inOffset + inOffsetTmp] * param.input_scale;
++                    smeminput[input_sts_addr + offset + i*(BM+PAD)] =
++                        ggml_cuda_cast<float>(input[inOffset + inOffsetTmp]) * param.input_scale;
+                 } else {
+                     smeminput[input_sts_addr + offset + i*(BM+PAD)] = 0.f;
+                 }
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 352ce087..00639510 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -3491,8 +3491,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         const ggml_tensor *tanh   = cgraph->nodes[node_idx+1];
+         const ggml_tensor *scale2 = cgraph->nodes[node_idx+2];
+ 
+-        GGML_ASSERT(scale->src[0]->type == GGML_TYPE_F32);
+-        GGML_ASSERT(scale->type == GGML_TYPE_F32);
++        if (scale->src[0]->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32) {
++            return false;
++        }
+ 
+         if (ggml_get_unary_op(tanh) != GGML_UNARY_OP_TANH) {
+             return false;
+diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
+index ef98f675..5ce3af72 100644
+--- a/src/ggml-cuda/norm.cu
++++ b/src/ggml-cuda/norm.cu
+@@ -1,4 +1,5 @@
+ #include "norm.cuh"
++#include "convert.cuh"
+ #include <cstdint>
+ 
+ template <int block_size>
+@@ -71,6 +72,36 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
+     }
+ }
+ 
++template <int block_size, typename src_t, typename dst_t>
++static __global__ void group_norm_compact(const src_t * x, dst_t * dst, const int group_size, const int ne_elements, const float eps) {
++    const int start = blockIdx.x * group_size + threadIdx.x;
++    const int end   = min(blockIdx.x * group_size + group_size, ne_elements);
++
++    float tmp = 0.0f;
++    for (int j = start; j < end; j += block_size) {
++        tmp += ggml_cuda_cast<float>(x[j]);
++    }
++
++    extern __shared__ float s_sum[];
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float mean = tmp / group_size;
++    tmp = 0.0f;
++
++    for (int j = start; j < end; j += block_size) {
++        const float xi = ggml_cuda_cast<float>(x[j]) - mean;
++        tmp += xi * xi;
++    }
++
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float variance = tmp / group_size;
++    const float scale = rsqrtf(variance + eps);
++    for (int j = start; j < end; j += block_size) {
++        dst[j] = ggml_cuda_cast<dst_t>((ggml_cuda_cast<float>(x[j]) - mean) * scale);
++    }
++}
++
+ template <int block_size, bool do_multiply = false, bool do_add = false>
+ static __global__ void rms_norm_f32(const float * x,
+                                     float *       dst,
+@@ -294,6 +325,18 @@ static void group_norm_f32_cuda(
+     }
+ }
+ 
++template <typename src_t, typename dst_t>
++static void group_norm_compact_cuda(
++        const src_t * x, dst_t * dst, const int num_groups, const float eps, const int group_size, const int ne_elements, cudaStream_t stream) {
++    if (group_size < 1024) {
++        const dim3 block_dims(WARP_SIZE, 1, 1);
++        group_norm_compact<WARP_SIZE><<<num_groups, block_dims, 0, stream>>>(x, dst, group_size, ne_elements, eps);
++    } else {
++        const dim3 block_dims(1024, 1, 1);
++        group_norm_compact<1024><<<num_groups, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(x, dst, group_size, ne_elements, eps);
++    }
++}
++
+ static void rms_norm_f32_cuda(
+         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+@@ -432,12 +475,12 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+-    const float * src0_d = (const float *)src0->data;
+-    float * dst_d = (float *)dst->data;
++    const void * src0_d = src0->data;
++    void * dst_d = dst->data;
+     cudaStream_t stream = ctx.stream();
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
++    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
+ 
+     int num_groups = dst->op_params[0];
+ 
+@@ -446,7 +489,21 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     GGML_ASSERT(eps >= 0.0f);
+ 
+     int group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
+-    group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
++    if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
++        group_norm_compact_cuda((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
++        group_norm_compact_cuda((const nv_bfloat16 *)src0_d, (float *)dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
++        group_norm_compact_cuda((const float *)src0_d, (nv_bfloat16 *)dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
++        group_norm_compact_cuda((const half *)src0_d, (half *)dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++        group_norm_compact_cuda((const half *)src0_d, (float *)dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
++        group_norm_compact_cuda((const float *)src0_d, (half *)dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
++    } else {
++        group_norm_f32_cuda((const float *)src0_d, (float *)dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
++    }
+ }
+ 
+ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/src/ggml-cuda/pad.cu b/src/ggml-cuda/pad.cu
+index 31cd00f7..a19bcfd3 100644
+--- a/src/ggml-cuda/pad.cu
++++ b/src/ggml-cuda/pad.cu
+@@ -1,4 +1,5 @@
+ #include "pad.cuh"
++#include "convert.cuh"
+ 
+ #include <stdint.h>
+ 
+@@ -7,7 +8,8 @@ __device__ __forceinline__ int64_t wrap_around(int64_t coord, int64_t size) {
+     return (coord + size) % size;
+ }
+ 
+-static __global__ void pad_f32(const float * src, size_t s00, size_t s01, size_t s02, size_t s03, float * dst,
++template <typename src_t, typename dst_t>
++static __global__ void pad_kernel(const src_t * src, size_t s00, size_t s01, size_t s02, size_t s03, dst_t * dst,
+                                const int lp0, const int rp0, const int lp1, const int rp1,
+                                const int lp2, const int rp2, const int lp3, const int rp3,
+                                const int ne0, const int ne1, const int ne2, const int ne3,
+@@ -37,9 +39,9 @@ static __global__ void pad_f32(const float * src, size_t s00, size_t s01, size_t
+ 
+             const int64_t src_idx = i03 * s03 + i02 * s02 + i01 * s01 + i00 * s00;
+ 
+-            dst[dst_idx] = src[src_idx];
++            dst[dst_idx] = ggml_cuda_cast<dst_t>(src[src_idx]);
+         } else {
+-            dst[dst_idx] = 0.0f;
++            dst[dst_idx] = ggml_cuda_cast<dst_t>(0.0f);
+         }
+     }
+     // circular means on a torus, so x and y wrap around
+@@ -56,33 +58,34 @@ static __global__ void pad_f32(const float * src, size_t s00, size_t s01, size_t
+ 
+         const int64_t src_idx = i03 * s03 + i02 * s02 + i01 * s01 + i00 * s00;
+ 
+-        dst[dst_idx] = src[src_idx];
++        dst[dst_idx] = ggml_cuda_cast<dst_t>(src[src_idx]);
+     }
+ }
+ 
+ 
+-static void pad_f32_cuda(const float * src, size_t s00, size_t s01, size_t s02, size_t s03, float * dst,
++template <typename src_t, typename dst_t>
++static void pad_cuda(const src_t * src, size_t s00, size_t s01, size_t s02, size_t s03, dst_t * dst,
+     const int lp0, const int rp0, const int lp1, const int rp1,
+     const int lp2, const int rp2, const int lp3, const int rp3,
+     const int ne0, const int ne1, const int ne2, const int ne3,
+     const bool circular, cudaStream_t stream) {
+     int  num_blocks = (ne0 + CUDA_PAD_BLOCK_SIZE - 1) / CUDA_PAD_BLOCK_SIZE;
+     dim3 gridDim(num_blocks, ne1, ne2 * ne3);
+-    pad_f32<<<gridDim, CUDA_PAD_BLOCK_SIZE, 0, stream>>>(src, s00, s01, s02, s03, dst,
++    pad_kernel<<<gridDim, CUDA_PAD_BLOCK_SIZE, 0, stream>>>(src, s00, s01, s02, s03, dst,
+                                                          lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3,
+                                                          ne0, ne1, ne2, ne3, circular);
+ }
+ 
+ void ggml_cuda_op_pad(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0   = dst->src[0];
+-    const float *       src0_d = (const float *) src0->data;
+-    float *             dst_d  = (float *) dst->data;
++    const void *        src0_d = src0->data;
++    void *              dst_d  = dst->data;
+     cudaStream_t        stream = ctx.stream();
+ 
+     GGML_TENSOR_UNARY_OP_LOCALS;
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
+ 
+     const int32_t lp0      = ((const int32_t *) (dst->op_params))[0];
+     const int32_t rp0      = ((const int32_t *) (dst->op_params))[1];
+@@ -99,8 +102,16 @@ void ggml_cuda_op_pad(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const size_t s02 = nb02 / ggml_type_size(src0->type);
+     const size_t s03 = nb03 / ggml_type_size(src0->type);
+ 
+-    pad_f32_cuda(src0_d, s00, s01, s02, s03, dst_d,
+-                 lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3,
+-                 dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+-                 (bool) circular, stream);
++    if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
++        pad_cuda((const nv_bfloat16 *)src0_d, s00, s01, s02, s03, (nv_bfloat16 *)dst_d,
++                 lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], (bool)circular, stream);
++    } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
++        pad_cuda((const half *)src0_d, s00, s01, s02, s03, (half *)dst_d,
++                 lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], (bool)circular, stream);
++    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++        pad_cuda((const float *)src0_d, s00, s01, s02, s03, (float *)dst_d,
++                 lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], (bool)circular, stream);
++    } else {
++        GGML_ABORT("unsupported mixed dtype PAD");
++    }
+ }
+diff --git a/src/ggml-cuda/scale.cu b/src/ggml-cuda/scale.cu
+index 0ddeff6a..d5747097 100644
+--- a/src/ggml-cuda/scale.cu
++++ b/src/ggml-cuda/scale.cu
+@@ -1,34 +1,51 @@
+ #include "scale.cuh"
++#include "convert.cuh"
+ 
+ #define MAX_GRIDDIM_X 0x7FFFFFFF
+ 
+-static __global__ void scale_f32(const float * x, float * dst, const float scale, const float bias, const int64_t nelements) {
++template <typename src_t, typename dst_t>
++static __global__ void scale_kernel(const src_t * x, dst_t * dst, const float scale, const float bias, const int64_t nelements) {
+     int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+     int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
+ 
+     for (int64_t i = tid; i < nelements; i += stride) {
+-        dst[i] = scale * x[i] + bias;
++        dst[i] = ggml_cuda_cast<dst_t>(scale * ggml_cuda_cast<float>(x[i]) + bias);
+     }
+ }
+ 
+-static void scale_f32_cuda(const float * x, float * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
++template <typename src_t, typename dst_t>
++static void scale_cuda(const src_t * x, dst_t * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
+     const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
+-    scale_f32<<<MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream>>>(x, dst, scale, bias, nelements);
++    scale_kernel<<<MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream>>>(x, dst, scale, bias, nelements);
+ }
+ 
+ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+-    const float * src0_d = (const float *)src0->data;
+-    float * dst_d = (float *)dst->data;
++    const void * src0_d = src0->data;
++    void * dst_d = dst->data;
+     cudaStream_t stream = ctx.stream();
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
++    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
+ 
+     float scale;
+     float bias;
+     memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+     memcpy(&bias,  (float *) dst->op_params + 1, sizeof(float));
+ 
+-    scale_f32_cuda(src0_d, dst_d, scale, bias, ggml_nelements(src0), stream);
++    if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
++        scale_cuda((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, scale, bias, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
++        scale_cuda((const nv_bfloat16 *)src0_d, (float *)dst_d, scale, bias, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
++        scale_cuda((const float *)src0_d, (nv_bfloat16 *)dst_d, scale, bias, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
++        scale_cuda((const half *)src0_d, (half *)dst_d, scale, bias, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++        scale_cuda((const half *)src0_d, (float *)dst_d, scale, bias, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
++        scale_cuda((const float *)src0_d, (half *)dst_d, scale, bias, ggml_nelements(src0), stream);
++    } else {
++        scale_cuda((const float *)src0_d, (float *)dst_d, scale, bias, ggml_nelements(src0), stream);
++    }
+ }
+diff --git a/src/ggml-cuda/unary.cu b/src/ggml-cuda/unary.cu
+index 4ad30fa1..01109680 100644
+--- a/src/ggml-cuda/unary.cu
++++ b/src/ggml-cuda/unary.cu
+@@ -117,7 +117,7 @@ static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
+         return;
+     }
+ 
+-    dst[i] = (T)op((float)x[i]);
++    dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[i])));
+ }
+ 
+ template <float (*op)(float), typename T>
+@@ -135,11 +135,13 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     GGML_ASSERT(ggml_is_contiguous(src0));
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+-    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
++    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
+     GGML_ASSERT(src0->type == dst->type);
+ 
+-    if (src0->type == GGML_TYPE_F16) {
++    if (src0->type == GGML_TYPE_BF16) {
++        unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
++    } else if (src0->type == GGML_TYPE_F16) {
+         unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+     } else {
+         unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+diff --git a/src/ggml-cuda/upscale.cu b/src/ggml-cuda/upscale.cu
+index 6bdf3cd9..58483d2b 100644
+--- a/src/ggml-cuda/upscale.cu
++++ b/src/ggml-cuda/upscale.cu
+@@ -1,6 +1,8 @@
+ #include "upscale.cuh"
++#include "convert.cuh"
+ 
+-static __global__ void upscale_f32(const float * x, float * dst,
++template <typename src_t, typename dst_t>
++static __global__ void upscale_nearest_kernel(const src_t * x, dst_t * dst,
+         const int nb00, const int nb01, const int nb02, const int nb03,
+         const int ne10, const int ne11, const int ne12, const int ne13,
+         const float sf0, const float sf1, const float sf2, const float sf3) {
+@@ -19,7 +21,7 @@ static __global__ void upscale_f32(const float * x, float * dst,
+     int i02 = i12 / sf2;
+     int i03 = i13 / sf3;
+ 
+-    dst[index] = *( (const float *)((const char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00) );
++    dst[index] = ggml_cuda_cast<dst_t>(*( (const src_t *)((const char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00) ));
+ }
+ 
+ static __global__ void upscale_f32_bilinear(const float * x, float * dst,
+@@ -215,7 +217,8 @@ static __global__ void upscale_f32_bicubic(const float * x, float * dst,
+     dst[index] = result;
+ }
+ 
+-static void upscale_f32_cuda(const float * x, float * dst,
++template <typename src_t, typename dst_t>
++static void upscale_nearest_cuda(const src_t * x, dst_t * dst,
+         const int nb00, const int nb01, const int nb02, const int nb03,
+         const int ne10, const int ne11, const int ne12, const int ne13,
+         const float sf0, const float sf1, const float sf2, const float sf3,
+@@ -223,7 +226,7 @@ static void upscale_f32_cuda(const float * x, float * dst,
+     const int64_t dst_size   = ne10 * ne11 * ne12 * ne13;
+     const int64_t num_blocks = (dst_size + CUDA_UPSCALE_BLOCK_SIZE - 1) / CUDA_UPSCALE_BLOCK_SIZE;
+ 
+-    upscale_f32<<<num_blocks, CUDA_UPSCALE_BLOCK_SIZE,0,stream>>>(x, dst, nb00, nb01, nb02, nb03, ne10, ne11, ne12, ne13, sf0, sf1, sf2, sf3);
++    upscale_nearest_kernel<<<num_blocks, CUDA_UPSCALE_BLOCK_SIZE,0,stream>>>(x, dst, nb00, nb01, nb02, nb03, ne10, ne11, ne12, ne13, sf0, sf1, sf2, sf3);
+ }
+ 
+ static void upscale_f32_bilinear_cuda(const float * x, float * dst,
+@@ -256,12 +259,12 @@ static void upscale_f32_bicubic_cuda(const float * x, float * dst,
+ 
+ void ggml_cuda_op_upscale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+-    const float * src0_d = (const float *)src0->data;
+-    float * dst_d = (float *)dst->data;
++    const void * src0_d = src0->data;
++    void * dst_d = dst->data;
+     cudaStream_t stream = ctx.stream();
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
++    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
+ 
+     const int mode_flags = dst->op_params[0];
+     const ggml_scale_mode mode = (ggml_scale_mode)(mode_flags & 0xFF);
+@@ -279,14 +282,32 @@ void ggml_cuda_op_upscale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     }
+ 
+     if (mode == GGML_SCALE_MODE_NEAREST) {
+-        upscale_f32_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
++            upscale_nearest_cuda((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        } else if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
++            upscale_nearest_cuda((const nv_bfloat16 *)src0_d, (float *)dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
++            upscale_nearest_cuda((const float *)src0_d, (nv_bfloat16 *)dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
++            upscale_nearest_cuda((const half *)src0_d, (half *)dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++            upscale_nearest_cuda((const half *)src0_d, (float *)dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
++            upscale_nearest_cuda((const float *)src0_d, (half *)dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        } else {
++            upscale_nearest_cuda((const float *)src0_d, (float *)dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        }
+     } else if (mode == GGML_SCALE_MODE_BILINEAR) {
++        GGML_ASSERT(src0->type == GGML_TYPE_F32);
++        GGML_ASSERT( dst->type == GGML_TYPE_F32);
+         const bool antialias = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS);
+-        upscale_f32_bilinear_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
++        upscale_f32_bilinear_cuda((const float *)src0_d, (float *)dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                                  src0->ne[0], src0->ne[1], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                                  sf0, sf1, sf2, sf3, pixel_offset, antialias, stream);
+     } else if (mode == GGML_SCALE_MODE_BICUBIC) {
+-        upscale_f32_bicubic_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
++        GGML_ASSERT(src0->type == GGML_TYPE_F32);
++        GGML_ASSERT( dst->type == GGML_TYPE_F32);
++        upscale_f32_bicubic_cuda((const float *)src0_d, (float *)dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                                  src0->ne[0], src0->ne[1], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                                  sf0, sf1, sf2, sf3, pixel_offset, stream);
+     }
+diff --git a/src/ggml.c b/src/ggml.c
+index e9b6720c..b616fdf1 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -4962,7 +4962,10 @@ static struct ggml_tensor * ggml_interpolate_impl(
+     GGML_ASSERT((mode & 0xFF) < GGML_SCALE_MODE_COUNT);
+     // TODO: implement antialias for modes other than bilinear
+     GGML_ASSERT(!(mode & GGML_SCALE_FLAG_ANTIALIAS) || (mode & 0xFF) == GGML_SCALE_MODE_BILINEAR);
+-    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    const uint32_t scale_mode = mode & 0xFF;
++    const bool compact_nearest = scale_mode == GGML_SCALE_MODE_NEAREST &&
++        (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16);
++    GGML_ASSERT(a->type == GGML_TYPE_F32 || compact_nearest);
+ 
+     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, ne0, ne1, ne2, ne3);
+ 
+-- 
+2.51.2.windows.1
+

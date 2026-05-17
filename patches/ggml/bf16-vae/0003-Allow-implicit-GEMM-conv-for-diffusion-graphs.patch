@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ohnoitsaninja <ohnoitsaninja@users.noreply.github.com>
+Date: Sun, 17 May 2026 14:39:04 -0400
+Subject: [PATCH 3/6] Allow implicit GEMM conv for diffusion graphs
+
+
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index a7324e43..352ce087 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2750,7 +2750,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+             ggml_cuda_op_im2col_3d(ctx, dst);
+             break;
+         case GGML_OP_CONV_2D:
+-            if (sdcpp_env_enabled("SDCPP_EXPERIMENTAL_VAE_IMPLICIT_GEMM_CONV")) {
++            if (sdcpp_env_enabled("SDCPP_EXPERIMENTAL_VAE_IMPLICIT_GEMM_CONV") ||
++                sdcpp_env_enabled("SDCPP_EXPERIMENTAL_DIFFUSION_IMPLICIT_GEMM_CONV")) {
+                 const bool debug_implicit = sdcpp_env_enabled("SDCPP_EXPERIMENTAL_VAE_IMPLICIT_GEMM_DEBUG");
+                 if (debug_implicit) {
+                     const ggml_tensor * kernel = dst->src[0];
+-- 
+2.51.2.windows.1
+

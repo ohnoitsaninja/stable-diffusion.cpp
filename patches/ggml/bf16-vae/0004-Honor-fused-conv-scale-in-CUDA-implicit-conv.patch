@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ohnoitsaninja <ohnoitsaninja@users.noreply.github.com>
+Date: Sun, 17 May 2026 15:56:37 -0400
+Subject: [PATCH 4/6] Honor fused conv scale in CUDA implicit conv
+
+
+diff --git a/src/ggml-cuda/conv2d-implicit.cu b/src/ggml-cuda/conv2d-implicit.cu
+index f9acbb2800bde3a067a5f2e41086a2cce4ca2ea1..960bccb8f00c458d8fb1904443a464f94dc59c84 100644
+GIT binary patch
+delta 837
+zcmcIiOD`l*6h23lLbr@YmwxEtis^Waw8tbm-j9UkM8rZOB0_gE52m`crHvmTILx(?
+zw8z3iMAD1ewgn3^i7<b_+NS3pIE8eJX?C+Xx2kS^_xrwczI$=5o&45LFIA-lgdFms
+zkJdUqlq|s<%)$?dQ0z}7)fBo@8Fj0`5YP+)e!?;&z<gY1APbd4Yv_^bebgu|)YM^-
+zsZi3R%3&{hbA<BlBkGjtE~Ry6MQYU9?4Y>TLZ%)ndt%S=ohewiSyV;WhC4@_(UTLj
+z+FGIKbs=N(7^LfO{$B}nQ1aeIr@H!*AdnK@(+9Ss9)}2<pMfc8gK22u#<)3&F7$*2
+z4De?=g!osK-@3U>9!Q*Pfp_z2LquX2t107l*{=CP!mV0^Wq5<H1l#|E;Oma9^>Xa>
+zZ-zDBn|`gUPuS%!IC&W3uD-(Jzp2v3t<N5!B|332;Iy&NbD?r!aHCdw94ANYMCBJR
+zx|ArGgpEyh?0%&m8s+Xb8g$bTsE_iES>mD3^U$*?GhZJUpW+}oWh{V|vStsp;M-^$
+z-}aOZU(f1ykXf(LL$g!0Y_iHq?BG^0#g9Amyb2UM{v6CD-}>k+pYIj=8`3SddV~)g
+COUr`*
+
+delta 278
+zcmZ2?mhIS4whgCPCM&TCZ5Ci%!8H9#9HYSGd2iSz7btRV{>EOw%&0jz@v`vd1>7E7
+zlSRbzCc7z$O-o~xn_M8w2U9nFgA!2F1ZIcL-^2n!rhk)W<eNMpRbsk<Frx?19HmV;
+z2NrV|F{CmSGsH7QGZ;*ERFs~qpeg`TAU9nhnNeW+KVC+a?PmlSS1}?fG=wSK4pi78
+z#jMF-J-u@RWAJt@J;q0zlizT2OpXc=nLfdSk!8D=1!I;BP)K0=g%HLn*Xe!2j9k<I
+zO=aYhEC5<*#t_S(z+el63Jhrsi3~YFr=(6^Xdyaz0XNU&2bx^l_swRU!m<6s62^Uu
+E0Hn`Xwg3PC
+
+diff --git a/src/ggml-cuda/conv2d-implicit.cuh b/src/ggml-cuda/conv2d-implicit.cuh
+index 2ae2bcbee282117373bc51cf598187b6a4525c89..c056d211c179447b76aefc6a4685c268f71ede96 100644
+GIT binary patch
+delta 332
+zcmex&ka@)s<_+6;CM&fGO`ft}fHRpPks*g6mBD(lY@4{G0z*DSDMJZE0ho+uC}x1l
+zZ(h%1dRSe7L5o2FD4EDm1jM-vdJLHid6<ePf83xxdBFv*$@|W8OpduAN20z064iT6
+sZn&sMf*$$Fan%Bobv9RR_Pdn8L$t=mZP}CUE;>v$*v_#z;r={E08CU|7ytkO
+
+delta 96
+zcmZ2+g!$h=<_+6;HcRm89iGgwR&BDtC9lZ}7dR$AyC64t1(ZMMqS|DSbs)Kd$uHK)
+xO+H{EFu8AY)#iZ92|SaZY|EN_@4Un0sQWULA6!<MY{0}Z`N8(E%?b}W7y+p3E%X2Y
+
+-- 
+2.51.2.windows.1
+

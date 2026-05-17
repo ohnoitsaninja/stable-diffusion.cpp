@@ -872,10 +872,8 @@ struct AutoEncoderKL : public VAE {
 
     GGMLRunnerContext get_context() override {
         auto runner_ctx = VAE::get_context();
-        const char* dtype_env = std::getenv("SDCPP_VAE_DTYPE");
-        const bool dtype_env_bf16 = dtype_env != nullptr && std::string(dtype_env) == "bf16";
         runner_ctx.vae_bf16_activations_enabled =
-            comfy_normal_enabled && (env_flag_enabled("SDCPP_EXPERIMENTAL_VAE_BF16_ACTIVATIONS") || dtype_env_bf16);
+            comfy_normal_enabled && env_flag_enabled("SDCPP_EXPERIMENTAL_VAE_BF16");
         return runner_ctx;
     }
 

@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ohnoitsaninja <ohnoitsaninja@users.noreply.github.com>
+Date: Sun, 17 May 2026 13:28:01 -0400
+Subject: [PATCH 2/6] Add CUDA Philox randn helper
+
+
+diff --git a/include/ggml-cuda.h b/include/ggml-cuda.h
+index 22ad2c00..30cec229 100644
+--- a/include/ggml-cuda.h
++++ b/include/ggml-cuda.h
+@@ -40,6 +40,10 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
+ GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
+ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
+ 
++// stable-diffusion.cpp experimental helper: fills a contiguous CUDA F32 tensor
++// with the same Philox/Box-Muller sequence used by PhiloxRNG::randn(offset).
++GGML_BACKEND_API bool ggml_backend_cuda_fill_philox_randn_f32(ggml_tensor * tensor, uint64_t seed, uint32_t offset);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
+ 
+ #ifdef  __cplusplus
+diff --git a/src/ggml-cuda/sd-randn.cu b/src/ggml-cuda/sd-randn.cu
+new file mode 100644
+index 00000000..994aa6b0
+--- /dev/null
++++ b/src/ggml-cuda/sd-randn.cu
+@@ -0,0 +1,117 @@
++#include "sd-randn.cuh"
++
++#include <math_constants.h>
++
++#define CUDA_SD_RANDN_BLOCK_SIZE 256
++
++static __device__ __forceinline__ void sd_philox4_round(uint32_t counter[4], const uint32_t key[2]) {
++    constexpr uint32_t m0 = 0xD2511F53u;
++    constexpr uint32_t m1 = 0xCD9E8D57u;
++
++    const uint64_t p0 = static_cast<uint64_t>(counter[0]) * static_cast<uint64_t>(m0);
++    const uint64_t p1 = static_cast<uint64_t>(counter[2]) * static_cast<uint64_t>(m1);
++
++    const uint32_t p0_lo = static_cast<uint32_t>(p0 & 0xFFFFFFFFu);
++    const uint32_t p0_hi = static_cast<uint32_t>(p0 >> 32);
++    const uint32_t p1_lo = static_cast<uint32_t>(p1 & 0xFFFFFFFFu);
++    const uint32_t p1_hi = static_cast<uint32_t>(p1 >> 32);
++
++    const uint32_t c0 = p1_hi ^ counter[1] ^ key[0];
++    const uint32_t c1 = p1_lo;
++    const uint32_t c2 = p0_hi ^ counter[3] ^ key[1];
++    const uint32_t c3 = p0_lo;
++
++    counter[0] = c0;
++    counter[1] = c1;
++    counter[2] = c2;
++    counter[3] = c3;
++}
++
++static __device__ __forceinline__ float sd_philox_box_muller(uint32_t x, uint32_t y) {
++    constexpr float two_pow32_inv      = 2.3283064e-10f;
++    constexpr float two_pow32_inv_2pi  = 2.3283064e-10f * 6.2831855f;
++    const float u = static_cast<float>(x) * two_pow32_inv + two_pow32_inv * 0.5f;
++    const float v = static_cast<float>(y) * two_pow32_inv_2pi + two_pow32_inv_2pi * 0.5f;
++    const float s = sqrtf(-2.0f * logf(u));
++    return s * sinf(v);
++}
++
++static __global__ void sd_philox_randn_f32_kernel(float * dst,
++                                                   int64_t n,
++                                                   uint64_t seed,
++                                                   uint32_t offset) {
++    const int64_t i = static_cast<int64_t>(blockDim.x) * blockIdx.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++
++    uint32_t counter[4] = {
++        offset,
++        0u,
++        static_cast<uint32_t>(i),
++        0u,
++    };
++    uint32_t key[2] = {
++        static_cast<uint32_t>(seed & 0xFFFFFFFFu),
++        static_cast<uint32_t>(seed >> 32),
++    };
++
++    constexpr uint32_t w0 = 0x9E3779B9u;
++    constexpr uint32_t w1 = 0xBB67AE85u;
++    for (int round = 0; round < 9; ++round) {
++        sd_philox4_round(counter, key);
++        key[0] += w0;
++        key[1] += w1;
++    }
++    sd_philox4_round(counter, key);
++
++    dst[i] = sd_philox_box_muller(counter[0], counter[1]);
++}
++
++bool ggml_cuda_fill_philox_randn_f32_impl(ggml_tensor * tensor, uint64_t seed, uint32_t offset) {
++    if (tensor == nullptr || tensor->buffer == nullptr || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
++        return false;
++    }
++
++    cudaPointerAttributes attr;
++    cudaError_t err = cudaPointerGetAttributes(&attr, tensor->data);
++    if (err != cudaSuccess) {
++        return false;
++    }
++    const int device =
++#if CUDART_VERSION >= 10000
++        attr.device;
++#else
++        attr.device;
++#endif
++    if (device < 0) {
++        return false;
++    }
++
++    const int64_t n = ggml_nelements(tensor);
++    if (n <= 0) {
++        return false;
++    }
++
++    err = cudaSetDevice(device);
++    if (err != cudaSuccess) {
++        return false;
++    }
++
++    const int64_t num_blocks = (n + CUDA_SD_RANDN_BLOCK_SIZE - 1) / CUDA_SD_RANDN_BLOCK_SIZE;
++    sd_philox_randn_f32_kernel<<<num_blocks, CUDA_SD_RANDN_BLOCK_SIZE, 0, cudaStreamPerThread>>>(
++        static_cast<float *>(tensor->data),
++        n,
++        seed,
++        offset);
++    err = cudaGetLastError();
++    if (err != cudaSuccess) {
++        return false;
++    }
++    err = cudaStreamSynchronize(cudaStreamPerThread);
++    return err == cudaSuccess;
++}
++
++extern "C" bool ggml_backend_cuda_fill_philox_randn_f32(ggml_tensor * tensor, uint64_t seed, uint32_t offset) {
++    return ggml_cuda_fill_philox_randn_f32_impl(tensor, seed, offset);
++}
+diff --git a/src/ggml-cuda/sd-randn.cuh b/src/ggml-cuda/sd-randn.cuh
+new file mode 100644
+index 00000000..1ba56cd0
+--- /dev/null
++++ b/src/ggml-cuda/sd-randn.cuh
+@@ -0,0 +1,5 @@
++#pragma once
++
++#include "common.cuh"
++
++bool ggml_cuda_fill_philox_randn_f32_impl(ggml_tensor * tensor, uint64_t seed, uint32_t offset);
+-- 
+2.51.2.windows.1
+

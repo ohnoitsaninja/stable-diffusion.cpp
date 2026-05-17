@@ -4799,6 +4799,21 @@ static void scale_vae_decode_output_to_image_range(sd::Tensor<float>* tensor) {
     }
 }
 
+static sd::Tensor<float> sd_image_to_vae_rgb_tensor(const sd_image_t& image) {
+    sd::Tensor<float> image_tensor = sd_image_to_tensor(image);
+    if (image_tensor.empty()) {
+        return image_tensor;
+    }
+    if (image_tensor.shape()[2] == 3) {
+        return image_tensor;
+    }
+    if (image_tensor.shape()[2] > 3) {
+        return sd::ops::slice(image_tensor, 2, 0, 3);
+    }
+    LOG_ERROR("VAE encode requires at least RGB input, got %" PRId64 " channel(s)", image_tensor.shape()[2]);
+    return sd::Tensor<float>();
+}
+
 static uint64_t default_im2col_warn_bytes() {
     return 512ull * 1024ull * 1024ull;
 }
@@ -4871,15 +4886,16 @@ static sd_vae_dtype_t resolve_vae_storage_dtype(const sd_vae_run_options_t& opti
         }
         return SD_VAE_DTYPE_F32;
     }
-    const char* vae_dtype_env = std::getenv("SDCPP_VAE_DTYPE");
-    const bool vae_dtype_env_bf16 = vae_dtype_env != nullptr && std::string(vae_dtype_env) == "bf16";
-    if (options.storage_dtype == SD_VAE_DTYPE_BF16 ||
-        vae_dtype_env_bf16 ||
-        StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_VAE_BF16_ACTIVATIONS")) {
+    const bool bf16_explicitly_enabled = StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_VAE_BF16");
+    if (bf16_explicitly_enabled) {
         if (fallback_reason != nullptr) {
             *fallback_reason = "experimental VAE bf16 activation storage enabled for selected intermediate tensors; conv uses bf16 graph I/O with fp32/f16 internal math and final public outputs remain f32";
         }
         return SD_VAE_DTYPE_BF16;
+    }
+    if (options.storage_dtype == SD_VAE_DTYPE_BF16 && fallback_reason != nullptr) {
+        *fallback_reason = "bf16 storage requested but experimental BF16 VAE is disabled; set SDCPP_EXPERIMENTAL_VAE_BF16=1 to opt in";
+        return SD_VAE_DTYPE_F32;
     }
     if (fallback_reason != nullptr) {
         *fallback_reason = "f32 fallback: CUDA group_norm/upscale are f32-only; direct conv follows f32 input; pointwise graph stores f32";
@@ -5390,7 +5406,10 @@ SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
         sd_ctx->sd->vae_tiling_params = *vae_tiling_params;
     }
 
-    sd::Tensor<float> image_tensor = sd_image_to_tensor(*image);
+    sd::Tensor<float> image_tensor = sd_image_to_vae_rgb_tensor(*image);
+    if (image_tensor.empty()) {
+        return nullptr;
+    }
     sd::Tensor<float> latent       = sd_ctx->sd->encode_first_stage(image_tensor);
     if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
         sd_ctx->sd->first_stage_model->free_params_buffer();
@@ -5442,7 +5461,10 @@ SD_API sd_latent_t* sd_encode_image_normal(sd_ctx_t* sd_ctx,
         return nullptr;
     }
     int64_t t0 = ggml_time_ms();
-    sd::Tensor<float> image_tensor = sd_image_to_tensor(*image);
+    sd::Tensor<float> image_tensor = sd_image_to_vae_rgb_tensor(*image);
+    if (image_tensor.empty()) {
+        return nullptr;
+    }
     sd::Tensor<float> latent = encode_image_tensor_normal_internal(sd_ctx,
                                                                    image_tensor,
                                                                    options,
@@ -7080,7 +7102,10 @@ SD_API bool sd_encode_image_normal_gpu(sd_ctx_t* sd_ctx,
         ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
 
         int64_t t0 = ggml_time_ms();
-        sd::Tensor<float> image_tensor = sd_image_to_tensor(*image);
+        sd::Tensor<float> image_tensor = sd_image_to_vae_rgb_tensor(*image);
+        if (image_tensor.empty()) {
+            return false;
+        }
         auto resource = sd_ctx->sd->first_stage_model->encode_to_backend_resource(sd_ctx->sd->n_threads,
                                                                                   image_tensor,
                                                                                   sd_ctx->sd->vae_tiling_params,

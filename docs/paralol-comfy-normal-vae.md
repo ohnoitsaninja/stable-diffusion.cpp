@@ -62,7 +62,7 @@ All VAE option, report, and capability structs include `struct_size`,
 
 - `SDCPP_VAE_NORMAL_MODE=auto|comfy_normal|direct_graph|legacy`
 - `SDCPP_VAE_DTYPE=auto|bf16|f16|f32`
-- `SDCPP_EXPERIMENTAL_VAE_BF16_ACTIVATIONS=1`
+- `SDCPP_EXPERIMENTAL_VAE_BF16=1`
 - `SDCPP_VAE_STRICT_COMFY_NORMAL=1`
 - `SDCPP_TRACE_VAE_STAGES=1`
 - `SDCPP_TRACE_GRAPH_ALLOC=1`
@@ -134,8 +134,7 @@ That path is not wired into COMFY_NORMAL.
 
 The native CUDA parity pass now has an experimental bf16 path behind:
 
-- `SDCPP_EXPERIMENTAL_VAE_BF16_ACTIVATIONS=1`
-- or `SDCPP_VAE_DTYPE=bf16`
+- `SDCPP_EXPERIMENTAL_VAE_BF16=1`
 
 This path keeps the current COMFY_NORMAL semantics, uses bf16 graph storage for
 selected VAE activations, allows bf16 graph input/output through the
@@ -158,7 +157,8 @@ Current SDXL 1024 smoke result versus the correct f32 COMFY_NORMAL baseline:
 
 This is still experimental until the op-level conv parity coverage is expanded
 and the full Comfy parity harness is rerun with the flag enabled. The production
-default remains the f32 COMFY_NORMAL path unless one of the bf16 flags is set.
+default remains the f32 COMFY_NORMAL path unless
+`SDCPP_EXPERIMENTAL_VAE_BF16=1` is set.
 
 ## Paralol Recommendation
 
