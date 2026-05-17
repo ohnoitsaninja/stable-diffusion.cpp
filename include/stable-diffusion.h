@@ -329,6 +329,8 @@ typedef struct sd_vae_capabilities_t {
     uint32_t version;
     bool supports_comfy_normal;
     bool supports_device_resident_stages;
+    // Production-default compact BF16 storage support. Experimental env-gated
+    // BF16 VAE paths intentionally keep this false until promoted.
     bool supports_bf16_storage;
     bool supports_f16_storage;
     bool supports_normal_encode;

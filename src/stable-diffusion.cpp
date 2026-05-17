@@ -4871,6 +4871,16 @@ static sd_vae_dtype_t resolve_vae_storage_dtype(const sd_vae_run_options_t& opti
         }
         return SD_VAE_DTYPE_F32;
     }
+    const char* vae_dtype_env = std::getenv("SDCPP_VAE_DTYPE");
+    const bool vae_dtype_env_bf16 = vae_dtype_env != nullptr && std::string(vae_dtype_env) == "bf16";
+    if (options.storage_dtype == SD_VAE_DTYPE_BF16 ||
+        vae_dtype_env_bf16 ||
+        StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_VAE_BF16_ACTIVATIONS")) {
+        if (fallback_reason != nullptr) {
+            *fallback_reason = "experimental VAE bf16 activation storage enabled for selected intermediate tensors; conv uses bf16 graph I/O with fp32/f16 internal math and final public outputs remain f32";
+        }
+        return SD_VAE_DTYPE_BF16;
+    }
     if (fallback_reason != nullptr) {
         *fallback_reason = "f32 fallback: CUDA group_norm/upscale are f32-only; direct conv follows f32 input; pointwise graph stores f32";
     }

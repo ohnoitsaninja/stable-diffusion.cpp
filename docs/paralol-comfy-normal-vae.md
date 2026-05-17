@@ -62,6 +62,7 @@ All VAE option, report, and capability structs include `struct_size`,
 
 - `SDCPP_VAE_NORMAL_MODE=auto|comfy_normal|direct_graph|legacy`
 - `SDCPP_VAE_DTYPE=auto|bf16|f16|f32`
+- `SDCPP_EXPERIMENTAL_VAE_BF16_ACTIVATIONS=1`
 - `SDCPP_VAE_STRICT_COMFY_NORMAL=1`
 - `SDCPP_TRACE_VAE_STAGES=1`
 - `SDCPP_TRACE_GRAPH_ALLOC=1`
@@ -80,6 +81,10 @@ older CUDA direct conv path. It should be used only for diagnostics.
 When this flag is set, SDXL decode defaults back to the conservative staged
 graph layout instead of the merged decode graph. `SDCPP_VAE_DECODE_TAIL_MERGE`
 can override the stage merge count for diagnostics.
+
+`sd_get_vae_capabilities().supports_bf16_storage` remains `false` while the
+bf16 path is experimental/env-gated. Paralol should not auto-enable bf16 from
+capabilities until that flag is explicitly promoted.
 
 ## Current Numbers
 
@@ -120,16 +125,40 @@ Paralol headless SDXL T2I verification:
 - KSampler: about 6s
 - Latent Decode: about 0.4-0.5s in the fork smoke after scale fusion
 
-## Deferred Work
+## Experimental BF16 Fast Path
 
-Compact bf16/f16 VAE activations are deferred. The current path keeps storage
-at f32 because CUDA group norm, nearest upscale, pointwise graph storage, and
-direct conv dtype plumbing are not yet compact-storage complete.
+Compact f16 VAE activations remain disabled. Isolated f16 storage tests for
+group norm/upscale/pointwise produced plausible per-op diffs, but full-frame SDXL
+VAE decode with f16 intermediate activation storage produced an all-white image.
+That path is not wired into COMFY_NORMAL.
 
-The feasibility pass found that group norm and direct conv are the high-risk
-pieces. The likely realistic memory win is not enough to block Paralol
-integration, so Paralol should productionize COMFY_NORMAL first and revisit
-compact activations on a separate branch.
+The native CUDA parity pass now has an experimental bf16 path behind:
+
+- `SDCPP_EXPERIMENTAL_VAE_BF16_ACTIVATIONS=1`
+- or `SDCPP_VAE_DTYPE=bf16`
+
+This path keeps the current COMFY_NORMAL semantics, uses bf16 graph storage for
+selected VAE activations, allows bf16 graph input/output through the
+implicit-GEMM conv path, keeps fp32 accumulation for normalization, and casts the
+final public image/latent output back to f32 for the existing ABI.
+
+Current SDXL 1024 smoke result versus the correct f32 COMFY_NORMAL baseline:
+
+- decode graph time: about 0.30s
+- decode planned workspace: 1408 MB
+- encode planned workspace: 1104 MB
+- `used_taesd=false`
+- `used_tiling=false`
+- `used_im2col=false`
+- `host_copies=0`
+- mean abs diff: 0.00296
+- p99 abs diff: 0.0196
+- PSNR: 45.15 dB
+- white/flat image check: false
+
+This is still experimental until the op-level conv parity coverage is expanded
+and the full Comfy parity harness is rerun with the flag enabled. The production
+default remains the f32 COMFY_NORMAL path unless one of the bf16 flags is set.
 
 ## Paralol Recommendation
 

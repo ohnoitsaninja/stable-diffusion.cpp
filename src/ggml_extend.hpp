@@ -1712,8 +1712,21 @@ struct GGMLRunnerContext {
     bool conv2d_direct_enabled                    = false;
     bool circular_x_enabled                       = false;
     bool circular_y_enabled                       = false;
+    bool vae_bf16_activations_enabled             = false;
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
 };
+
+__STATIC_INLINE__ ggml_tensor* ggml_vae_maybe_bf16_activation(GGMLRunnerContext* ctx, ggml_tensor* x) {
+    if (ctx != nullptr && ctx->vae_bf16_activations_enabled && x != nullptr && x->type == GGML_TYPE_F32) {
+        return ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_BF16);
+    }
+    return x;
+}
+
+__STATIC_INLINE__ ggml_tensor* ggml_vae_require_f32_for_conv(GGMLRunnerContext* ctx, ggml_tensor* x) {
+    GGML_UNUSED(ctx);
+    return x;
+}
 
 struct GgmlBackendTensorResource {
     ggml_context* ctx = nullptr;
@@ -2039,6 +2052,7 @@ protected:
         node_info largest_im2col{-1, 0, nullptr};
         node_info largest_tensor{-1, 0, nullptr};
         bool used_im2col = false;
+        bool compact_activation_storage = false;
 
         for (int i = 0; i < n_nodes; ++i) {
             const ggml_tensor* node = ggml_graph_node(gf, i);
@@ -2058,6 +2072,9 @@ protected:
             if (node != nullptr && bytes > largest_tensor.bytes) {
                 largest_tensor = {i, bytes, node};
             }
+            if (node != nullptr && bytes > 0 && (node->type == GGML_TYPE_F16 || node->type == GGML_TYPE_BF16)) {
+                compact_activation_storage = true;
+            }
             if (trace_graph && node != nullptr) {
                 auto& op_entry = by_op[ggml_op_name(node->op)];
                 op_entry.first += 1;
@@ -2074,14 +2091,14 @@ protected:
         last_graph_report.stage_count = 1;
         last_graph_report.used_im2col = used_im2col;
         last_graph_report.used_direct_conv = conv2d_direct_enabled;
-        last_graph_report.compact_activation_storage = false;
+        last_graph_report.compact_activation_storage = compact_activation_storage;
         last_graph_report.device_resident_stages = false;
         copy_report_string(last_graph_report.math_dtype_policy,
                            sizeof(last_graph_report.math_dtype_policy),
-                           "storage=f32 math=f32");
+                           compact_activation_storage ? "storage=bf16/f16/f32 math=f32 reductions=f32" : "storage=f32 math=f32");
         copy_report_string(last_graph_report.fallback_reason,
                            sizeof(last_graph_report.fallback_reason),
-                           "ggml CUDA VAE graph still produces f32 activation tensors for conv/groupnorm/upscale/pointwise ops");
+                           compact_activation_storage ? "experimental compact VAE activation graph contains bf16/f16 storage tensors" : "ggml CUDA VAE graph still produces f32 activation tensors for conv/groupnorm/upscale/pointwise ops");
         if (largest_tensor.tensor != nullptr) {
             copy_report_string(last_graph_report.largest_tensor_op,
                                sizeof(last_graph_report.largest_tensor_op),
@@ -2983,22 +3000,25 @@ public:
             forward_params.conv2d.circular_x = ctx->circular_x_enabled;
             forward_params.conv2d.circular_y = ctx->circular_y_enabled;
             forward_params.conv2d.scale      = scale;
-            return ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, x, w, b, prefix, forward_params);
+            ggml_tensor* y = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, x, w, b, prefix, forward_params);
+            return ggml_vae_maybe_bf16_activation(ctx, y);
         }
-        return ggml_ext_conv_2d(ctx->ggml_ctx,
-                                x,
-                                w,
-                                b,
-                                stride.second,
-                                stride.first,
-                                padding.second,
-                                padding.first,
-                                dilation.second,
-                                dilation.first,
-                                ctx->conv2d_direct_enabled,
-                                ctx->circular_x_enabled,
-                                ctx->circular_y_enabled,
-                                scale);
+        ggml_tensor* conv_input = ggml_vae_require_f32_for_conv(ctx, x);
+        ggml_tensor* y = ggml_ext_conv_2d(ctx->ggml_ctx,
+                                          conv_input,
+                                          w,
+                                          b,
+                                          stride.second,
+                                          stride.first,
+                                          padding.second,
+                                          padding.first,
+                                          dilation.second,
+                                          dilation.first,
+                                          ctx->conv2d_direct_enabled,
+                                          ctx->circular_x_enabled,
+                                          ctx->circular_y_enabled,
+                                          scale);
+        return ggml_vae_maybe_bf16_activation(ctx, y);
     }
 };
 
@@ -3154,7 +3174,8 @@ public:
                 b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, b, prefix + "bias");
             }
         }
-        return ggml_ext_group_norm(ctx->ggml_ctx, x, w, b, num_groups);
+        x = ggml_ext_group_norm(ctx->ggml_ctx, x, w, b, num_groups);
+        return ggml_vae_maybe_bf16_activation(ctx, x);
     }
 };
 

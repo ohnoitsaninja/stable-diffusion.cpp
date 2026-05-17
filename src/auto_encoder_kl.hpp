@@ -107,6 +107,7 @@ public:
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
         // x: [N, in_channels, h, w]
+        x = ggml_vae_require_f32_for_conv(ctx, x);
         auto norm     = std::dynamic_pointer_cast<GroupNorm32>(blocks["norm"]);
         auto q_proj   = std::dynamic_pointer_cast<UnaryBlock>(blocks["q"]);
         auto k_proj   = std::dynamic_pointer_cast<UnaryBlock>(blocks["k"]);
@@ -159,7 +160,7 @@ public:
         }
 
         h_ = ggml_add(ctx->ggml_ctx, h_, x);
-        return h_;
+        return ggml_vae_maybe_bf16_activation(ctx, h_);
     }
 };
 
@@ -869,6 +870,15 @@ struct AutoEncoderKL : public VAE {
         comfy_normal_enabled = enabled;
     }
 
+    GGMLRunnerContext get_context() override {
+        auto runner_ctx = VAE::get_context();
+        const char* dtype_env = std::getenv("SDCPP_VAE_DTYPE");
+        const bool dtype_env_bf16 = dtype_env != nullptr && std::string(dtype_env) == "bf16";
+        runner_ctx.vae_bf16_activations_enabled =
+            comfy_normal_enabled && (env_flag_enabled("SDCPP_EXPERIMENTAL_VAE_BF16_ACTIVATIONS") || dtype_env_bf16);
+        return runner_ctx;
+    }
+
     std::string get_desc() override {
         return "vae";
     }
@@ -884,6 +894,9 @@ struct AutoEncoderKL : public VAE {
         auto runner_ctx = get_context();
 
         ggml_tensor* out = decode_graph ? ae.decode(&runner_ctx, z) : ae.encode(&runner_ctx, z);
+        if (runner_ctx.vae_bf16_activations_enabled && out != nullptr && out->type == GGML_TYPE_BF16) {
+            out = ggml_cast(compute_ctx, out, GGML_TYPE_F32);
+        }
 
         ggml_build_forward_expand(gf, out);
 
@@ -897,6 +910,10 @@ struct AutoEncoderKL : public VAE {
         auto runner_ctx = get_context();
         ggml_tensor* out = decode_graph ? ae.decode_stage(&runner_ctx, z, stage)
                                         : ae.encode_stage(&runner_ctx, z, stage);
+        const int final_stage = decode_graph ? ae.decode_stage_count() - 1 : ae.encode_stage_count() - 1;
+        if (runner_ctx.vae_bf16_activations_enabled && stage == final_stage && out != nullptr && out->type == GGML_TYPE_BF16) {
+            out = ggml_cast(compute_ctx, out, GGML_TYPE_F32);
+        }
 
         ggml_build_forward_expand(gf, out);
         return gf;
@@ -907,6 +924,10 @@ struct AutoEncoderKL : public VAE {
         auto runner_ctx = get_context();
         ggml_tensor* out = decode_graph ? ae.decode_stage(&runner_ctx, z, stage)
                                         : ae.encode_stage(&runner_ctx, z, stage);
+        const int final_stage = decode_graph ? ae.decode_stage_count() - 1 : ae.encode_stage_count() - 1;
+        if (runner_ctx.vae_bf16_activations_enabled && stage == final_stage && out != nullptr && out->type == GGML_TYPE_BF16) {
+            out = ggml_cast(compute_ctx, out, GGML_TYPE_F32);
+        }
 
         ggml_build_forward_expand(gf, out);
         return gf;
@@ -921,6 +942,10 @@ struct AutoEncoderKL : public VAE {
             out = decode_graph ? ae.decode_stage(&runner_ctx, out, stage)
                                : ae.encode_stage(&runner_ctx, out, stage);
         }
+        const int final_stage = decode_graph ? ae.decode_stage_count() - 1 : ae.encode_stage_count() - 1;
+        if (runner_ctx.vae_bf16_activations_enabled && last_stage == final_stage && out != nullptr && out->type == GGML_TYPE_BF16) {
+            out = ggml_cast(compute_ctx, out, GGML_TYPE_F32);
+        }
 
         ggml_build_forward_expand(gf, out);
         return gf;
@@ -933,6 +958,10 @@ struct AutoEncoderKL : public VAE {
         for (int stage = first_stage; stage <= last_stage; ++stage) {
             out = decode_graph ? ae.decode_stage(&runner_ctx, out, stage)
                                : ae.encode_stage(&runner_ctx, out, stage);
+        }
+        const int final_stage = decode_graph ? ae.decode_stage_count() - 1 : ae.encode_stage_count() - 1;
+        if (runner_ctx.vae_bf16_activations_enabled && last_stage == final_stage && out != nullptr && out->type == GGML_TYPE_BF16) {
+            out = ggml_cast(compute_ctx, out, GGML_TYPE_F32);
         }
 
         ggml_build_forward_expand(gf, out);
