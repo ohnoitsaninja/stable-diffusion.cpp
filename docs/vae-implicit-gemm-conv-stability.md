@@ -24,6 +24,11 @@ COMFY_NORMAL now scopes implicit-GEMM around VAE encode/decode/estimate by
 default. Use `SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV=1` to force the older direct
 conv path for diagnostics.
 
+The later SDXL VAE scale-fusion pass also removes the paired `scale -> conv ->
+inverse scale` tensors from implicit-GEMM VAE convolutions. That allows the SDXL
+decode stages to run as one merged graph by default while preserving the
+2816 MB workspace guardrail.
+
 ## Files Changed
 
 - `ggml/src/ggml-cuda/conv2d-implicit.cu`
@@ -112,6 +117,19 @@ Result:
 - `host_copies=0`
 - `device_copies=5`
 
+Current default after scale fusion:
+
+- decode: `sd_decode_gpu_latent_normal_gpu completed, taking 0.41s`
+- decode workspace: 2816 MB
+- graphs/stages: 1 / 1
+- `used_im2col=false`
+- `used_tiling=false`
+- `used_taesd=false`
+- `host_copies=0`
+- `device_copies=0`
+- output hash matches the conservative staged fallback:
+  `41DA8D68663DCF31A31B9972EBD4EAC82247A684E61515360B424B88557B29CE`
+
 Direct conv escape hatch:
 
 ```text
@@ -191,7 +209,8 @@ Important examples:
 
 ## Recommendation
 
-Recommendation: **B. keep implicit-GEMM and continue**, but do not make it the default yet.
+Recommendation: **make implicit-GEMM the COMFY_NORMAL CUDA VAE default** and keep
+the explicit escape hatches for diagnostics.
 
 The op-level result is strong:
 
@@ -199,7 +218,10 @@ The op-level result is strong:
 - no NaN/Inf
 - large speedup on every significant VAE conv shape
 - no IM2COL memory blowup
+- full SDXL 1024 decode now passes in the merged COMFY_NORMAL graph at 2816 MB
+  and about 0.41s
 
-The next practical task should not be a cuDNN backend. It should be to isolate the decode-stage hard stop that reproduces even when implicit-GEMM is disabled. The most likely next target is the first decode graph outside conv2d, especially the attention `MUL_MAT` / `SOFT_MAX` region or the current `sd-latent-smoke` latent/decode handoff.
-
-Once that independent full-decode issue is resolved, implicit-GEMM should be retested as the default CUDA `CONV_2D` backend for COMFY_NORMAL.
+The remaining gap to ComfyUI is no longer the old 2x VAE decode wall. Further
+work should focus on compact bf16/f16 activation storage or a broader CUDA
+kernel backend, not on reintroducing tiled VAE, TAESD, IM2COL, or a custom
+cuDNN-only decoder.

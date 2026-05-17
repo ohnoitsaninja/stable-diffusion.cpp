@@ -39,6 +39,10 @@ struct BenchCase {
     int groups  = 32;
     bool direct = true;
     bool implicit = false;
+    bool weight_f16 = false;
+    bool scaled_ref = false;
+    bool fused_scale = false;
+    float conv_scale = 1.0f;
 };
 
 struct BenchResult {
@@ -193,7 +197,8 @@ static BuiltGraph build_graph_for_case(ggml_context* ctx, const BenchCase& bench
     built.inputs.push_back(x);
 
     if (bench.op == "conv2d_direct" || bench.op == "conv2d_implicit" || bench.op == "conv2d_legacy") {
-        ggml_tensor* w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, bench.k, bench.k, bench.c, bench.out_c);
+        const ggml_type weight_type = bench.weight_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        ggml_tensor* w = ggml_new_tensor_4d(ctx, weight_type, bench.k, bench.k, bench.c, bench.out_c);
         ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, bench.out_c);
         ggml_set_name(w, "weight");
         ggml_set_name(b, "bias");
@@ -201,8 +206,18 @@ static BuiltGraph build_graph_for_case(ggml_context* ctx, const BenchCase& bench
         ggml_set_input(b);
         built.inputs.push_back(w);
         built.inputs.push_back(b);
-        ggml_tensor* y = bench.direct ? ggml_conv_2d_direct(ctx, w, x, 1, 1, 1, 1, 1, 1)
-                                      : ggml_conv_2d(ctx, w, x, 1, 1, 1, 1, 1, 1);
+        ggml_tensor* conv_input = x;
+        if (bench.scaled_ref && bench.conv_scale != 1.0f) {
+            conv_input = ggml_scale(ctx, conv_input, bench.conv_scale);
+        }
+        ggml_tensor* y = bench.direct ? ggml_conv_2d_direct(ctx, w, conv_input, 1, 1, 1, 1, 1, 1)
+                                      : ggml_conv_2d(ctx, w, conv_input, 1, 1, 1, 1, 1, 1);
+        if (bench.fused_scale && bench.conv_scale != 1.0f) {
+            reinterpret_cast<float*>(y->op_params)[6] = bench.conv_scale;
+        }
+        if (bench.scaled_ref && bench.conv_scale != 1.0f) {
+            y = ggml_scale(ctx, y, 1.0f / bench.conv_scale);
+        }
         b = ggml_reshape_4d(ctx, b, 1, 1, bench.out_c, 1);
         y = ggml_add_inplace(ctx, y, b);
         ggml_set_name(y, "output");
@@ -253,7 +268,7 @@ static float deterministic_value(uint64_t i, uint64_t salt, float scale) {
 }
 
 static void fill_input_tensor(ggml_tensor* tensor) {
-    if (tensor->type != GGML_TYPE_F32) {
+    if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16) {
         return;
     }
     const int64_t n = ggml_nelements(tensor);
@@ -274,7 +289,13 @@ static void fill_input_tensor(ggml_tensor* tensor) {
     for (int64_t i = 0; i < n; ++i) {
         data[static_cast<size_t>(i)] = deterministic_value(static_cast<uint64_t>(i), salt, scale);
     }
-    ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(float));
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> data_f16(static_cast<size_t>(n));
+        ggml_fp32_to_fp16_row(data.data(), data_f16.data(), n);
+        ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size() * sizeof(ggml_fp16_t));
+    } else {
+        ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(float));
+    }
 }
 
 static BenchResult run_case(ggml_backend_t backend, const BenchCase& bench, const Args& args, bool capture_output = false) {
@@ -490,6 +511,79 @@ static CorrectnessResult compare_conv_case(ggml_backend_t backend, const BenchCa
     return result;
 }
 
+static CorrectnessResult compare_scaled_conv_case(ggml_backend_t backend, const BenchCase& base_case, const Args& args) {
+    CorrectnessResult result;
+    result.bench = base_case;
+
+    BenchCase reference = base_case;
+    reference.name = "scaled_ref_" + base_case.name;
+    reference.op = "conv2d_direct";
+    reference.direct = true;
+    reference.implicit = true;
+    reference.weight_f16 = true;
+    reference.scaled_ref = true;
+    reference.fused_scale = false;
+
+    BenchCase fused = base_case;
+    fused.name = "fused_scale_" + base_case.name;
+    fused.op = "conv2d_implicit";
+    fused.direct = true;
+    fused.implicit = true;
+    fused.weight_f16 = true;
+    fused.scaled_ref = false;
+    fused.fused_scale = true;
+
+    Args local_args = args;
+    local_args.warmup = std::min(args.warmup, 1);
+    local_args.iterations = std::min(args.iterations, 3);
+
+    result.direct = run_case(backend, reference, local_args, true);
+    result.implicit = run_case(backend, fused, local_args, true);
+    if (result.direct.status != "ok" || result.implicit.status != "ok") {
+        result.status = "error";
+        result.error = "scaled reference or fused implicit run failed";
+        return result;
+    }
+    if (result.direct.output.size() != result.implicit.output.size() || result.direct.output.empty()) {
+        result.status = "error";
+        result.error = "output size mismatch or empty output";
+        return result;
+    }
+
+    result.direct_hash = fnv1a_bytes(result.direct.output);
+    result.implicit_hash = fnv1a_bytes(result.implicit.output);
+    fill_value_stats(result.direct.output, result.direct_min, result.direct_max, result.direct_mean, result.direct_nan_inf);
+    fill_value_stats(result.implicit.output, result.implicit_min, result.implicit_max, result.implicit_mean, result.implicit_nan_inf);
+
+    const size_t n = result.direct.output.size();
+    const size_t max_samples = 1000000;
+    const size_t stride = std::max<size_t>(1, n / max_samples);
+    std::vector<double> sampled_diffs;
+    sampled_diffs.reserve(std::min(max_samples, n));
+    long double sum_abs = 0.0;
+    double max_abs = 0.0;
+    uint64_t valid_count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float a = result.direct.output[i];
+        const float b = result.implicit.output[i];
+        if (!std::isfinite(a) || !std::isfinite(b)) {
+            continue;
+        }
+        const double diff = std::abs(static_cast<double>(a) - static_cast<double>(b));
+        sum_abs += diff;
+        max_abs = std::max(max_abs, diff);
+        ++valid_count;
+        if ((i % stride) == 0) {
+            sampled_diffs.push_back(diff);
+        }
+    }
+    result.mean_abs_diff = valid_count == 0 ? 0.0 : static_cast<double>(sum_abs / valid_count);
+    result.max_abs_diff = max_abs;
+    result.p95_abs_diff = percentile(sampled_diffs, 0.95);
+    result.p99_abs_diff = percentile(sampled_diffs, 0.99);
+    return result;
+}
+
 static std::vector<BenchCase> make_conv_correctness_cases() {
     return {
         {"decode_stage1_4c_to_512_128", "conv2d_direct", 128, 128, 4, 512, 3, 32, true, false},
@@ -500,6 +594,18 @@ static std::vector<BenchCase> make_conv_correctness_cases() {
         {"decode_stage4_256c_1024", "conv2d_direct", 1024, 1024, 256, 256, 3, 32, true, false},
         {"decode_256c_to_128_1024", "conv2d_direct", 1024, 1024, 256, 128, 3, 32, true, false},
         {"decode_stage5_128c_1024", "conv2d_direct", 1024, 1024, 128, 128, 3, 32, true, false},
+    };
+}
+
+static std::vector<BenchCase> make_scaled_conv_correctness_cases() {
+    constexpr float sdxl_vae_scale = 1.0f / 32.0f;
+    return {
+        {"scaled_decode_stage1_4c_to_512_128", "conv2d_direct", 128, 128, 4, 512, 3, 32, true, false, true, false, false, sdxl_vae_scale},
+        {"scaled_decode_1x1_512c_128", "conv2d_direct", 128, 128, 512, 512, 1, 32, true, false, true, false, false, sdxl_vae_scale},
+        {"scaled_decode_mid_512c_256", "conv2d_direct", 256, 256, 512, 512, 3, 32, true, false, true, false, false, sdxl_vae_scale},
+        {"scaled_decode_512c_to_256_512", "conv2d_direct", 512, 512, 512, 256, 3, 32, true, false, true, false, false, sdxl_vae_scale},
+        {"scaled_decode_256c_to_128_1024", "conv2d_direct", 1024, 1024, 256, 128, 3, 32, true, false, true, false, false, sdxl_vae_scale},
+        {"scaled_decode_stage5_128c_1024", "conv2d_direct", 1024, 1024, 128, 128, 3, 32, true, false, true, false, false, sdxl_vae_scale},
     };
 }
 
@@ -639,6 +745,22 @@ int main(int argc, char** argv) {
             std::cout << "  status=" << result.status
                       << " direct_ms=" << result.direct.median_ms
                       << " implicit_ms=" << result.implicit.median_ms
+                      << " mean_abs=" << result.mean_abs_diff
+                      << " p99_abs=" << result.p99_abs_diff
+                      << " max_abs=" << result.max_abs_diff
+                      << " nan_inf=" << (result.direct_nan_inf + result.implicit_nan_inf)
+                      << "\n";
+            if (!result.error.empty()) {
+                std::cout << "  error=" << result.error << "\n";
+            }
+            correctness_results.push_back(std::move(result));
+        }
+        for (const auto& bench : make_scaled_conv_correctness_cases()) {
+            std::cout << "checking " << bench.name << "\n";
+            CorrectnessResult result = compare_scaled_conv_case(backend, bench, args);
+            std::cout << "  status=" << result.status
+                      << " ref_ms=" << result.direct.median_ms
+                      << " fused_ms=" << result.implicit.median_ms
                       << " mean_abs=" << result.mean_abs_diff
                       << " p99_abs=" << result.p99_abs_diff
                       << " max_abs=" << result.max_abs_diff

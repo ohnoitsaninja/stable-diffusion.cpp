@@ -23,8 +23,9 @@ The mode uses:
 - no tiled VAE
 - no legacy IM2COL
 - CUDA implicit-GEMM convolution for COMFY_NORMAL VAE by default
-- stage-scoped graphs
-- CUDA device-resident stage boundaries
+- SDXL decode scale fusion inside the implicit-GEMM conv kernel
+- a merged SDXL decode graph by default when scale fusion is active
+- CUDA device-resident graph boundaries when staging is required
 - ABI-safe public C APIs with memory reports and capability discovery
 
 `SD_VAE_EXEC_AUTO` selects `COMFY_NORMAL` for CUDA SDXL VAE contexts. Other
@@ -66,12 +67,19 @@ All VAE option, report, and capability structs include `struct_size`,
 - `SDCPP_TRACE_GRAPH_ALLOC=1`
 - `SDCPP_DISABLE_COMFY_NORMAL_VAE=1`
 - `SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV=1`
+- `SDCPP_DISABLE_VAE_FUSE_CONV_SCALE=1`
+- `SDCPP_VAE_DECODE_TAIL_MERGE=<stage-count>`
 
 Strict mode fails or loudly reports if COMFY_NORMAL enters tiled VAE, TAESD,
 IM2COL, host stage copies, or a workspace regression beyond the staged baseline.
 
 `SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV=1` is the escape hatch for forcing the
 older CUDA direct conv path. It should be used only for diagnostics.
+
+`SDCPP_DISABLE_VAE_FUSE_CONV_SCALE=1` disables the SDXL VAE scale-fusion path.
+When this flag is set, SDXL decode defaults back to the conservative staged
+graph layout instead of the merged decode graph. `SDCPP_VAE_DECODE_TAIL_MERGE`
+can override the stage merge count for diagnostics.
 
 ## Current Numbers
 
@@ -83,6 +91,7 @@ Measured on SDXL 1024 with the embedded checkpoint VAE:
 | Direct monolithic decode | 3840.25 MB |
 | COMFY_NORMAL staged decode, direct conv | 2816 MB, ~11.9s |
 | COMFY_NORMAL staged decode, implicit-GEMM conv | 2816 MB, ~0.8s |
+| COMFY_NORMAL merged decode, implicit-GEMM + scale fusion | 2816 MB, ~0.41s |
 | COMFY_NORMAL staged encode, implicit-GEMM conv | 1536 MB, ~0.7s |
 | Comfy normal reference | 2371.94 MiB allocated / 3328 MiB reserved |
 
@@ -99,7 +108,7 @@ COMFY_NORMAL reports:
 - `used_im2col=false`
 - `used_direct_conv=true`
 - `stage_boundary_host_copies=0`
-- `stage_boundary_device_copies=5`
+- `stage_boundary_device_copies=0` for the default merged SDXL decode graph
 
 Paralol headless SDXL T2I verification:
 
@@ -109,7 +118,7 @@ Paralol headless SDXL T2I verification:
 - output: `F:\Paralol\build\generated\sd_t2i_comfy_normal_test.bmp`
 - result: `scenario_pass`
 - KSampler: about 6s
-- Latent Decode: about 1s
+- Latent Decode: about 0.4-0.5s in the fork smoke after scale fusion
 
 ## Deferred Work
 

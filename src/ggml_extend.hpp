@@ -1139,7 +1139,20 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
                                                 bool circular_x = false,
                                                 bool circular_y = false,
                                                 float scale     = 1.f) {
-    if (scale != 1.f) {
+    const char* vae_implicit_env = std::getenv("SDCPP_EXPERIMENTAL_VAE_IMPLICIT_GEMM_CONV");
+    const char* disable_fuse_scale_env = std::getenv("SDCPP_DISABLE_VAE_FUSE_CONV_SCALE");
+    const bool vae_implicit_conv_requested =
+        vae_implicit_env != nullptr && vae_implicit_env[0] != '\0' && vae_implicit_env[0] != '0';
+    const bool fuse_scale_disabled =
+        disable_fuse_scale_env != nullptr && disable_fuse_scale_env[0] != '\0' && disable_fuse_scale_env[0] != '0';
+    const bool fuse_conv_scale =
+        direct &&
+        vae_implicit_conv_requested &&
+        !fuse_scale_disabled &&
+        scale != 1.f &&
+        w->type == GGML_TYPE_F16;
+
+    if (scale != 1.f && !fuse_conv_scale) {
         x = ggml_ext_scale(ctx, x, scale);
     }
     if (w->ne[2] != x->ne[2] && ggml_n_dims(w) == 2) {
@@ -1154,10 +1167,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
 
     if (direct) {
         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
+        if (fuse_conv_scale) {
+            reinterpret_cast<float*>(x->op_params)[6] = scale;
+        }
     } else {
         x = ggml_conv_2d(ctx, w, x, s0, s1, p0, p1, d0, d1);
     }
-    if (scale != 1.f) {
+    if (scale != 1.f && !fuse_conv_scale) {
         x = ggml_ext_scale(ctx, x, 1.f / scale);
     }
     if (b != nullptr) {

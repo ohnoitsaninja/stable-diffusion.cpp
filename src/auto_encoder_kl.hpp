@@ -3,7 +3,9 @@
 
 #include "vae.hpp"
 
+#include <cstdlib>
 #include <limits>
+#include <utility>
 
 /*================================================== AutoEncoderKL ===================================================*/
 
@@ -910,6 +912,91 @@ struct AutoEncoderKL : public VAE {
         return gf;
     }
 
+    ggml_cgraph* build_stage_range_graph(const sd::Tensor<float>& z_tensor, bool decode_graph, int first_stage, int last_stage) {
+        ggml_cgraph* gf = ggml_new_graph(compute_ctx);
+        ggml_tensor* out = make_input(z_tensor);
+
+        auto runner_ctx = get_context();
+        for (int stage = first_stage; stage <= last_stage; ++stage) {
+            out = decode_graph ? ae.decode_stage(&runner_ctx, out, stage)
+                               : ae.encode_stage(&runner_ctx, out, stage);
+        }
+
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    ggml_cgraph* build_stage_range_graph(ggml_tensor* z, bool decode_graph, int first_stage, int last_stage) {
+        ggml_cgraph* gf = ggml_new_graph(compute_ctx);
+        auto runner_ctx = get_context();
+        ggml_tensor* out = z;
+        for (int stage = first_stage; stage <= last_stage; ++stage) {
+            out = decode_graph ? ae.decode_stage(&runner_ctx, out, stage)
+                               : ae.encode_stage(&runner_ctx, out, stage);
+        }
+
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    static int env_int_or_default(const char* name, int fallback) {
+        const char* value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0') {
+            return fallback;
+        }
+        char* end = nullptr;
+        long parsed = std::strtol(value, &end, 10);
+        if (end == value) {
+            return fallback;
+        }
+        return static_cast<int>(parsed);
+    }
+
+    std::vector<std::pair<int, int>> stage_ranges(bool decode_graph) {
+        const int stages = decode_graph ? ae.decode_stage_count() : ae.encode_stage_count();
+        int merge_tail = 1;
+        if (decode_graph && comfy_normal_enabled) {
+            const char* disable_fuse_scale_env = std::getenv("SDCPP_DISABLE_VAE_FUSE_CONV_SCALE");
+            const bool fuse_scale_disabled = disable_fuse_scale_env != nullptr &&
+                                             disable_fuse_scale_env[0] != '\0' &&
+                                             disable_fuse_scale_env[0] != '0';
+            const int default_merge_tail = sd_version_is_sdxl(version) && !fuse_scale_disabled ? stages : 1;
+            merge_tail = env_int_or_default("SDCPP_VAE_DECODE_TAIL_MERGE", default_merge_tail);
+        }
+        merge_tail = std::max(1, std::min(merge_tail, stages));
+
+        std::vector<std::pair<int, int>> ranges;
+        const int split = stages - merge_tail;
+        for (int stage = 0; stage < split; ++stage) {
+            ranges.push_back({stage, stage});
+        }
+        ranges.push_back({split, stages - 1});
+        return ranges;
+    }
+
+    void log_stage_timing_if_enabled(bool decode_graph,
+                                     size_t graph_index,
+                                     const std::pair<int, int>& range,
+                                     const sd_vae_memory_report_t& report,
+                                     int64_t elapsed_ms,
+                                     const char* path) {
+        if (!env_flag_enabled("SDCPP_TRACE_VAE_TIMING")) {
+            return;
+        }
+        LOG_INFO("[VAE] COMFY_NORMAL %s %s graph=%zu stage_range=%d-%d total_ms=%" PRId64 " workspace=%.2fMB largest=%.2fMB op=%s type=%s shape=%s",
+                 decode_graph ? "decode" : "encode",
+                 path == nullptr ? "stage" : path,
+                 graph_index,
+                 range.first,
+                 range.second,
+                 elapsed_ms,
+                 report.planned_workspace_bytes / 1024.0 / 1024.0,
+                 report.largest_tensor_bytes / 1024.0 / 1024.0,
+                 report.largest_tensor_op,
+                 report.largest_tensor_type,
+                 report.largest_tensor_shape);
+    }
+
     void prepare_flux2_diffusion_to_vae_inputs() {
         if (diffusion_to_vae_flux2_mean_input.size() == 128 &&
             diffusion_to_vae_flux2_std_scaled_input.size() == 128) {
@@ -1086,24 +1173,28 @@ struct AutoEncoderKL : public VAE {
                                       const sd::Tensor<float>& z,
                                       bool decode_graph) {
         GGML_ASSERT(!decode_only || decode_graph);
-        const int stages = decode_graph ? ae.decode_stage_count() : ae.encode_stage_count();
+        const auto ranges = stage_ranges(decode_graph);
         std::unique_ptr<BackendTensorHandle> current;
         sd_vae_memory_report_t aggregate = {};
         aggregate.used_direct_conv = conv2d_direct_enabled;
-        for (int stage = 0; stage < stages; ++stage) {
+        for (size_t graph_index = 0; graph_index < ranges.size(); ++graph_index) {
+            const auto range = ranges[graph_index];
             auto get_graph = [&]() -> ggml_cgraph* {
-                if (stage == 0) {
-                    return build_stage_graph(z, decode_graph, stage);
+                if (graph_index == 0) {
+                    return build_stage_range_graph(z, decode_graph, range.first, range.second);
                 }
-                return build_stage_graph(current->tensor, decode_graph, stage);
+                return build_stage_range_graph(current->tensor, decode_graph, range.first, range.second);
             };
+            int64_t stage_t0 = ggml_time_ms();
             auto stage_output = compute_to_backend_handle(get_graph, n_threads, "vae_comfy_normal_stage");
             sd_vae_memory_report_t stage_report = get_last_graph_report();
+            int64_t stage_t1 = ggml_time_ms();
+            log_stage_timing_if_enabled(decode_graph, graph_index, range, stage_report, stage_t1 - stage_t0, "cpu-output");
             merge_stage_report(&aggregate, stage_report);
             if (stage_output == nullptr || stage_output->empty()) {
                 return {};
             }
-            record_stage_output(&aggregate, stage, stage_output.get(), stage > 0);
+            record_stage_output(&aggregate, static_cast<int>(graph_index), stage_output.get(), graph_index > 0);
             current = std::move(stage_output);
         }
         aggregate.device_resident_stages = aggregate.stage_boundary_host_copies == 0 && !ggml_backend_buffer_is_host(current->buffer);
@@ -1120,21 +1211,25 @@ struct AutoEncoderKL : public VAE {
                                                                         const sd::Tensor<float>& z,
                                                                         bool decode_graph) {
         GGML_ASSERT(!decode_only || decode_graph);
-        const int stages = decode_graph ? ae.decode_stage_count() : ae.encode_stage_count();
+        const auto ranges = stage_ranges(decode_graph);
         std::unique_ptr<BackendTensorHandle> current;
         std::unique_ptr<GgmlBackendTensorResource> final_resource;
         sd_vae_memory_report_t aggregate = {};
         aggregate.used_direct_conv = conv2d_direct_enabled;
-        for (int stage = 0; stage < stages; ++stage) {
+        for (size_t graph_index = 0; graph_index < ranges.size(); ++graph_index) {
+            const auto range = ranges[graph_index];
             auto get_graph = [&]() -> ggml_cgraph* {
-                if (stage == 0) {
-                    return build_stage_graph(z, decode_graph, stage);
+                if (graph_index == 0) {
+                    return build_stage_range_graph(z, decode_graph, range.first, range.second);
                 }
-                return build_stage_graph(current->tensor, decode_graph, stage);
+                return build_stage_range_graph(current->tensor, decode_graph, range.first, range.second);
             };
-            if (stage + 1 == stages) {
+            int64_t stage_t0 = ggml_time_ms();
+            if (graph_index + 1 == ranges.size()) {
                 final_resource = compute_to_backend_resource_handle(get_graph, n_threads, "vae_comfy_normal_gpu_output");
                 sd_vae_memory_report_t stage_report = get_last_graph_report();
+                int64_t stage_t1 = ggml_time_ms();
+                log_stage_timing_if_enabled(decode_graph, graph_index, range, stage_report, stage_t1 - stage_t0, "gpu-output");
                 merge_stage_report(&aggregate, stage_report);
                 if (final_resource == nullptr || final_resource->empty()) {
                     return nullptr;
@@ -1142,17 +1237,19 @@ struct AutoEncoderKL : public VAE {
                 BackendTensorHandle final_view;
                 final_view.tensor = final_resource->tensor;
                 final_view.buffer = final_resource->buffer;
-                record_stage_output(&aggregate, stage, &final_view, stage > 0);
+                record_stage_output(&aggregate, static_cast<int>(graph_index), &final_view, graph_index > 0);
                 final_view.tensor = nullptr;
                 final_view.buffer = nullptr;
             } else {
                 auto stage_output = compute_to_backend_handle(get_graph, n_threads, "vae_comfy_normal_stage");
                 sd_vae_memory_report_t stage_report = get_last_graph_report();
+                int64_t stage_t1 = ggml_time_ms();
+                log_stage_timing_if_enabled(decode_graph, graph_index, range, stage_report, stage_t1 - stage_t0, "stage");
                 merge_stage_report(&aggregate, stage_report);
                 if (stage_output == nullptr || stage_output->empty()) {
                     return nullptr;
                 }
-                record_stage_output(&aggregate, stage, stage_output.get(), stage > 0);
+                record_stage_output(&aggregate, static_cast<int>(graph_index), stage_output.get(), graph_index > 0);
                 current = std::move(stage_output);
             }
         }
@@ -1173,21 +1270,25 @@ struct AutoEncoderKL : public VAE {
                                                                                            ggml_tensor* z,
                                                                                            bool decode_graph) {
         GGML_ASSERT(!decode_only || decode_graph);
-        const int stages = decode_graph ? ae.decode_stage_count() : ae.encode_stage_count();
+        const auto ranges = stage_ranges(decode_graph);
         std::unique_ptr<BackendTensorHandle> current;
         std::unique_ptr<GgmlBackendTensorResource> final_resource;
         sd_vae_memory_report_t aggregate = {};
         aggregate.used_direct_conv = conv2d_direct_enabled;
-        for (int stage = 0; stage < stages; ++stage) {
+        for (size_t graph_index = 0; graph_index < ranges.size(); ++graph_index) {
+            const auto range = ranges[graph_index];
             auto get_graph = [&]() -> ggml_cgraph* {
-                if (stage == 0) {
-                    return build_stage_graph(z, decode_graph, stage);
+                if (graph_index == 0) {
+                    return build_stage_range_graph(z, decode_graph, range.first, range.second);
                 }
-                return build_stage_graph(current->tensor, decode_graph, stage);
+                return build_stage_range_graph(current->tensor, decode_graph, range.first, range.second);
             };
-            if (stage + 1 == stages) {
+            int64_t stage_t0 = ggml_time_ms();
+            if (graph_index + 1 == ranges.size()) {
                 final_resource = compute_to_backend_resource_handle(get_graph, n_threads, "vae_comfy_normal_gpu_output");
                 sd_vae_memory_report_t stage_report = get_last_graph_report();
+                int64_t stage_t1 = ggml_time_ms();
+                log_stage_timing_if_enabled(decode_graph, graph_index, range, stage_report, stage_t1 - stage_t0, "gpu-output");
                 merge_stage_report(&aggregate, stage_report);
                 if (final_resource == nullptr || final_resource->empty()) {
                     return nullptr;
@@ -1195,17 +1296,19 @@ struct AutoEncoderKL : public VAE {
                 BackendTensorHandle final_view;
                 final_view.tensor = final_resource->tensor;
                 final_view.buffer = final_resource->buffer;
-                record_stage_output(&aggregate, stage, &final_view, stage > 0);
+                record_stage_output(&aggregate, static_cast<int>(graph_index), &final_view, graph_index > 0);
                 final_view.tensor = nullptr;
                 final_view.buffer = nullptr;
             } else {
                 auto stage_output = compute_to_backend_handle(get_graph, n_threads, "vae_comfy_normal_stage");
                 sd_vae_memory_report_t stage_report = get_last_graph_report();
+                int64_t stage_t1 = ggml_time_ms();
+                log_stage_timing_if_enabled(decode_graph, graph_index, range, stage_report, stage_t1 - stage_t0, "stage");
                 merge_stage_report(&aggregate, stage_report);
                 if (stage_output == nullptr || stage_output->empty()) {
                     return nullptr;
                 }
-                record_stage_output(&aggregate, stage, stage_output.get(), stage > 0);
+                record_stage_output(&aggregate, static_cast<int>(graph_index), stage_output.get(), graph_index > 0);
                 current = std::move(stage_output);
             }
         }

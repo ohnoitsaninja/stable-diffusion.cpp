@@ -161,7 +161,18 @@ Captured logs:
 - `build/vae-speed/implicit_decode_smoke.stdout.log`
 - `build/vae-speed/implicit_decode_smoke.stderr.log`
 
-Because the full decode did not complete, this prototype does not yet meet the full COMFY_NORMAL acceptance target.
+Later stability and scale-fusion work resolved the full-decode issue. Current
+default COMFY_NORMAL SDXL 1024 decode uses implicit-GEMM with fused SDXL VAE
+conv scale, runs as a merged graph, and reports:
+
+- decode: `sd_decode_gpu_latent_normal_gpu completed, taking 0.41s`
+- workspace: 2816 MB
+- graphs/stages: 1 / 1
+- `used_im2col=false`
+- `used_tiling=false`
+- `used_taesd=false`
+- `host_copies=0`
+- `device_copies=0`
 
 ## Decision
 
@@ -171,12 +182,7 @@ Implicit-GEMM is worth continuing and should be preferred before returning to cu
 - 1024x1024x128: about 3.9x slower than PyTorch BF16 channels-last.
 - Memory stays at the direct-conv footprint, not the IM2COL footprint.
 
-Do not replace production COMFY_NORMAL yet. The next task should be correctness/stability for full graph execution:
-
-1. Add nonzero deterministic input/weight initialization and sampled output diff to `sd-vae-op-bench`.
-2. Compare implicit vs direct on every VAE decode conv shape, including 1x1 and 3x3 variants.
-3. Add CUDA error checks after `ggml_cuda_op_conv2d_implicit`.
-4. Narrow the full-decode crash to a specific conv node or post-conv consumer.
-5. Only after full decode passes, wire this as the COMFY_NORMAL default CUDA conv backend.
+Implicit-GEMM is now the production COMFY_NORMAL CUDA VAE conv backend, with
+`SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV=1` as the direct-conv escape hatch.
 
 cuDNN is not needed yet. CUTLASS remains a backup if the upstream implicit-GEMM path cannot be made graph-stable.
