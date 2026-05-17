@@ -306,7 +306,12 @@ Refused now:
   model families such as Anima
 
 The complete all-GPU KSampler project is still a broader sampler backend
-refactor: init-latent sampling, non-Euler samplers, flow denoisers, ControlNet,
-and model-family-specific paths still need backend tensor/resource variants
-instead of `sd::Tensor<float>` host values. The concrete blocker map is in
-`docs/paralol-true-gpu-sampler-plan.md`.
+refactor. The env-gated SDXL/SD1 T2I Euler backend path now keeps sampler state
+as backend tensors and uses implicit-GEMM direct diffusion conv by default, with
+`SDCPP_DISABLE_GPU_EULER_DIFFUSION_IMPLICIT_GEMM_CONV=1` as an escape hatch.
+Explicit batch CFG is available only for investigation with
+`SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG=1`; it is not the default because the
+current batch-2 UNet graph is not consistently faster. Init-latent sampling,
+non-Euler samplers, flow denoisers, ControlNet, and model-family-specific paths
+still need backend tensor/resource variants instead of `sd::Tensor<float>` host
+values. The concrete blocker map is in `docs/paralol-true-gpu-sampler-plan.md`.

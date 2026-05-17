@@ -36,6 +36,7 @@ struct Args {
     bool skip_estimate = false;
     bool split_decode_context = false;
     bool vae_conv_direct = false;
+    bool diffusion_conv_direct = false;
     bool disable_default_vae_conv_direct = false;
     bool type_f16 = false;
     bool gpu_sample_output = false;
@@ -83,6 +84,7 @@ static void usage(const char* argv0) {
         << "  --width <int>            optional target width for sample/decode path\n"
         << "  --height <int>           optional target height for sample/decode path\n"
         << "  --vae-conv-direct        enable direct VAE convolution\n"
+        << "  --diffusion-conv-direct  enable direct diffusion-model convolution\n"
         << "  --disable-default-vae-conv-direct disable CUDA SDXL default direct VAE convolution\n"
         << "  --type-f16               request f16 model tensor conversion\n"
         << "  --sample                 run sd_sample_latent after encode\n"
@@ -199,6 +201,8 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.height = std::atoi(value);
         } else if (arg == "--vae-conv-direct") {
             args.vae_conv_direct = true;
+        } else if (arg == "--diffusion-conv-direct") {
+            args.diffusion_conv_direct = true;
         } else if (arg == "--disable-default-vae-conv-direct") {
             args.disable_default_vae_conv_direct = true;
         } else if (arg == "--type-f16") {
@@ -319,6 +323,7 @@ static sd_ctx_t* create_context(const Args& args, bool vae_decode_only) {
     ctx_params.llm_path              = args.llm.empty() ? nullptr : args.llm.c_str();
     ctx_params.vae_decode_only       = vae_decode_only;
     ctx_params.diffusion_flash_attn  = true;
+    ctx_params.diffusion_conv_direct = args.diffusion_conv_direct;
     ctx_params.vae_conv_direct       = args.vae_conv_direct;
     ctx_params.tae_preview_only      = args.preview_tae && !args.taesd.empty();
     ctx_params.wtype                 = args.type_f16 ? SD_TYPE_F16 : SD_TYPE_COUNT;

@@ -1429,7 +1429,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if (!ggml_backend_supports_op(backend, kqv)) {
                 kqv = nullptr;
             } else {
-                kqv = ggml_view_3d(ctx, kqv, d_head, n_head, L_q, kqv->nb[1], kqv->nb[2], 0);
+                if (N == 1) {
+                    kqv = ggml_view_3d(ctx, kqv, d_head, n_head, L_q, kqv->nb[1], kqv->nb[2], 0);
+                } else {
+                    ggml_tensor* kqv_by_head_batch = ggml_view_4d(ctx,
+                                                                   kqv,
+                                                                   d_head,
+                                                                   n_head,
+                                                                   N,
+                                                                   L_q,
+                                                                   kqv->nb[1],
+                                                                   kqv->nb[1] * n_head,
+                                                                   kqv->nb[2],
+                                                                   0);
+                    kqv = ggml_permute(ctx, kqv_by_head_batch, 0, 1, 3, 2);
+                }
             }
         }
     }
@@ -2664,6 +2678,10 @@ public:
 
     void set_conv2d_direct_enabled(bool enabled) {
         conv2d_direct_enabled = enabled;
+    }
+
+    bool get_conv2d_direct_enabled() const {
+        return conv2d_direct_enabled;
     }
 
     void set_circular_axes(bool circular_x, bool circular_y) {
