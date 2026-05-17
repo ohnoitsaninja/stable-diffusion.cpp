@@ -377,6 +377,7 @@ enum sd_gpu_resource_flags_t {
     SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD = 1u << 3,
     SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_DOWNLOAD = 1u << 4,
     SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT = 1u << 5,
+    SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE = 1u << 6,
 };
 
 typedef struct sd_gpu_device_info_t {
@@ -435,7 +436,11 @@ typedef struct sd_gpu_capabilities_t {
     bool supports_cuda_pointer_borrow;
     bool supports_cuda_ipc_export;
     bool supports_external_memory_interop;
-    uint32_t reserved[9];
+    bool supports_sampler_gpu_init_latent_input;
+    bool supports_sampler_gpu_init_latent_bridge_input;
+    bool supports_sampler_gpu_latent_bridge_output;
+    uint8_t reserved_capability_padding;
+    uint32_t reserved[8];
 } sd_gpu_capabilities_t;
 
 enum sd_model_family_t {
@@ -713,6 +718,10 @@ SD_API bool sd_sample_latent_gpu(sd_ctx_t* sd_ctx,
                                  const sd_img_gen_params_t* sd_img_gen_params,
                                  const sd_latent_t* init_latent,
                                  sd_gpu_handle_t* out_gpu_latent);
+SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
+                                               const sd_img_gen_params_t* sd_img_gen_params,
+                                               sd_gpu_handle_t init_gpu_latent,
+                                               sd_gpu_handle_t* out_gpu_latent);
 SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
                                     const sd_latent_t* latent,
                                     const sd_tiling_params_t* vae_tiling_params);

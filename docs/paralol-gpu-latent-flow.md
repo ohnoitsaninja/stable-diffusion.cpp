@@ -29,11 +29,17 @@ The pre-existing CPU VAE decode path uploaded this latent by converting the `sd_
 The fork now supports `SD_GPU_RESOURCE_LATENT` handles and explicit latent download/upload helpers:
 
 - `sd_sample_latent_gpu(...)`
+- `sd_sample_latent_gpu_with_init_gpu(...)`
 - `sd_gpu_latent_download(...)`
 - `sd_cpu_latent_upload(...)`
 - `sd_decode_gpu_latent_normal_gpu(...)`
 
-`sd_decode_gpu_latent_normal_gpu(...)` consumes a CUDA latent handle directly. For SDXL/Flux/Flux2/Z-Image scalar latent transforms it keeps the diffusion-latent to VAE-latent conversion on the selected backend, then runs COMFY_NORMAL VAE decode and returns a GPU image handle.
+`sd_decode_gpu_latent_normal_gpu(...)` consumes a CUDA latent handle directly.
+For base SD1, SDXL, Flux, Flux2, and Z-Image scalar latent transforms it
+keeps the diffusion-latent to VAE-latent conversion on the selected backend,
+then runs COMFY_NORMAL VAE decode and returns a GPU image handle. SD1 support is
+intentionally limited to the base model version until inpaint, pix2pix, tiny,
+and other variants get their own smokes. SD2 is not a current Paralol target.
 
 Anima is supported through a compatibility bridge, not true GPU-resident VAE
 decode. The sampler/CPU-upload latent handle is downloaded into the existing
@@ -66,13 +72,52 @@ At 1024x1024 this Wan/Qwen VAE path currently plans about 7702 MB for encode and
 7493 MB for decode, with IM2COL present. That is expected for Anima today and is
 reported rather than hidden.
 
-`sd_sample_latent_gpu(...)` is intentionally marked as a compatibility bridge today. It calls the existing host-side sampler and uploads the final latent to CUDA. It sets `SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT | SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD` on the returned handle. With `SDCPP_STRICT_GPU_RESIDENT=1`, it fails instead of hiding the CPU materialization.
+`sd_sample_latent_gpu(...)` is intentionally marked as a compatibility bridge today. It calls the existing host-side sampler and uploads the final latent to CUDA. It sets `SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT | SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD` on the returned handle. `sd_get_gpu_capabilities(...)` reports `supports_sampler_gpu_latent_output=false` and `supports_sampler_gpu_latent_bridge_output=true` so callers do not confuse this with a true GPU-resident sampler. With `SDCPP_STRICT_GPU_RESIDENT=1`, it fails instead of hiding the CPU materialization.
 
 CPU sampled latents can also be uploaded explicitly with `sd_cpu_latent_upload(...)`.
 That path is intended as a compatibility bridge for existing CPU latent values.
 The uploaded handle is an owned CUDA buffer with `SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD`;
 if the source latent came from `sd_sample_latent(...)`, it also carries
 `SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT`.
+
+`sd_sample_latent_gpu_with_init_gpu(...)` is the I2I bridge API for KSampler
+init latents. It accepts an `SD_GPU_RESOURCE_LATENT` handle, validates the CUDA
+descriptor, downloads that init latent through the existing CPU-compatible
+sampler path, then returns the sampled output as a CUDA latent handle. This is
+not true all-GPU sampling yet, so:
+
+- `supports_sampler_gpu_init_latent_input=false`
+- `supports_sampler_gpu_init_latent_bridge_input=true`
+- `SDCPP_STRICT_GPU_RESIDENT=1` refuses the API
+- logs say `init_bridge_download=true` and `output_bridge_upload=true`
+- the sampled output handle is flagged with both `CPU_BRIDGE_DOWNLOAD` and
+  `CPU_BRIDGE_UPLOAD` so its provenance is visible through
+  `sd_gpu_handle_get_desc(...)`
+
+The value of the API is that Paralol can pass a VAE Encode GPU latent handle
+into KSampler without inventing its own DLL-side lifetime or download/upload
+sequence. The fork owns the validation and keeps the public seam stable for a
+future true GPU-native sampler implementation.
+
+The API validates dtype, channel count, and spatial latent dimensions against
+the resolved request before downloading the GPU init latent. A mismatched
+resolution now fails with a clear error before any bridge download occurs.
+
+The sampler API emits structured timing logs:
+
+- `[Timing] sd_sample_latent latent_prepare_ms=... prompt_encode_ms=... denoise_ms=...`
+- `[Timing] sd_sample_latent_gpu cpu_sample_ms=... bridge_upload_ms=...`
+- `[Timing] sd_sample_latent_gpu_with_init_gpu init_bridge_download_ms=... sample_bridge_ms=...`
+
+Prompt/CLIP encode is still folded into KSampler, but this gives Paralol a
+named timing bucket to compare against ComfyUI `CLIPTextEncode` until a separate
+public CLIP encode API exists.
+
+When the init handle came from true GPU VAE Encode, the sampled output is tagged
+with `SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE`. That keeps the later
+Latent Decode on the safe isolated COMFY_NORMAL VAE context path, avoiding the
+known same-context CUDA fault after VAE encode while still using device-to-device
+handoff for the decode side.
 
 ## VAE-encoded latent handoff
 
@@ -178,6 +223,10 @@ For the next Paralol worker integration:
   strict mode. Treat `supports_vae_encode_gpu_latent_bridge_output=true` as a
   compatibility signal only for model families such as Anima, where the handle
   is safe but bridge-uploaded, not true resident.
+- I2I KSampler can call `sd_sample_latent_gpu_with_init_gpu` when it receives a
+  GPU VAE Encode latent and wants a GPU sampled latent result. This is a
+  non-strict bridge today, but it centralizes init-latent validation and keeps
+  the worker off the raw latent bytes path.
 
 ## Supported handoff paths
 
@@ -185,6 +234,8 @@ Supported now:
 
 - Non-strict T2I bridge:
   `sd_sample_latent_gpu -> sd_decode_gpu_latent_normal_gpu -> sd_gpu_image_download`
+- Non-strict I2I init-latent bridge:
+  `sd_encode_image_normal_gpu -> sd_sample_latent_gpu_with_init_gpu -> sd_decode_gpu_latent_normal_gpu -> sd_gpu_image_download_to_buffer`
 - CPU sampled latent bridge:
   `sd_sample_latent -> sd_cpu_latent_upload -> sd_decode_gpu_latent_normal_gpu`
 - Anima sampled-latent bridge:
@@ -201,12 +252,19 @@ Supported now:
 - VAE Encode true GPU handoff:
   `sd_encode_image_normal_gpu -> CUDA latent handle -> D2D isolated COMFY_NORMAL decode -> CUDA image handle`
 
+Model-family status is summarized in
+`docs/paralol-model-capability-matrix.md`. Use that matrix and
+`sd_get_model_pipeline_capabilities()` rather than inferring support from file
+names or latent channel count alone.
+
 Refused now:
 
 - Strict sampler GPU output:
   `SDCPP_STRICT_GPU_RESIDENT=1 sd_sample_latent_gpu`
+- Strict sampler GPU init-latent bridge:
+  `SDCPP_STRICT_GPU_RESIDENT=1 sd_sample_latent_gpu_with_init_gpu`
 - Strict VAE Encode compatibility bridge output:
   `SDCPP_STRICT_GPU_RESIDENT=1 sd_encode_image_normal_gpu` for bridge-only
   model families such as Anima
 
-The real all-GPU KSampler project is a separate sampler backend refactor: the denoiser callback and sampler math need backend tensor/resource variants instead of `sd::Tensor<float>` host values.
+The real all-GPU KSampler project is a separate sampler backend refactor: the denoiser callback and sampler math need backend tensor/resource variants instead of `sd::Tensor<float>` host values. The concrete blocker map is in `docs/paralol-true-gpu-sampler-plan.md`.

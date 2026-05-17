@@ -37,12 +37,20 @@ Important fields:
 
 | Family | Latent | VAE Scale | Text Encoder | GPU latent -> GPU image |
 | --- | ---: | ---: | --- | --- |
+| SD1 base | 4 channels | 8 | CLIP | Supported for base SD1; variants need their own smokes |
 | SDXL | 4 channels | 8 | CLIP stack | Supported |
-| Flux / Flux1-style | 16 channels | model-reported | CLIP-L + T5XXL | Supported where the upstream VAE path matches Flux AE semantics |
+| Flux / Flux1-style | 16 channels | model-reported | CLIP-L + T5XXL | Supported |
 | Z-Image | 16 channels | 8 | Qwen LLM | Supported |
 | Flux2 | 128 channels | 16 | Qwen LLM | Supported |
 
 ## Z-Image Verification
+
+Z-Image T2I GPU latent handoff is verified. Reference/edit conditioning is not
+advertised by this fork yet because the current Paralol-supported Z workflows
+are T2I. `sd_get_model_pipeline_capabilities()` therefore reports
+`supports_reference_images=false`, `supports_edit_mode=false`, and
+`supports_comfy_reference_vae_encode=false` for Z-Image until a dedicated
+Z edit/reference smoke proves the path.
 
 Validated with:
 
@@ -73,6 +81,56 @@ Observed API handoff:
 The output image was coherent in the API smoke:
 
 `C:\tmp\stable-diffusion.cpp-paralol\build\flux-z-api-smoke\z-image-api-1024-rerun.png`
+
+The Z-Image non-strict init-latent bridge path was also validated at 512:
+
+- VAE Encode GPU latent: `1x16x64x64`, f32, CUDA
+- `sd_sample_latent_gpu_with_init_gpu`: bridge-downloads init latent, samples,
+  and bridge-uploads sampled latent
+- isolated GPU VAE Decode: `im2col=false`, `tiled=false`, `taesd=false`,
+  `host_copies=0`, planned workspace `704 MB`, decode about `0.16s`
+
+This proves the fork-side handoff contract. It does not claim Z reference/edit
+conditioning.
+
+## Flux.1 Verification
+
+Validated a Flux.1-style model with:
+
+- Diffusion model:
+  `F:\automatic1111\Stability\Models\DiffusionModels\flux1-kontext-dev-Q5_K_M.gguf`
+- VAE:
+  `F:\automatic1111\Stability\Models\VAE\ae.safetensors`
+- CLIP-L:
+  `F:\automatic1111\Stability\Models\TextEncoders\clip_l.safetensors`
+- T5XXL:
+  `F:\automatic1111\Stability\Models\TextEncoders\t5-v1_1-xxl-encoder-Q3_K_L.gguf`
+- Resolution: `512x512`
+- Steps: `1`
+- CFG: `1.0`
+
+Observed T2I API handoff:
+
+- `family_name=flux`
+- `latent_channels=16`
+- sampled GPU latent: `1x16x64x64`, f32, CUDA
+- VAE decode output: `1x3x512x512`, f32, CUDA
+- COMFY_NORMAL VAE decode: supported
+- implicit-GEMM conv: enabled
+- tiled VAE: false
+- TAESD: false
+- IM2COL: false
+- stage host copies: 0
+- planned workspace: 704 MB
+- decode time: about 0.18 seconds on the local 4080 Super
+
+The Flux.1 non-strict init-latent bridge path was also validated at 512:
+
+- VAE Encode GPU latent: `1x16x64x64`, f32, CUDA
+- `sd_sample_latent_gpu_with_init_gpu`: bridge-downloads init latent, samples,
+  and bridge-uploads sampled latent
+- isolated GPU VAE Decode: `im2col=false`, `tiled=false`, `taesd=false`,
+  `host_copies=0`, planned workspace `704 MB`, decode about `0.17s`
 
 ## Flux2 Verification
 
