@@ -722,6 +722,11 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
                                                const sd_img_gen_params_t* sd_img_gen_params,
                                                sd_gpu_handle_t init_gpu_latent,
                                                sd_gpu_handle_t* out_gpu_latent);
+// Experimental SDXL/SD1 Euler proof path. Requires SDCPP_EXPERIMENTAL_TRUE_GPU_SAMPLER=1.
+// This is not production sampling: initial noise is device-procedural rather than seed-compatible Philox.
+SD_API bool sd_sample_latent_gpu_true_euler_spike(sd_ctx_t* sd_ctx,
+                                                  const sd_img_gen_params_t* sd_img_gen_params,
+                                                  sd_gpu_handle_t* out_gpu_latent);
 SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
                                     const sd_latent_t* latent,
                                     const sd_tiling_params_t* vae_tiling_params);

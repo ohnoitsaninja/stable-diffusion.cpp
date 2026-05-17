@@ -12,7 +12,12 @@ This note covers the current stable-diffusion.cpp latent path used by Paralol.
 - Each diffusion model callback returns `sd::Tensor<float>` from `DiffusionModel::compute(...)`.
 - `GGMLRunner::compute<T>(...)` materializes the final ggml graph tensor with `sd::make_sd_tensor_from_ggml<T>(...)`.
 
-That means the current sampler does not have a final device tensor that can be wrapped directly as a true GPU-resident KSampler output. A narrow `sd_sample_latent_gpu` wrapper can upload the final CPU latent into an `sd_gpu_handle_t`, but strict GPU-resident mode rejects that bridge because it is not an all-device sampler path.
+That means the default sampler does not have a final device tensor that can be
+wrapped directly as a true GPU-resident KSampler output. A narrow
+`sd_sample_latent_gpu` wrapper can upload the final CPU latent into an
+`sd_gpu_handle_t`, but strict GPU-resident mode rejects that bridge because it
+is not an all-device sampler path. The exception today is the env-gated
+SDXL/SD1 T2I Euler backend path described below.
 
 ## Current materialization points
 
@@ -108,10 +113,34 @@ The sampler API emits structured timing logs:
 - `[Timing] sd_sample_latent latent_prepare_ms=... prompt_encode_ms=... denoise_ms=...`
 - `[Timing] sd_sample_latent_gpu cpu_sample_ms=... bridge_upload_ms=...`
 - `[Timing] sd_sample_latent_gpu_with_init_gpu init_bridge_download_ms=... sample_bridge_ms=...`
+- `[Timing] sd_sample_latent_gpu_euler_backend_bridge latent_prepare_ms=... prompt_encode_ms=... noise_prepare_ms=... denoise_ms=...`
 
 Prompt/CLIP encode is still folded into KSampler, but this gives Paralol a
 named timing bucket to compare against ComfyUI `CLIPTextEncode` until a separate
 public CLIP encode API exists.
+
+An experimental SDXL/SD1 T2I Euler backend sampler loop can be enabled with
+`SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1`. It keeps per-step latent state,
+UNet input/output, CFG blend, denoised reconstruction, and Euler updates as
+backend tensors. The path now creates the initial Philox Gaussian noise on
+CUDA and scales it on the backend, so the normal success case returns a CUDA
+latent handle with only `SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT` and no
+`CPU_BRIDGE_UPLOAD`/`CPU_BRIDGE_DOWNLOAD` flags. With
+`SDCPP_STRICT_GPU_RESIDENT=1`, strict mode allows this narrow path.
+
+If CUDA Philox allocation fails, non-strict mode falls back to the older
+one-time CPU noise upload and marks the handle `CPU_BRIDGE_UPLOAD`; strict
+mode refuses that fallback. The lane remains experimental and should not be
+advertised as a global sampler capability because it only supports SDXL/SD1,
+T2I, Euler, batch 1, no init/mask/control/ref/image-CFG, and non-flow
+denoisers.
+
+There is also a stricter proof API,
+`sd_sample_latent_gpu_true_euler_spike(...)`, gated by
+`SDCPP_EXPERIMENTAL_TRUE_GPU_SAMPLER=1`. It returns a latent handle without CPU
+bridge flags and strict mode allows it, but it uses a deterministic procedural
+device noise source rather than production Philox. Its purpose is to prove that
+owned backend tensors can carry sampler state through UNet and Euler math.
 
 When the init handle came from true GPU VAE Encode, the sampled output is tagged
 with `SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE`. That keeps the later
@@ -212,7 +241,11 @@ For the next Paralol worker integration:
 
 - Treat latent values as `CPU latent OR GPU latent handle`.
 - Treat image values as `CPU image OR GPU image handle`.
-- If KSampler calls `sd_sample_latent_gpu`, inspect handle flags. `CPU_BRIDGE_UPLOAD` means the sampler itself still materialized on CPU.
+- If KSampler calls `sd_sample_latent_gpu`, inspect handle flags.
+  `CPU_BRIDGE_UPLOAD` means the sampler itself still materialized on CPU. A
+  SDXL/SD1 T2I Euler result produced with
+  `SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1` should have only
+  `SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT`.
 - Latent Decode should prefer `sd_decode_gpu_latent_normal_gpu` when it receives a CUDA latent handle.
 - Save/export/debug consumers should explicitly call `sd_gpu_latent_download`,
   `sd_gpu_image_download`, or preferably `sd_gpu_image_download_to_buffer` when
@@ -234,6 +267,9 @@ Supported now:
 
 - Non-strict T2I bridge:
   `sd_sample_latent_gpu -> sd_decode_gpu_latent_normal_gpu -> sd_gpu_image_download`
+- Experimental strict SDXL/SD1 T2I Euler:
+  `SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1 sd_sample_latent_gpu -> sd_decode_gpu_latent_normal_gpu -> sd_gpu_image_download_to_buffer`
+  with sampler output flags `SAMPLER_OUTPUT` only
 - Non-strict I2I init-latent bridge:
   `sd_encode_image_normal_gpu -> sd_sample_latent_gpu_with_init_gpu -> sd_decode_gpu_latent_normal_gpu -> sd_gpu_image_download_to_buffer`
 - CPU sampled latent bridge:
@@ -259,12 +295,18 @@ names or latent channel count alone.
 
 Refused now:
 
-- Strict sampler GPU output:
-  `SDCPP_STRICT_GPU_RESIDENT=1 sd_sample_latent_gpu`
+- Strict default sampler GPU output:
+  `SDCPP_STRICT_GPU_RESIDENT=1 sd_sample_latent_gpu` without
+  `SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1`, or with unsupported sampler/model
+  settings
 - Strict sampler GPU init-latent bridge:
   `SDCPP_STRICT_GPU_RESIDENT=1 sd_sample_latent_gpu_with_init_gpu`
 - Strict VAE Encode compatibility bridge output:
   `SDCPP_STRICT_GPU_RESIDENT=1 sd_encode_image_normal_gpu` for bridge-only
   model families such as Anima
 
-The real all-GPU KSampler project is a separate sampler backend refactor: the denoiser callback and sampler math need backend tensor/resource variants instead of `sd::Tensor<float>` host values. The concrete blocker map is in `docs/paralol-true-gpu-sampler-plan.md`.
+The complete all-GPU KSampler project is still a broader sampler backend
+refactor: init-latent sampling, non-Euler samplers, flow denoisers, ControlNet,
+and model-family-specific paths still need backend tensor/resource variants
+instead of `sd::Tensor<float>` host values. The concrete blocker map is in
+`docs/paralol-true-gpu-sampler-plan.md`.

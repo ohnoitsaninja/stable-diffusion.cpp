@@ -24,6 +24,7 @@ struct Args {
     std::string output = "latent_smoke.png";
     std::string prompt = "a detailed fantasy orc portrait, high quality";
     std::string negative_prompt = "blurry, low quality, noisy";
+    std::string sampling_method;
     int image_channels = 4;
     int width          = 0;
     int height         = 0;
@@ -38,6 +39,9 @@ struct Args {
     bool disable_default_vae_conv_direct = false;
     bool type_f16 = false;
     bool gpu_sample_output = false;
+    bool true_gpu_sampler_spike = false;
+    bool gpu_sampler_backend_euler = false;
+    bool compare_gpu_sampler_backend_euler = false;
     bool gpu_init_sample_input = false;
     bool gpu_encode_output = false;
     bool gpu_upload_latent_decode_input = false;
@@ -73,6 +77,7 @@ static void usage(const char* argv0) {
         << "  --negative-prompt <text> negative prompt for sampler smoke\n"
         << "  --steps <int>            sampler steps override\n"
         << "  --cfg-scale <float>      text/image CFG override\n"
+        << "  --sampling-method <name> sampler method override\n"
         << "  --image-channels <3|4>   channel count to load and pass into sd_encode_image (default: 4)\n"
         << "  --ref-image <path>       reference image for edit/reference-conditioning smoke\n"
         << "  --width <int>            optional target width for sample/decode path\n"
@@ -83,6 +88,9 @@ static void usage(const char* argv0) {
         << "  --sample                 run sd_sample_latent after encode\n"
         << "  --sample-without-init    run sampler with no init latent and skip VAE encode\n"
         << "  --gpu-sample-output      run sd_sample_latent_gpu and keep sampled latent as a GPU handle\n"
+        << "  --true-gpu-sampler-spike run experimental backend-resident Euler sampler spike\n"
+        << "  --gpu-sampler-backend-euler use experimental Euler backend sampler through sd_sample_latent_gpu\n"
+        << "  --compare-gpu-sampler-backend-euler compare CPU sampler latent vs experimental Euler backend latent\n"
         << "  --gpu-init-sample-input  pass a GPU latent handle into the sampler init-latent bridge API\n"
         << "  --gpu-encode-output      call sd_encode_image_normal_gpu and keep encoded latent as a GPU handle\n"
         << "  --gpu-upload-latent-decode-input upload the CPU latent, then decode from the GPU latent handle\n"
@@ -173,6 +181,10 @@ static bool parse_args(int argc, char** argv, Args& args) {
             const char* value = need_value("--cfg-scale");
             if (value == nullptr) return false;
             args.cfg_scale = static_cast<float>(std::atof(value));
+        } else if (arg == "--sampling-method") {
+            const char* value = need_value("--sampling-method");
+            if (value == nullptr) return false;
+            args.sampling_method = value;
         } else if (arg == "--image-channels") {
             const char* value = need_value("--image-channels");
             if (value == nullptr) return false;
@@ -199,6 +211,23 @@ static bool parse_args(int argc, char** argv, Args& args) {
         } else if (arg == "--gpu-sample-output") {
             args.gpu_sample_output = true;
             args.sample = true;
+        } else if (arg == "--true-gpu-sampler-spike") {
+            args.true_gpu_sampler_spike = true;
+            args.gpu_sample_output = true;
+            args.sample = true;
+            args.sample_without_init = true;
+        } else if (arg == "--gpu-sampler-backend-euler") {
+            args.gpu_sampler_backend_euler = true;
+            args.gpu_sample_output = true;
+            args.sample = true;
+            args.sample_without_init = true;
+        } else if (arg == "--compare-gpu-sampler-backend-euler") {
+            args.compare_gpu_sampler_backend_euler = true;
+            args.gpu_sampler_backend_euler = true;
+            args.gpu_sample_output = true;
+            args.sample = true;
+            args.sample_without_init = true;
+            args.decode = false;
         } else if (arg == "--gpu-init-sample-input") {
             args.gpu_init_sample_input = true;
             args.gpu_sample_output = true;
@@ -381,6 +410,111 @@ static void print_gpu_desc(sd_ctx_t* ctx, const char* label, sd_gpu_handle_t han
               << " refcount=" << desc.refcount << "\n";
 }
 
+struct LatentDiffStats {
+    double mean_abs = 0.0;
+    float p95_abs = 0.0f;
+    float p99_abs = 0.0f;
+    float max_abs = 0.0f;
+    uint64_t compared = 0;
+    uint64_t nan_or_inf = 0;
+};
+
+static bool download_gpu_float_tensor(sd_ctx_t* ctx,
+                                      sd_gpu_handle_t handle,
+                                      std::vector<float>& out,
+                                      sd_gpu_tensor_desc_t* out_desc = nullptr) {
+    sd_gpu_tensor_desc_t desc{};
+    if (!sd_gpu_handle_get_desc(ctx, handle, &desc)) {
+        std::cerr << "sd_gpu_handle_get_desc failed for handle=" << handle << "\n";
+        return false;
+    }
+    if (desc.dtype != SD_DTYPE_F32 || desc.byte_size % sizeof(float) != 0) {
+        std::cerr << "expected f32 tensor handle=" << handle
+                  << " dtype=" << desc.dtype
+                  << " bytes=" << desc.byte_size << "\n";
+        return false;
+    }
+    out.resize(static_cast<size_t>(desc.byte_size / sizeof(float)));
+    if (!sd_gpu_tensor_download(ctx, handle, out.data(), desc.byte_size, nullptr)) {
+        std::cerr << "sd_gpu_tensor_download failed for handle=" << handle << "\n";
+        return false;
+    }
+    if (out_desc != nullptr) {
+        *out_desc = desc;
+    }
+    return true;
+}
+
+static bool download_cpu_latent_as_float_tensor(sd_ctx_t* ctx,
+                                                const sd_latent_t* latent,
+                                                std::vector<float>& out,
+                                                sd_gpu_tensor_desc_t* out_desc = nullptr) {
+    sd_gpu_handle_t uploaded = 0;
+    if (!sd_cpu_latent_upload(ctx, latent, &uploaded, nullptr)) {
+        std::cerr << "sd_cpu_latent_upload failed for comparison\n";
+        return false;
+    }
+    bool ok = download_gpu_float_tensor(ctx, uploaded, out, out_desc);
+    sd_gpu_handle_release(ctx, uploaded);
+    return ok;
+}
+
+static LatentDiffStats compare_float_tensors(const std::vector<float>& a,
+                                             const std::vector<float>& b) {
+    LatentDiffStats stats{};
+    const size_t count = std::min(a.size(), b.size());
+    if (count == 0) {
+        return stats;
+    }
+
+    std::vector<float> diffs;
+    diffs.reserve(count);
+    double sum = 0.0;
+    float max_abs = 0.0f;
+    uint64_t bad = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const float av = a[i];
+        const float bv = b[i];
+        if (!std::isfinite(av) || !std::isfinite(bv)) {
+            ++bad;
+            continue;
+        }
+        const float diff = std::fabs(av - bv);
+        diffs.push_back(diff);
+        sum += static_cast<double>(diff);
+        max_abs = std::max(max_abs, diff);
+    }
+
+    stats.compared = static_cast<uint64_t>(diffs.size());
+    stats.nan_or_inf = bad;
+    if (diffs.empty()) {
+        return stats;
+    }
+    auto percentile = [&diffs](double q) -> float {
+        const size_t index = static_cast<size_t>(std::min<double>(
+            static_cast<double>(diffs.size() - 1),
+            std::ceil(q * static_cast<double>(diffs.size())) - 1.0));
+        std::nth_element(diffs.begin(), diffs.begin() + index, diffs.end());
+        return diffs[index];
+    };
+    stats.mean_abs = sum / static_cast<double>(diffs.size());
+    stats.p95_abs = percentile(0.95);
+    stats.p99_abs = percentile(0.99);
+    stats.max_abs = max_abs;
+    return stats;
+}
+
+static bool same_latent_desc_shape(const sd_gpu_tensor_desc_t& a,
+                                   const sd_gpu_tensor_desc_t& b) {
+    return a.dtype == b.dtype &&
+           a.layout == b.layout &&
+           a.n == b.n &&
+           a.c == b.c &&
+           a.h == b.h &&
+           a.w == b.w &&
+           a.byte_size == b.byte_size;
+}
+
 static void print_model_capabilities(sd_ctx_t* ctx) {
     sd_model_pipeline_capabilities_t caps{};
     if (!sd_get_model_pipeline_capabilities(ctx, &caps)) {
@@ -474,6 +608,12 @@ int main(int argc, char** argv) {
     }
     if (args.strict_gpu_resident) {
         set_env_value("SDCPP_STRICT_GPU_RESIDENT", "1");
+    }
+    if (args.true_gpu_sampler_spike) {
+        set_env_value("SDCPP_EXPERIMENTAL_TRUE_GPU_SAMPLER", "1");
+    }
+    if (args.gpu_sampler_backend_euler) {
+        set_env_value("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER", "1");
     }
     sd_set_log_callback(sd_log_cb, nullptr);
 
@@ -673,6 +813,9 @@ int main(int argc, char** argv) {
         gen_params.sample_params.guidance.txt_cfg      = args.cfg_scale > 0.0f ? args.cfg_scale : (caps.default_cfg_scale > 0.0f ? caps.default_cfg_scale : 1.2f);
         gen_params.sample_params.guidance.img_cfg      = gen_params.sample_params.guidance.txt_cfg;
         gen_params.sample_params.sample_method         = caps.default_sample_method;
+        if (!args.sampling_method.empty()) {
+            gen_params.sample_params.sample_method = str_to_sample_method(args.sampling_method.c_str());
+        }
         gen_params.sample_params.scheduler             = caps.default_scheduler;
         gen_params.sample_params.flow_shift            = caps.default_flow_shift;
         gen_params.vae_tiling_params                   = tiling;
@@ -689,8 +832,105 @@ int main(int argc, char** argv) {
             std::cout << "loaded reference image " << ref_image.width << "x" << ref_image.height << "x" << ref_image.channel << "\n";
         }
 
+        if (args.compare_gpu_sampler_backend_euler) {
+            std::cout << "comparing CPU sampler vs experimental Euler backend sampler\n";
+            sd_latent_t* cpu_sampled = sd_sample_latent(ctx, &gen_params, nullptr);
+            if (cpu_sampled == nullptr) {
+                std::cerr << "sd_sample_latent failed during comparison\n";
+                if (ref_image.data != nullptr) free(ref_image.data);
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            std::vector<float> cpu_values;
+            sd_gpu_tensor_desc_t cpu_desc{};
+            if (!download_cpu_latent_as_float_tensor(ctx, cpu_sampled, cpu_values, &cpu_desc)) {
+                free_sd_latent(cpu_sampled);
+                if (ref_image.data != nullptr) free(ref_image.data);
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+
+            sd_ctx_t* gpu_compare_ctx = create_context(args, false);
+            if (gpu_compare_ctx == nullptr) {
+                std::cerr << "gpu comparison new_sd_ctx failed\n";
+                free_sd_latent(cpu_sampled);
+                if (ref_image.data != nullptr) free(ref_image.data);
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+
+            sd_gpu_handle_t gpu_sampled = 0;
+            if (!sd_sample_latent_gpu(gpu_compare_ctx, &gen_params, nullptr, &gpu_sampled)) {
+                std::cerr << "sd_sample_latent_gpu backend sampler failed during comparison\n";
+                free_sd_ctx(gpu_compare_ctx);
+                free_sd_latent(cpu_sampled);
+                if (ref_image.data != nullptr) free(ref_image.data);
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            print_gpu_desc(gpu_compare_ctx, "gpu_backend_sample_latent", gpu_sampled);
+            std::vector<float> gpu_values;
+            sd_gpu_tensor_desc_t gpu_desc{};
+            if (!download_gpu_float_tensor(gpu_compare_ctx, gpu_sampled, gpu_values, &gpu_desc)) {
+                sd_gpu_handle_release(gpu_compare_ctx, gpu_sampled);
+                free_sd_ctx(gpu_compare_ctx);
+                free_sd_latent(cpu_sampled);
+                if (ref_image.data != nullptr) free(ref_image.data);
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+
+            const bool shape_match = same_latent_desc_shape(cpu_desc, gpu_desc);
+            const bool count_match = cpu_values.size() == gpu_values.size();
+            LatentDiffStats stats = compare_float_tensors(cpu_values, gpu_values);
+            std::cout << "gpu_sampler_backend_euler_compare"
+                      << " shape_match=" << (shape_match ? "true" : "false")
+                      << " count_match=" << (count_match ? "true" : "false")
+                      << " elements_cpu=" << cpu_values.size()
+                      << " elements_gpu=" << gpu_values.size()
+                      << " compared=" << stats.compared
+                      << " nan_or_inf=" << stats.nan_or_inf
+                      << " mean_abs=" << stats.mean_abs
+                      << " p95_abs=" << stats.p95_abs
+                      << " p99_abs=" << stats.p99_abs
+                      << " max_abs=" << stats.max_abs
+                      << "\n";
+
+            sd_gpu_handle_release(gpu_compare_ctx, gpu_sampled);
+            free_sd_ctx(gpu_compare_ctx);
+            free_sd_latent(cpu_sampled);
+            if (ref_image.data != nullptr) {
+                free(ref_image.data);
+            }
+            if (encoded != nullptr) {
+                free_sd_latent(encoded);
+            }
+            free_sd_ctx(ctx);
+
+            if (!shape_match || !count_match || stats.nan_or_inf != 0 || stats.compared == 0 ||
+                stats.mean_abs > 5.0e-2 || stats.p99_abs > 5.0e-1f || stats.max_abs > 5.0f) {
+                std::cerr << "GPU sampler backend comparison exceeded tolerance\n";
+                return 1;
+            }
+            return 0;
+        }
+
         if (args.gpu_sample_output) {
-            if (args.gpu_init_sample_input && !args.sample_without_init) {
+            if (args.true_gpu_sampler_spike) {
+                std::cout << "calling sd_sample_latent_gpu_true_euler_spike\n";
+                if (!sd_sample_latent_gpu_true_euler_spike(ctx, &gen_params, &sampled_gpu_latent)) {
+                    std::cerr << "sd_sample_latent_gpu_true_euler_spike failed\n";
+                    if (ref_image.data != nullptr) free(ref_image.data);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+            } else if (args.gpu_init_sample_input && !args.sample_without_init) {
                 if (encoded_gpu_latent != 0) {
                     sample_init_gpu_latent = encoded_gpu_latent;
                 } else if (encoded != nullptr) {

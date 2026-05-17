@@ -663,6 +663,53 @@ struct UNetModelRunner : public GGMLRunner {
         return gf;
     }
 
+    ggml_cgraph* build_graph(const GgmlBackendTensorResource& x_resource,
+                             const sd::Tensor<float>& timesteps_tensor,
+                             const sd::Tensor<float>& context_tensor               = {},
+                             const sd::Tensor<float>& c_concat_tensor              = {},
+                             const sd::Tensor<float>& y_tensor                     = {},
+                             int num_video_frames                                  = -1,
+                             const std::vector<sd::Tensor<float>>& controls_tensor = {},
+                             const std::vector<ggml_tensor*>* backend_controls     = nullptr,
+                             float control_strength                                = 0.f) {
+        ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
+
+        ggml_tensor* x         = make_backend_input(x_resource);
+        ggml_tensor* timesteps = make_input(timesteps_tensor);
+        ggml_tensor* context   = make_optional_input(context_tensor);
+        ggml_tensor* c_concat  = make_optional_input(c_concat_tensor);
+        ggml_tensor* y         = make_optional_input(y_tensor);
+        std::vector<ggml_tensor*> controls;
+        if (backend_controls != nullptr && !backend_controls->empty()) {
+            controls = *backend_controls;
+        } else {
+            controls.reserve(controls_tensor.size());
+            for (const auto& control_tensor : controls_tensor) {
+                controls.push_back(make_input(control_tensor));
+            }
+        }
+
+        if (num_video_frames == -1) {
+            num_video_frames = static_cast<int>(x->ne[3]);
+        }
+
+        auto runner_ctx = get_context();
+
+        ggml_tensor* out = unet.forward(&runner_ctx,
+                                        x,
+                                        timesteps,
+                                        context,
+                                        c_concat,
+                                        y,
+                                        num_video_frames,
+                                        controls,
+                                        control_strength);
+
+        ggml_build_forward_expand(gf, out);
+
+        return gf;
+    }
+
     sd::Tensor<float> compute(int n_threads,
                               const sd::Tensor<float>& x,
                               const sd::Tensor<float>& timesteps,
@@ -683,6 +730,24 @@ struct UNetModelRunner : public GGMLRunner {
         };
 
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_to_backend_resource(
+        int n_threads,
+        const GgmlBackendTensorResource& x,
+        const sd::Tensor<float>& timesteps,
+        const sd::Tensor<float>& context                  = {},
+        const sd::Tensor<float>& c_concat                 = {},
+        const sd::Tensor<float>& y                        = {},
+        int num_video_frames                              = -1,
+        const std::vector<sd::Tensor<float>>& controls    = {},
+        const std::vector<ggml_tensor*>* backend_controls = nullptr,
+        float control_strength                            = 0.f) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, backend_controls, control_strength);
+        };
+
+        return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "unet_backend_output");
     }
 
     void test() {

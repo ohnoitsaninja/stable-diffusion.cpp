@@ -1807,6 +1807,7 @@ protected:
     ggml_tensor* zero_int_tensor  = nullptr;
 
     std::map<ggml_tensor*, const void*> backend_tensor_data_map;
+    std::map<ggml_tensor*, ggml_tensor*> backend_tensor_source_map;
     std::map<std::string, ggml_tensor*> cache_tensor_map;  // name -> tensor
     const std::string final_result_name = "ggml_runner_final_result_tensor";
 
@@ -2136,6 +2137,7 @@ protected:
         ggml_cgraph* gf = get_compute_graph(get_graph);
         analyze_compute_graph_allocations(gf);
         backend_tensor_data_map.clear();
+        backend_tensor_source_map.clear();
         compute_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(runtime_backend));
 
         if (!ggml_gallocr_reserve(compute_allocr, gf)) {
@@ -2207,6 +2209,15 @@ protected:
         }
 
         backend_tensor_data_map.clear();
+
+        for (auto& kv : backend_tensor_source_map) {
+            auto dst = kv.first;
+            auto src = kv.second;
+
+            ggml_backend_tensor_copy(src, dst);
+        }
+
+        backend_tensor_source_map.clear();
     }
 
     bool offload_params_to_runtime_backend() {
@@ -2382,10 +2393,22 @@ public:
         backend_tensor_data_map[tensor] = data;
     }
 
+    void set_backend_tensor_source(ggml_tensor* tensor, ggml_tensor* source) {
+        backend_tensor_source_map[tensor] = source;
+    }
+
     template <typename T>
     ggml_tensor* make_input(const sd::Tensor<T>& tensor) {
         ggml_tensor* input = sd::make_ggml_tensor(compute_ctx, tensor, false);
         set_backend_tensor_data(input, tensor.data());
+        return input;
+    }
+
+    ggml_tensor* make_backend_input(const GgmlBackendTensorResource& resource) {
+        GGML_ASSERT(compute_ctx != nullptr);
+        GGML_ASSERT(resource.tensor != nullptr);
+        ggml_tensor* input = ggml_dup_tensor(compute_ctx, resource.tensor);
+        set_backend_tensor_source(input, resource.tensor);
         return input;
     }
 
