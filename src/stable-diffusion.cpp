@@ -3487,6 +3487,19 @@ struct sd_gpu_resource_private_t {
     std::unique_ptr<GgmlBackendTensorResource> tensor;
 };
 
+struct sd_conditioning_resource_private_t {
+    sd_conditioning_handle_t handle = 0;
+    uint32_t refcount = 1;
+    uint32_t flags = 0;
+    SDCondition condition;
+    int clip_skip = -1;
+    int width = -1;
+    int height = -1;
+    bool zero_out_masked = false;
+    std::string cache_key_hint;
+    std::string debug_name;
+};
+
 struct sd_ctx_params_snapshot_t {
     sd_ctx_params_t params{};
     std::string model_path;
@@ -3510,10 +3523,15 @@ struct sd_ctx_t {
     StableDiffusionGGML* sd = nullptr;
     sd_gpu_handle_t next_gpu_handle = 1;
     std::unordered_map<sd_gpu_handle_t, std::shared_ptr<sd_gpu_resource_private_t>> gpu_resources;
+    sd_conditioning_handle_t next_conditioning_handle = 1;
+    std::unordered_map<sd_conditioning_handle_t, std::shared_ptr<sd_conditioning_resource_private_t>> conditioning_resources;
     sd_ctx_params_snapshot_t init_params;
     sd_ctx_t* vae_decode_bridge_ctx = nullptr;
     bool vae_encode_used = false;
 };
+
+static std::shared_ptr<sd_conditioning_resource_private_t> sd_conditioning_lookup(sd_ctx_t* sd_ctx,
+                                                                                  sd_conditioning_handle_t handle);
 
 static const char* snapshot_c_str(const std::string& value) {
     return value.empty() ? nullptr : value.c_str();
@@ -4379,6 +4397,129 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     return embeds;
 }
 
+static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
+                                                         const sd_img_gen_params_t* sd_img_gen_params,
+                                                         const sd_latent_t* init_latent,
+                                                         const GenerationRequest& request) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr) {
+        return false;
+    }
+    if (!sd_version_is_sd1(sd_ctx->sd->version) && !sd_version_is_sdxl(sd_ctx->sd->version)) {
+        LOG_ERROR("conditioning handle sampler currently supports SD1/SDXL text-only UNet models only");
+        return false;
+    }
+    if (sd_version_is_inpaint_or_unet_edit(sd_ctx->sd->version) || sd_ctx->sd->is_flow_denoiser()) {
+        LOG_ERROR("conditioning handle sampler does not support inpaint/edit/flow model conditioning yet");
+        return false;
+    }
+    if (init_latent != nullptr ||
+        sd_img_gen_params->init_image.data != nullptr ||
+        sd_img_gen_params->mask_image.data != nullptr ||
+        sd_img_gen_params->control_image.data != nullptr ||
+        sd_img_gen_params->ref_images_count > 0 ||
+        request.use_img_cond) {
+        LOG_ERROR("conditioning handle sampler currently supports text-only T2I; init/mask/control/ref/image-CFG inputs are not supported");
+        return false;
+    }
+    if (sd_img_gen_params->lora_count != 0) {
+        LOG_ERROR("conditioning handle sampler currently rejects LoRA stacks; encode conditioning after CLIP LoRA application is not ABI-defined yet");
+        return false;
+    }
+    if (request.batch_count != 1) {
+        LOG_ERROR("conditioning handle sampler currently supports batch_count=1, got %d", request.batch_count);
+        return false;
+    }
+    return true;
+}
+
+static bool conditioning_resource_matches_request(sd_ctx_t* sd_ctx,
+                                                  const sd_conditioning_resource_private_t& resource,
+                                                  const GenerationRequest& request,
+                                                  const char* label) {
+    if (resource.condition.empty()) {
+        LOG_ERROR("%s conditioning handle is empty", label);
+        return false;
+    }
+    if (resource.clip_skip != request.clip_skip) {
+        LOG_ERROR("%s conditioning handle clip_skip mismatch: handle=%d request=%d",
+                  label,
+                  resource.clip_skip,
+                  request.clip_skip);
+        return false;
+    }
+    if (resource.width > 0 && resource.width != request.width) {
+        LOG_ERROR("%s conditioning handle width mismatch: handle=%d request=%d",
+                  label,
+                  resource.width,
+                  request.width);
+        return false;
+    }
+    if (resource.height > 0 && resource.height != request.height) {
+        LOG_ERROR("%s conditioning handle height mismatch: handle=%d request=%d",
+                  label,
+                  resource.height,
+                  request.height);
+        return false;
+    }
+    if (sd_version_is_sdxl(sd_ctx->sd->version) && (resource.width <= 0 || resource.height <= 0)) {
+        LOG_ERROR("%s conditioning handle for SDXL must be encoded with explicit width/height", label);
+        return false;
+    }
+    return true;
+}
+
+static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds_from_conditioning_handles(
+    sd_ctx_t* sd_ctx,
+    GenerationRequest* request,
+    ImageGenerationLatents* latents,
+    sd_conditioning_handle_t positive,
+    sd_conditioning_handle_t negative) {
+    if (sd_ctx == nullptr || request == nullptr || latents == nullptr) {
+        return std::nullopt;
+    }
+    auto positive_resource = sd_conditioning_lookup(sd_ctx, positive);
+    if (positive_resource == nullptr) {
+        LOG_ERROR("positive conditioning handle %" PRIu64 " is not valid for this context", positive);
+        return std::nullopt;
+    }
+    if (!conditioning_resource_matches_request(sd_ctx, *positive_resource, *request, "positive")) {
+        return std::nullopt;
+    }
+
+    ImageGenerationEmbeds embeds;
+    embeds.cond = positive_resource->condition;
+    if (embeds.cond.c_concat.empty()) {
+        embeds.cond.c_concat = latents->concat_latent;
+    }
+
+    if (request->use_uncond || request->use_high_noise_uncond) {
+        auto negative_resource = sd_conditioning_lookup(sd_ctx, negative);
+        if (negative_resource == nullptr) {
+            LOG_ERROR("negative conditioning handle %" PRIu64 " is required for cfg/uncond sampling", negative);
+            return std::nullopt;
+        }
+        if (!conditioning_resource_matches_request(sd_ctx, *negative_resource, *request, "negative")) {
+            return std::nullopt;
+        }
+        const bool expected_zero_out_masked = sd_version_is_sdxl(sd_ctx->sd->version) &&
+                                              request->negative_prompt.empty() &&
+                                              !sd_ctx->sd->is_using_edm_v_parameterization;
+        if (expected_zero_out_masked && !negative_resource->zero_out_masked) {
+            LOG_ERROR("negative conditioning handle for empty SDXL negative prompt must be encoded with force_zero_uncond=true");
+            return std::nullopt;
+        }
+        embeds.uncond = negative_resource->condition;
+        if (embeds.uncond.c_concat.empty()) {
+            embeds.uncond.c_concat = latents->uncond_concat_latent;
+        }
+    }
+
+    LOG_INFO("conditioning handles accepted positive=%" PRIu64 " negative=%" PRIu64 " storage=host_tensor device_resident=false",
+             positive,
+             negative);
+    return embeds;
+}
+
 static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
                                         const GenerationRequest& request,
                                         const std::vector<sd::Tensor<float>>& final_latents) {
@@ -4598,6 +4739,134 @@ static sd_gpu_handle_t sd_gpu_register_resource(sd_ctx_t* sd_ctx,
                      desc.h,
                      desc.w,
                      desc.byte_size,
+                     resource->debug_name.c_str());
+        }
+    }
+    return resource->handle;
+}
+
+static bool trace_conditioning_handles_enabled() {
+    return StableDiffusionGGML::env_flag_enabled("SDCPP_TRACE_CONDITIONING_HANDLES");
+}
+
+template <typename T>
+static uint64_t sd_condition_tensor_bytes(const sd::Tensor<T>& tensor) {
+    return static_cast<uint64_t>(tensor.numel()) * static_cast<uint64_t>(sizeof(T));
+}
+
+static uint64_t sd_condition_estimated_bytes(const SDCondition& condition) {
+    uint64_t bytes = 0;
+    bytes += sd_condition_tensor_bytes(condition.c_crossattn);
+    bytes += sd_condition_tensor_bytes(condition.c_vector);
+    bytes += sd_condition_tensor_bytes(condition.c_concat);
+    bytes += sd_condition_tensor_bytes(condition.c_t5_ids);
+    bytes += sd_condition_tensor_bytes(condition.c_t5_weights);
+    for (const auto& extra : condition.extra_c_crossattns) {
+        bytes += sd_condition_tensor_bytes(extra);
+    }
+    return bytes;
+}
+
+static std::shared_ptr<sd_conditioning_resource_private_t> sd_conditioning_lookup(sd_ctx_t* sd_ctx,
+                                                                                  sd_conditioning_handle_t handle) {
+    if (sd_ctx == nullptr || handle == 0) {
+        return nullptr;
+    }
+    auto it = sd_ctx->conditioning_resources.find(handle);
+    if (it == sd_ctx->conditioning_resources.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+static bool sd_conditioning_fill_desc(const sd_conditioning_resource_private_t& resource,
+                                      sd_conditioning_desc_t* desc) {
+    if (desc == nullptr) {
+        return false;
+    }
+    const SDCondition& condition = resource.condition;
+    *desc = {};
+    desc->struct_size = sizeof(sd_conditioning_desc_t);
+    desc->version = SD_VAE_API_VERSION;
+    desc->handle = resource.handle;
+    desc->flags = resource.flags;
+    desc->refcount = resource.refcount;
+    desc->dtype = SD_DTYPE_F32;
+    desc->backend = SD_BACKEND_CPU;
+    desc->estimated_bytes = sd_condition_estimated_bytes(condition);
+    desc->device_resident = false;
+    desc->has_crossattn = !condition.c_crossattn.empty();
+    desc->has_vector = !condition.c_vector.empty();
+    desc->has_concat = !condition.c_concat.empty();
+    desc->has_t5_ids = !condition.c_t5_ids.empty();
+    desc->has_t5_weights = !condition.c_t5_weights.empty();
+    desc->copy_safe = true;
+    desc->extra_crossattn_count = static_cast<uint32_t>(condition.extra_c_crossattns.size());
+    desc->clip_skip = resource.clip_skip;
+    desc->width = resource.width;
+    desc->height = resource.height;
+    desc->zero_out_masked = resource.zero_out_masked;
+    std::snprintf(desc->debug_name, sizeof(desc->debug_name), "%s", resource.debug_name.c_str());
+
+    const auto& cross_shape = condition.c_crossattn.shape();
+    if (cross_shape.size() >= 3) {
+        desc->batch = cross_shape[0];
+        desc->token_count = cross_shape[1];
+        desc->crossattn_dim = cross_shape[2];
+    } else if (cross_shape.size() == 2) {
+        desc->batch = 1;
+        desc->token_count = cross_shape[0];
+        desc->crossattn_dim = cross_shape[1];
+    }
+
+    const auto& vector_shape = condition.c_vector.shape();
+    if (!vector_shape.empty()) {
+        int64_t batch = desc->batch > 0 ? desc->batch : 1;
+        desc->vector_dim = condition.c_vector.numel() / batch;
+    }
+
+    const auto& concat_shape = condition.c_concat.shape();
+    if (concat_shape.size() >= 3) {
+        desc->concat_channels = concat_shape[2];
+    }
+
+    const auto& t5_shape = condition.c_t5_ids.shape();
+    if (t5_shape.size() >= 2) {
+        desc->t5_token_count = t5_shape[1];
+    } else if (t5_shape.size() == 1) {
+        desc->t5_token_count = t5_shape[0];
+    }
+    return true;
+}
+
+static sd_conditioning_handle_t sd_conditioning_register(sd_ctx_t* sd_ctx,
+                                                         SDCondition&& condition,
+                                                         const sd_conditioning_encode_options_t& options,
+                                                         const char* debug_name) {
+    if (sd_ctx == nullptr || condition.empty()) {
+        return 0;
+    }
+    auto resource = std::make_shared<sd_conditioning_resource_private_t>();
+    resource->handle = sd_ctx->next_conditioning_handle++;
+    resource->condition = std::move(condition);
+    resource->clip_skip = options.clip_skip;
+    resource->width = options.width;
+    resource->height = options.height;
+    resource->zero_out_masked = options.force_zero_uncond;
+    resource->cache_key_hint = options.cache_key_hint != nullptr ? options.cache_key_hint : "";
+    resource->debug_name = debug_name != nullptr ? debug_name : "conditioning";
+    sd_ctx->conditioning_resources[resource->handle] = resource;
+    if (trace_conditioning_handles_enabled()) {
+        sd_conditioning_desc_t desc;
+        if (sd_conditioning_fill_desc(*resource, &desc)) {
+            LOG_INFO("[Conditioning] handle created id=%" PRIu64 " backend=%d device_resident=%s tokens=%" PRId64 " crossattn_dim=%" PRId64 " vector_dim=%" PRId64 " bytes=%" PRIu64 " name=%s",
+                     resource->handle,
+                     static_cast<int>(desc.backend),
+                     desc.device_resident ? "true" : "false",
+                     desc.token_count,
+                     desc.crossattn_dim,
+                     desc.vector_dim,
+                     desc.estimated_bytes,
                      resource->debug_name.c_str());
         }
     }
@@ -5604,6 +5873,173 @@ SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
     return make_sd_latent(std::move(final_latent), sd_latent_source_t::sampler);
 }
 
+static sd_latent_t* sd_sample_latent_with_conditioning_internal(sd_ctx_t* sd_ctx,
+                                                                const sd_img_gen_params_t* sd_img_gen_params,
+                                                                const sd_latent_t* init_latent,
+                                                                sd_conditioning_handle_t positive,
+                                                                sd_conditioning_handle_t negative) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr) {
+        return nullptr;
+    }
+    if (sd_ctx->sd->vae_decode_only ||
+        sd_ctx->sd->cond_stage_model == nullptr ||
+        sd_ctx->sd->diffusion_model == nullptr ||
+        sd_ctx->sd->denoiser == nullptr) {
+        LOG_ERROR("sd_sample_latent_with_conditioning requires a full SD context; recreate with vae_decode_only=false");
+        return nullptr;
+    }
+
+    int64_t t0                    = ggml_time_ms();
+    sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
+    GenerationRequest request(sd_ctx, sd_img_gen_params);
+    if (!conditioning_handle_sampler_supports_request(sd_ctx, sd_img_gen_params, init_latent, request)) {
+        return nullptr;
+    }
+    LOG_INFO("sd_sample_latent_with_conditioning %dx%d positive=%" PRIu64 " negative=%" PRIu64,
+             request.width,
+             request.height,
+             positive,
+             negative);
+
+    sd_ctx->sd->rng->manual_seed(request.seed);
+    sd_ctx->sd->sampler_rng->manual_seed(request.seed);
+    sd_ctx->sd->set_flow_shift(sd_img_gen_params->sample_params.flow_shift);
+    sd_ctx->sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count);
+
+    ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
+
+    int64_t latent_prepare_start = ggml_time_ms();
+    SamplePlan plan(sd_ctx, sd_img_gen_params, request);
+    auto latents_opt = prepare_image_generation_latents(sd_ctx,
+                                                        sd_img_gen_params,
+                                                        &request,
+                                                        &plan);
+    if (!latents_opt.has_value()) {
+        return nullptr;
+    }
+    ImageGenerationLatents latents = std::move(*latents_opt);
+    int64_t latent_prepare_end = ggml_time_ms();
+
+    int64_t condition_bind_start = ggml_time_ms();
+    auto embeds_opt = prepare_image_generation_embeds_from_conditioning_handles(sd_ctx,
+                                                                                &request,
+                                                                                &latents,
+                                                                                positive,
+                                                                                negative);
+    if (!embeds_opt.has_value()) {
+        return nullptr;
+    }
+    ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+    int64_t condition_bind_end = ggml_time_ms();
+
+    int64_t sampling_start = ggml_time_ms();
+    LOG_INFO("generating latent image with conditioning handles - seed %" PRId64, request.seed);
+
+    sd_ctx->sd->rng->manual_seed(request.seed);
+    sd_ctx->sd->sampler_rng->manual_seed(request.seed);
+    sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd_ctx->sd->rng);
+
+    sd::Tensor<float> final_latent = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
+                                                        true,
+                                                        latents.init_latent,
+                                                        std::move(noise),
+                                                        embeds.cond,
+                                                        embeds.uncond,
+                                                        embeds.img_cond,
+                                                        embeds.id_cond,
+                                                        latents.control_image,
+                                                        request.control_strength,
+                                                        request.guidance,
+                                                        plan.eta,
+                                                        plan.s_noise,
+                                                        plan.dpmpp_sde_r,
+                                                        plan.dpmpp_sde_solver,
+                                                        request.shifted_timestep,
+                                                        plan.sample_method,
+                                                        sd_ctx->sd->is_flow_denoiser(),
+                                                        plan.sigmas,
+                                                        plan.start_merge_step,
+                                                        latents.ref_latents,
+                                                        request.increase_ref_index,
+                                                        latents.denoise_mask,
+                                                        sd::Tensor<float>(),
+                                                        1.f,
+                                                        request.cache_params);
+    int64_t sampling_end = ggml_time_ms();
+    if (sd_ctx->sd->free_params_immediately) {
+        sd_ctx->sd->diffusion_model->free_params_buffer();
+    }
+    if (final_latent.empty()) {
+        LOG_ERROR("latent sampling with conditioning handles failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+        return nullptr;
+    }
+
+    sd_ctx->sd->lora_stat();
+
+    int64_t t1 = ggml_time_ms();
+    LOG_INFO("[Timing] sd_sample_latent_with_conditioning latent_prepare_ms=%" PRId64 " condition_bind_ms=%" PRId64 " prompt_encode_ms=0 denoise_ms=%" PRId64 " total_ms=%" PRId64 " condition_input=handle conditioning_storage=host_tensor sampler_math_residency=cpu_tensor",
+             latent_prepare_end - latent_prepare_start,
+             condition_bind_end - condition_bind_start,
+             sampling_end - sampling_start,
+             t1 - t0);
+    LOG_INFO("sd_sample_latent_with_conditioning completed in %.2fs", (t1 - t0) * 1.0f / 1000);
+    return make_sd_latent(std::move(final_latent), sd_latent_source_t::sampler);
+}
+
+SD_API bool sd_sample_latent_gpu_with_conditioning(sd_ctx_t* sd_ctx,
+                                                   const sd_img_gen_params_t* sd_img_gen_params,
+                                                   const sd_latent_t* init_latent,
+                                                   sd_conditioning_handle_t positive,
+                                                   sd_conditioning_handle_t negative,
+                                                   sd_gpu_handle_t* out_gpu_latent) {
+    if (out_gpu_latent != nullptr) {
+        *out_gpu_latent = 0;
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr || out_gpu_latent == nullptr) {
+        return false;
+    }
+    if (sd_strict_gpu_resident_enabled()) {
+        LOG_ERROR("sd_sample_latent_gpu_with_conditioning strict mode refused CPU-backed sampler bridge; conditioning handles are resident but sampler output still materializes through sd::Tensor<float>");
+        return false;
+    }
+
+    int64_t t0 = ggml_time_ms();
+    sd_latent_t* latent = sd_sample_latent_with_conditioning_internal(sd_ctx,
+                                                                      sd_img_gen_params,
+                                                                      init_latent,
+                                                                      positive,
+                                                                      negative);
+    int64_t sample_end = ggml_time_ms();
+    if (latent == nullptr) {
+        return false;
+    }
+    const sd::Tensor<float>* tensor = sd_latent_tensor(latent);
+    if (tensor == nullptr) {
+        free_sd_latent(latent);
+        return false;
+    }
+    auto resource = sd_upload_tensor_to_backend_resource(sd_ctx, *tensor, "sampler_latent_conditioning_f32");
+    free_sd_latent(latent);
+    sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
+                                                      std::move(resource),
+                                                      SD_GPU_RESOURCE_LATENT,
+                                                      SD_LAYOUT_WHCN_GGML,
+                                                      SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT | SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD,
+                                                      "sampler_latent_conditioning_f32");
+    if (handle == 0) {
+        LOG_ERROR("sd_sample_latent_gpu_with_conditioning failed to register GPU latent handle");
+        return false;
+    }
+    int64_t upload_end = ggml_time_ms();
+    *out_gpu_latent = handle;
+    LOG_INFO("[Timing] sd_sample_latent_gpu_with_conditioning cpu_sample_ms=%" PRId64 " bridge_upload_ms=%" PRId64 " total_ms=%" PRId64 " condition_input=handle prompt_encode_ms=0 bridge_upload=true",
+             sample_end - t0,
+             upload_end - sample_end,
+             upload_end - t0);
+    LOG_INFO("sd_sample_latent_gpu_with_conditioning completed handle=%" PRIu64 " bridge_upload=true", handle);
+    return true;
+}
+
 SD_API bool sd_sample_latent_gpu_true_euler_spike(sd_ctx_t* sd_ctx,
                                                   const sd_img_gen_params_t* sd_img_gen_params,
                                                   sd_gpu_handle_t* out_gpu_latent) {
@@ -6266,6 +6702,25 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_external_memory_interop = false;
     capabilities->supports_sampler_gpu_init_latent_input = false;
     capabilities->supports_sampler_gpu_init_latent_bridge_input = true;
+    return true;
+}
+
+SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_capabilities_t* capabilities) {
+    if (capabilities == nullptr) {
+        return false;
+    }
+    *capabilities = {};
+    capabilities->struct_size = sizeof(sd_conditioning_capabilities_t);
+    capabilities->version = SD_VAE_API_VERSION;
+    capabilities->supports_text_conditioning_encode = true;
+    capabilities->supports_conditioning_handles = true;
+    capabilities->supports_conditioning_gpu_resident = false;
+    capabilities->supports_sampler_conditioning_handle_input =
+        sd_ctx == nullptr || sd_ctx->sd == nullptr ||
+        (sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version));
+    capabilities->supports_conditioning_handle_reuse =
+        sd_ctx == nullptr || sd_ctx->sd == nullptr || !sd_ctx->sd->free_params_immediately;
+    capabilities->supports_conditioning_cpu_resident = true;
     return true;
 }
 
@@ -7461,6 +7916,154 @@ SD_API bool sd_encode_gpu_image_normal_gpu(sd_ctx_t* sd_ctx,
     bool ok = sd_encode_image_normal_gpu(sd_ctx, &image, options, out_gpu_latent, report);
     free(image.data);
     return ok;
+}
+
+SD_API void sd_conditioning_encode_options_init(sd_conditioning_encode_options_t* options) {
+    if (options == nullptr) {
+        return;
+    }
+    *options = {};
+    options->struct_size = sizeof(sd_conditioning_encode_options_t);
+    options->version = SD_VAE_API_VERSION;
+    options->clip_skip = -1;
+    options->width = -1;
+    options->height = -1;
+    options->force_zero_uncond = false;
+    options->cache_key_hint = nullptr;
+}
+
+SD_API bool sd_conditioning_encode_text(sd_ctx_t* sd_ctx,
+                                        const char* text,
+                                        const sd_conditioning_encode_options_t* options,
+                                        sd_conditioning_handle_t* out_handle,
+                                        sd_conditioning_desc_t* out_desc) {
+    if (out_handle != nullptr) {
+        *out_handle = 0;
+    }
+    if (out_desc != nullptr) {
+        *out_desc = {};
+        out_desc->struct_size = sizeof(sd_conditioning_desc_t);
+        out_desc->version = SD_VAE_API_VERSION;
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || out_handle == nullptr) {
+        return false;
+    }
+    if (sd_ctx->sd->vae_decode_only ||
+        sd_ctx->sd->cond_stage_model == nullptr ||
+        sd_ctx->sd->diffusion_model == nullptr) {
+        LOG_ERROR("sd_conditioning_encode_text requires a full SD context with CLIP and diffusion model loaded");
+        return false;
+    }
+    if (!sd_version_is_sd1(sd_ctx->sd->version) && !sd_version_is_sdxl(sd_ctx->sd->version)) {
+        LOG_ERROR("sd_conditioning_encode_text currently supports SD1/SDXL text-only conditioning only");
+        return false;
+    }
+
+    sd_conditioning_encode_options_t effective;
+    sd_conditioning_encode_options_init(&effective);
+    if (options != nullptr) {
+        effective = *options;
+        if (effective.struct_size == 0) {
+            effective.struct_size = sizeof(sd_conditioning_encode_options_t);
+        }
+        if (effective.version == 0) {
+            effective.version = SD_VAE_API_VERSION;
+        }
+    }
+    if (sd_version_is_sdxl(sd_ctx->sd->version) && (effective.width <= 0 || effective.height <= 0)) {
+        LOG_ERROR("sd_conditioning_encode_text requires explicit width/height for SDXL conditioning");
+        return false;
+    }
+
+    ConditionerParams condition_params;
+    condition_params.text = SAFE_STR(text);
+    condition_params.clip_skip = effective.clip_skip;
+    condition_params.width = effective.width;
+    condition_params.height = effective.height;
+    condition_params.zero_out_masked = effective.force_zero_uncond;
+    condition_params.adm_in_channels = static_cast<int>(sd_ctx->sd->diffusion_model->get_adm_in_channels());
+
+    int64_t t0 = ggml_time_ms();
+    SDCondition condition = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
+                                                                                condition_params);
+    int64_t t1 = ggml_time_ms();
+    if (condition.empty()) {
+        LOG_ERROR("sd_conditioning_encode_text produced empty conditioning");
+        return false;
+    }
+
+    const char* debug_name = effective.cache_key_hint != nullptr ? effective.cache_key_hint
+                                                                  : (effective.force_zero_uncond ? "conditioning_negative"
+                                                                                                  : "conditioning_positive");
+    sd_conditioning_handle_t handle = sd_conditioning_register(sd_ctx,
+                                                               std::move(condition),
+                                                               effective,
+                                                               debug_name);
+    if (handle == 0) {
+        LOG_ERROR("sd_conditioning_encode_text failed to register conditioning handle");
+        return false;
+    }
+    *out_handle = handle;
+    if (out_desc != nullptr) {
+        auto resource = sd_conditioning_lookup(sd_ctx, handle);
+        if (resource != nullptr) {
+            sd_conditioning_fill_desc(*resource, out_desc);
+        }
+    }
+
+    LOG_INFO("[Timing] sd_conditioning_encode_text condition_encode_ms=%" PRId64 " handle=%" PRIu64 " storage=host_tensor device_resident=false zero_out_masked=%s",
+             t1 - t0,
+             handle,
+             effective.force_zero_uncond ? "true" : "false");
+    return true;
+}
+
+SD_API bool sd_conditioning_retain(sd_ctx_t* sd_ctx, sd_conditioning_handle_t handle) {
+    auto resource = sd_conditioning_lookup(sd_ctx, handle);
+    if (resource == nullptr) {
+        return false;
+    }
+    resource->refcount += 1;
+    if (trace_conditioning_handles_enabled()) {
+        LOG_INFO("[Conditioning] handle retain id=%" PRIu64 " refcount=%u", handle, resource->refcount);
+    }
+    return true;
+}
+
+SD_API bool sd_conditioning_release(sd_ctx_t* sd_ctx, sd_conditioning_handle_t handle) {
+    auto resource = sd_conditioning_lookup(sd_ctx, handle);
+    if (resource == nullptr || resource->refcount == 0) {
+        return false;
+    }
+    resource->refcount -= 1;
+    if (trace_conditioning_handles_enabled()) {
+        LOG_INFO("[Conditioning] handle release id=%" PRIu64 " refcount=%u", handle, resource->refcount);
+    }
+    if (resource->refcount == 0) {
+        sd_ctx->conditioning_resources.erase(handle);
+    }
+    return true;
+}
+
+SD_API bool sd_conditioning_get_desc(sd_ctx_t* sd_ctx,
+                                     sd_conditioning_handle_t handle,
+                                     sd_conditioning_desc_t* out_desc) {
+    auto resource = sd_conditioning_lookup(sd_ctx, handle);
+    if (resource == nullptr) {
+        return false;
+    }
+    return sd_conditioning_fill_desc(*resource, out_desc);
+}
+
+SD_API bool sd_conditioning_debug_name(sd_ctx_t* sd_ctx,
+                                       sd_conditioning_handle_t handle,
+                                       const char* name) {
+    auto resource = sd_conditioning_lookup(sd_ctx, handle);
+    if (resource == nullptr) {
+        return false;
+    }
+    resource->debug_name = name != nullptr ? name : "";
+    return true;
 }
 
 SD_API bool sd_release_clip_model_params(sd_ctx_t* sd_ctx) {

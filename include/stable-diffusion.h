@@ -445,6 +445,62 @@ typedef struct sd_gpu_capabilities_t {
     uint32_t reserved[8];
 } sd_gpu_capabilities_t;
 
+typedef uint64_t sd_conditioning_handle_t;
+
+typedef struct sd_conditioning_desc_t {
+    uint32_t struct_size;
+    uint32_t version;
+    sd_conditioning_handle_t handle;
+    uint32_t flags;
+    uint32_t refcount;
+    int64_t batch;
+    int64_t token_count;
+    int64_t crossattn_dim;
+    int64_t vector_dim;
+    int64_t concat_channels;
+    int64_t t5_token_count;
+    enum sd_tensor_dtype_t dtype;
+    enum sd_backend_kind_t backend;
+    uint64_t estimated_bytes;
+    bool device_resident;
+    bool has_crossattn;
+    bool has_vector;
+    bool has_concat;
+    bool has_t5_ids;
+    bool has_t5_weights;
+    bool copy_safe;
+    uint32_t extra_crossattn_count;
+    int clip_skip;
+    int width;
+    int height;
+    bool zero_out_masked;
+    char debug_name[64];
+    uint32_t reserved[16];
+} sd_conditioning_desc_t;
+
+typedef struct sd_conditioning_encode_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    int clip_skip;
+    int width;
+    int height;
+    bool force_zero_uncond;
+    const char* cache_key_hint;
+    uint32_t reserved[16];
+} sd_conditioning_encode_options_t;
+
+typedef struct sd_conditioning_capabilities_t {
+    uint32_t struct_size;
+    uint32_t version;
+    bool supports_text_conditioning_encode;
+    bool supports_conditioning_handles;
+    bool supports_conditioning_gpu_resident;
+    bool supports_sampler_conditioning_handle_input;
+    bool supports_conditioning_handle_reuse;
+    bool supports_conditioning_cpu_resident;
+    uint32_t reserved[16];
+} sd_conditioning_capabilities_t;
+
 enum sd_model_family_t {
     SD_MODEL_FAMILY_UNKNOWN = 0,
     SD_MODEL_FAMILY_SD1 = 1,
@@ -724,6 +780,12 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
                                                const sd_img_gen_params_t* sd_img_gen_params,
                                                sd_gpu_handle_t init_gpu_latent,
                                                sd_gpu_handle_t* out_gpu_latent);
+SD_API bool sd_sample_latent_gpu_with_conditioning(sd_ctx_t* sd_ctx,
+                                                   const sd_img_gen_params_t* sd_img_gen_params,
+                                                   const sd_latent_t* init_latent,
+                                                   sd_conditioning_handle_t positive,
+                                                   sd_conditioning_handle_t negative,
+                                                   sd_gpu_handle_t* out_gpu_latent);
 // Experimental SDXL/SD1 Euler proof path. Requires SDCPP_EXPERIMENTAL_TRUE_GPU_SAMPLER=1.
 // This is not production sampling: initial noise is device-procedural rather than seed-compatible Philox.
 SD_API bool sd_sample_latent_gpu_true_euler_spike(sd_ctx_t* sd_ctx,
@@ -750,6 +812,7 @@ SD_API bool sd_estimate_vae_normal_memory(sd_ctx_t* sd_ctx,
                                           sd_vae_memory_report_t* report);
 SD_API bool sd_get_vae_capabilities(sd_ctx_t* sd_ctx, sd_vae_capabilities_t* capabilities);
 SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* capabilities);
+SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_capabilities_t* capabilities);
 SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeline_capabilities_t* capabilities);
 SD_API void sd_marigold_iid_options_init(sd_marigold_iid_options_t* options);
 SD_API sd_marigold_iid_result_t* sd_marigold_iid_predict(sd_ctx_t* sd_ctx,
@@ -804,6 +867,20 @@ SD_API bool sd_gpu_tensor_download(sd_ctx_t* sd_ctx,
                                    void* dst,
                                    uint64_t dst_bytes,
                                    const sd_download_options_t* options);
+SD_API void sd_conditioning_encode_options_init(sd_conditioning_encode_options_t* options);
+SD_API bool sd_conditioning_encode_text(sd_ctx_t* sd_ctx,
+                                        const char* text,
+                                        const sd_conditioning_encode_options_t* options,
+                                        sd_conditioning_handle_t* out_handle,
+                                        sd_conditioning_desc_t* out_desc);
+SD_API bool sd_conditioning_retain(sd_ctx_t* sd_ctx, sd_conditioning_handle_t handle);
+SD_API bool sd_conditioning_release(sd_ctx_t* sd_ctx, sd_conditioning_handle_t handle);
+SD_API bool sd_conditioning_get_desc(sd_ctx_t* sd_ctx,
+                                     sd_conditioning_handle_t handle,
+                                     sd_conditioning_desc_t* out_desc);
+SD_API bool sd_conditioning_debug_name(sd_ctx_t* sd_ctx,
+                                       sd_conditioning_handle_t handle,
+                                       const char* name);
 SD_API bool sd_release_clip_model_params(sd_ctx_t* sd_ctx);
 SD_API bool sd_release_diffusion_model_params(sd_ctx_t* sd_ctx);
 SD_API void free_sd_latent(sd_latent_t* latent);

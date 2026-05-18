@@ -51,6 +51,8 @@ struct Args {
     bool gpu_decode_output = false;
     bool download_gpu_output = false;
     bool download_gpu_output_buffer = false;
+    bool condition_handles = false;
+    bool condition_handles_reuse = false;
     bool strict_gpu_resident = false;
     bool dump_gpu_handle_desc = false;
     bool expect_gpu_encode_refusal = false;
@@ -103,6 +105,8 @@ static void usage(const char* argv0) {
         << "  --gpu-decode-output      call sd_decode_latent_normal_gpu and keep decode output as a GPU handle\n"
         << "  --download-gpu-output    explicitly download the GPU image handle and write it\n"
         << "  --download-gpu-output-buffer download GPU image directly into caller-owned RGBA8 memory\n"
+        << "  --condition-handles      encode prompt/negative into resident conditioning handles and sample with them\n"
+        << "  --condition-handles-reuse sample twice with the same conditioning handles to prove CLIP encode is not rerun\n"
         << "  --strict-gpu-resident    set SDCPP_STRICT_GPU_RESIDENT=1 for GPU-output checks\n"
         << "  --dump-gpu-handle-desc   print GPU handle descriptor after decode\n"
         << "  --expect-gpu-encode-refusal treat sd_encode_image_normal_gpu refusal as a passing smoke result\n"
@@ -257,6 +261,17 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.download_gpu_output = true;
         } else if (arg == "--download-gpu-output-buffer") {
             args.download_gpu_output_buffer = true;
+        } else if (arg == "--condition-handles") {
+            args.condition_handles = true;
+            args.gpu_sample_output = true;
+            args.sample = true;
+            args.sample_without_init = true;
+        } else if (arg == "--condition-handles-reuse") {
+            args.condition_handles = true;
+            args.condition_handles_reuse = true;
+            args.gpu_sample_output = true;
+            args.sample = true;
+            args.sample_without_init = true;
         } else if (arg == "--strict-gpu-resident") {
             args.strict_gpu_resident = true;
         } else if (arg == "--dump-gpu-handle-desc") {
@@ -330,6 +345,9 @@ static sd_ctx_t* create_context(const Args& args, bool vae_decode_only) {
     ctx_params.offload_params_to_cpu = false;
     ctx_params.keep_clip_on_cpu      = false;
     ctx_params.keep_vae_on_cpu       = false;
+    if (args.condition_handles_reuse) {
+        ctx_params.free_params_immediately = false;
+    }
 
     std::cout << "creating context vae_decode_only=" << (vae_decode_only ? "true" : "false") << "\n";
     return new_sd_ctx(&ctx_params);
@@ -413,6 +431,28 @@ static void print_gpu_desc(sd_ctx_t* ctx, const char* label, sd_gpu_handle_t han
               << " bytes=" << desc.byte_size
               << " flags=" << desc.flags
               << " refcount=" << desc.refcount << "\n";
+}
+
+static void print_conditioning_desc(sd_ctx_t* ctx, const char* label, sd_conditioning_handle_t handle) {
+    sd_conditioning_desc_t desc{};
+    if (!sd_conditioning_get_desc(ctx, handle, &desc)) {
+        std::cout << label << "_desc unavailable handle=" << handle << "\n";
+        return;
+    }
+    std::cout << label << "_desc handle=" << desc.handle
+              << " backend=" << desc.backend
+              << " dtype=" << desc.dtype
+              << " device_resident=" << (desc.device_resident ? "true" : "false")
+              << " batch=" << desc.batch
+              << " tokens=" << desc.token_count
+              << " crossattn_dim=" << desc.crossattn_dim
+              << " vector_dim=" << desc.vector_dim
+              << " bytes=" << desc.estimated_bytes
+              << " clip_skip=" << desc.clip_skip
+              << " size=" << desc.width << "x" << desc.height
+              << " zero_out_masked=" << (desc.zero_out_masked ? "true" : "false")
+              << " refcount=" << desc.refcount
+              << " name=\"" << desc.debug_name << "\"\n";
 }
 
 struct LatentDiffStats {
@@ -837,6 +877,59 @@ int main(int argc, char** argv) {
             std::cout << "loaded reference image " << ref_image.width << "x" << ref_image.height << "x" << ref_image.channel << "\n";
         }
 
+        sd_conditioning_handle_t positive_condition = 0;
+        sd_conditioning_handle_t negative_condition = 0;
+        if (args.condition_handles) {
+            sd_conditioning_capabilities_t condition_caps{};
+            if (!sd_get_conditioning_capabilities(ctx, &condition_caps) ||
+                !condition_caps.supports_text_conditioning_encode ||
+                !condition_caps.supports_conditioning_handles ||
+                !condition_caps.supports_sampler_conditioning_handle_input) {
+                std::cerr << "conditioning handle capabilities are not available\n";
+                if (ref_image.data != nullptr) free(ref_image.data);
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            std::cout << "conditioning_capabilities"
+                      << " text_encode=" << (condition_caps.supports_text_conditioning_encode ? "true" : "false")
+                      << " handles=" << (condition_caps.supports_conditioning_handles ? "true" : "false")
+                      << " gpu_resident=" << (condition_caps.supports_conditioning_gpu_resident ? "true" : "false")
+                      << " sampler_input=" << (condition_caps.supports_sampler_conditioning_handle_input ? "true" : "false")
+                      << " reuse=" << (condition_caps.supports_conditioning_handle_reuse ? "true" : "false")
+                      << "\n";
+
+            sd_conditioning_encode_options_t condition_options;
+            sd_conditioning_encode_options_init(&condition_options);
+            condition_options.clip_skip = gen_params.clip_skip;
+            condition_options.width = gen_params.width;
+            condition_options.height = gen_params.height;
+
+            sd_conditioning_desc_t positive_desc{};
+            condition_options.cache_key_hint = "conditioning_positive";
+            if (!sd_conditioning_encode_text(ctx, args.prompt.c_str(), &condition_options, &positive_condition, &positive_desc)) {
+                std::cerr << "sd_conditioning_encode_text positive failed\n";
+                if (ref_image.data != nullptr) free(ref_image.data);
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            print_conditioning_desc(ctx, "positive_condition", positive_condition);
+
+            condition_options.force_zero_uncond = (caps.family == SD_MODEL_FAMILY_SDXL && args.negative_prompt.empty());
+            condition_options.cache_key_hint = "conditioning_negative";
+            sd_conditioning_desc_t negative_desc{};
+            if (!sd_conditioning_encode_text(ctx, args.negative_prompt.c_str(), &condition_options, &negative_condition, &negative_desc)) {
+                std::cerr << "sd_conditioning_encode_text negative failed\n";
+                sd_conditioning_release(ctx, positive_condition);
+                if (ref_image.data != nullptr) free(ref_image.data);
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+            print_conditioning_desc(ctx, "negative_condition", negative_condition);
+        }
+
         if (args.compare_gpu_sampler_backend_euler) {
             std::cout << "comparing CPU sampler vs experimental Euler backend sampler\n";
             sd_latent_t* cpu_sampled = sd_sample_latent(ctx, &gen_params, nullptr);
@@ -926,7 +1019,36 @@ int main(int argc, char** argv) {
         }
 
         if (args.gpu_sample_output) {
-            if (args.true_gpu_sampler_spike) {
+            if (args.condition_handles) {
+                std::cout << "calling sd_sample_latent_gpu_with_conditioning\n";
+                if (!sd_sample_latent_gpu_with_conditioning(ctx, &gen_params, nullptr, positive_condition, negative_condition, &sampled_gpu_latent)) {
+                    std::cerr << "sd_sample_latent_gpu_with_conditioning failed\n";
+                    sd_conditioning_release(ctx, positive_condition);
+                    sd_conditioning_release(ctx, negative_condition);
+                    if (ref_image.data != nullptr) free(ref_image.data);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                if (args.condition_handles_reuse) {
+                    sd_gpu_handle_release(ctx, sampled_gpu_latent);
+                    sampled_gpu_latent = 0;
+
+                    sd_gpu_handle_t reused_gpu_latent = 0;
+                    std::cout << "calling sd_sample_latent_gpu_with_conditioning reuse\n";
+                    if (!sd_sample_latent_gpu_with_conditioning(ctx, &gen_params, nullptr, positive_condition, negative_condition, &reused_gpu_latent)) {
+                        std::cerr << "sd_sample_latent_gpu_with_conditioning reuse failed\n";
+                        sd_conditioning_release(ctx, positive_condition);
+                        sd_conditioning_release(ctx, negative_condition);
+                        if (ref_image.data != nullptr) free(ref_image.data);
+                        if (encoded != nullptr) free_sd_latent(encoded);
+                        free_sd_ctx(ctx);
+                        return 1;
+                    }
+                    sampled_gpu_latent = reused_gpu_latent;
+                    std::cout << "conditioning_handle_reuse=true\n";
+                }
+            } else if (args.true_gpu_sampler_spike) {
                 std::cout << "calling sd_sample_latent_gpu_true_euler_spike\n";
                 if (!sd_sample_latent_gpu_true_euler_spike(ctx, &gen_params, &sampled_gpu_latent)) {
                     std::cerr << "sd_sample_latent_gpu_true_euler_spike failed\n";
@@ -1009,6 +1131,12 @@ int main(int argc, char** argv) {
         }
         if (ref_image.data != nullptr) {
             free(ref_image.data);
+        }
+        if (positive_condition != 0) {
+            sd_conditioning_release(ctx, positive_condition);
+        }
+        if (negative_condition != 0) {
+            sd_conditioning_release(ctx, negative_condition);
         }
     }
     if (sample_init_gpu_latent_owned) {
