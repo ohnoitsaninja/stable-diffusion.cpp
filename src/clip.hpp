@@ -770,7 +770,11 @@ public:
             auto text_projection = params["text_projection"];
             ggml_tensor* pooled  = ggml_view_1d(ctx->ggml_ctx, x, hidden_size, x->nb[1] * max_token_idx);
             if (text_projection != nullptr) {
-                pooled = ggml_ext_linear(ctx->ggml_ctx, pooled, text_projection, nullptr);
+                // PyTorch CLIPTextModelWithProjection stores Linear weights as
+                // [out, in]. The pooled projection is square for SDXL CLIP-G, so
+                // shape checks alone cannot catch the required transpose.
+                auto projected_weight = ggml_cont(ctx->ggml_ctx, ggml_transpose(ctx->ggml_ctx, text_projection));
+                pooled                = ggml_ext_linear(ctx->ggml_ctx, pooled, projected_weight, nullptr);
             } else {
                 LOG_DEBUG("identity projection");
             }

@@ -321,7 +321,16 @@ typedef struct sd_vae_memory_report_t {
     char stage_output_backend[16][32];
     char math_dtype_policy[96];
     char fallback_reason[192];
-    uint32_t reserved[16];
+    uint32_t decode_setup_ms;
+    uint32_t decode_context_ms;
+    uint32_t decode_latent_d2d_ms;
+    uint32_t decode_graph_ms;
+    uint32_t decode_image_d2d_ms;
+    uint32_t decode_download_ms;
+    uint32_t decode_context_reuse;
+    uint32_t decode_same_context_attempted;
+    uint32_t decode_same_context_succeeded;
+    uint32_t reserved[7];
 } sd_vae_memory_report_t;
 
 typedef struct sd_vae_capabilities_t {
@@ -366,6 +375,26 @@ enum sd_tensor_layout_t {
     SD_LAYOUT_WHCN_GGML = 2,
     SD_LAYOUT_PACKED_RGBA8 = 3,
 };
+
+typedef struct sd_latent_view_t {
+    uint32_t struct_size;
+    uint32_t version;
+    enum sd_tensor_dtype_t dtype;
+    enum sd_tensor_layout_t layout;
+    int64_t n;
+    int64_t c;
+    int64_t h;
+    int64_t w;
+    int64_t stride_n;
+    int64_t stride_c;
+    int64_t stride_h;
+    int64_t stride_w;
+    uint64_t element_count;
+    uint64_t byte_size;
+    const float* data;
+    uint32_t flags;
+    uint32_t reserved[8];
+} sd_latent_view_t;
 
 enum sd_image_color_space_t {
     SD_COLOR_LINEAR_RGB = 0,
@@ -794,6 +823,13 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning(sd_ctx_t* sd_ctx
                                                                sd_conditioning_handle_t positive,
                                                                sd_conditioning_handle_t negative,
                                                                sd_gpu_handle_t* out_gpu_latent);
+SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu(sd_ctx_t* sd_ctx,
+                                                                             const sd_img_gen_params_t* sd_img_gen_params,
+                                                                             sd_gpu_handle_t init_gpu_latent,
+                                                                             sd_gpu_handle_t noise_gpu_latent,
+                                                                             sd_conditioning_handle_t positive,
+                                                                             sd_conditioning_handle_t negative,
+                                                                             sd_gpu_handle_t* out_gpu_latent);
 // Experimental SDXL/SD1 Euler proof path. Requires SDCPP_EXPERIMENTAL_TRUE_GPU_SAMPLER=1.
 // This is not production sampling: initial noise is device-procedural rather than seed-compatible Philox.
 SD_API bool sd_sample_latent_gpu_true_euler_spike(sd_ctx_t* sd_ctx,
@@ -850,6 +886,9 @@ SD_API bool sd_encode_image_normal_gpu(sd_ctx_t* sd_ctx,
                                        const sd_vae_run_options_t* options,
                                        sd_gpu_handle_t* out_gpu_latent,
                                        sd_vae_memory_report_t* report);
+SD_API bool sd_prewarm_vae_decode_bridge(sd_ctx_t* sd_ctx,
+                                          const sd_vae_run_options_t* options,
+                                          sd_vae_memory_report_t* report);
 SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
                                             sd_gpu_handle_t gpu_latent,
                                             const sd_vae_run_options_t* options,
@@ -875,6 +914,23 @@ SD_API bool sd_gpu_tensor_download(sd_ctx_t* sd_ctx,
                                    void* dst,
                                    uint64_t dst_bytes,
                                    const sd_download_options_t* options);
+SD_API bool sd_latent_get_view(const sd_latent_t* latent,
+                               sd_latent_view_t* out_view);
+SD_API bool sd_latent_export_f32(const sd_latent_t* latent,
+                                 float* dst,
+                                 uint64_t dst_elements,
+                                 sd_latent_view_t* out_view);
+SD_API sd_latent_t* sd_latent_import_f32(const float* data,
+                                         uint64_t element_count,
+                                         uint32_t w,
+                                         uint32_t h,
+                                         uint32_t c);
+SD_API bool sd_gpu_latent_export_f32_nchw_debug(sd_ctx_t* sd_ctx,
+                                                sd_gpu_handle_t gpu_latent,
+                                                float* dst,
+                                                uint64_t dst_elements,
+                                                sd_latent_view_t* out_view,
+                                                const sd_download_options_t* options);
 SD_API void sd_conditioning_encode_options_init(sd_conditioning_encode_options_t* options);
 SD_API bool sd_conditioning_encode_text(sd_ctx_t* sd_ctx,
                                         const char* text,

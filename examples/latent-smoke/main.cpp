@@ -1,9 +1,12 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -21,6 +24,7 @@ struct Args {
     std::string llm;
     std::string image;
     std::string ref_image;
+    std::string import_noise_npy;
     std::string output = "latent_smoke.png";
     std::string prompt = "a detailed fantasy orc portrait, high quality";
     std::string negative_prompt = "blurry, low quality, noisy";
@@ -45,10 +49,13 @@ struct Args {
     bool compare_gpu_sampler_backend_euler = false;
     bool gpu_init_sample_input = false;
     bool gpu_encode_output = false;
+    bool prewarm_decode_bridge = false;
+    bool compare_roundtrip_input = false;
     bool gpu_upload_latent_decode_input = false;
     bool gpu_latent_decode_input = false;
     bool download_gpu_latent = false;
     bool gpu_decode_output = false;
+    bool decode_twice = false;
     bool download_gpu_output = false;
     bool download_gpu_output_buffer = false;
     bool condition_handles = false;
@@ -97,17 +104,21 @@ static void usage(const char* argv0) {
         << "  --compare-gpu-sampler-backend-euler compare CPU sampler latent vs experimental Euler backend latent\n"
         << "  --gpu-init-sample-input  pass a GPU latent handle into the sampler init-latent bridge API\n"
         << "  --gpu-encode-output      call sd_encode_image_normal_gpu and keep encoded latent as a GPU handle\n"
+        << "  --prewarm-decode-bridge  create/cache isolated VAE decode context before decode\n"
+        << "  --compare-roundtrip-input compare downloaded output RGB against the input image\n"
         << "  --gpu-upload-latent-decode-input upload the CPU latent, then decode from the GPU latent handle\n"
         << "  --gpu-latent-decode-input decode from a GPU latent handle with sd_decode_gpu_latent_normal_gpu\n"
         << "  --download-gpu-latent    explicitly download the sampled GPU latent handle\n"
         << "  --skip-estimate          skip sd_estimate_vae_normal_memory smoke checks\n"
         << "  --split-decode-context   decode with a separate vae_decode_only=true context\n"
         << "  --gpu-decode-output      call sd_decode_latent_normal_gpu and keep decode output as a GPU handle\n"
+        << "  --decode-twice           decode the same GPU latent twice to test cached decode context reuse\n"
         << "  --download-gpu-output    explicitly download the GPU image handle and write it\n"
         << "  --download-gpu-output-buffer download GPU image directly into caller-owned RGBA8 memory\n"
         << "  --condition-handles      encode prompt/negative into resident conditioning handles and sample with them\n"
         << "                           combine with --gpu-init-sample-input to test I2I conditioning-handle sampler bridge\n"
         << "  --condition-handles-reuse sample twice with the same conditioning handles to prove CLIP encode is not rerun\n"
+        << "  --import-noise-npy <path> import f32 NCHW noise .npy as a GPU latent for parity/debug sampling\n"
         << "  --strict-gpu-resident    set SDCPP_STRICT_GPU_RESIDENT=1 for GPU-output checks\n"
         << "  --dump-gpu-handle-desc   print GPU handle descriptor after decode\n"
         << "  --expect-gpu-encode-refusal treat sd_encode_image_normal_gpu refusal as a passing smoke result\n"
@@ -243,6 +254,10 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.sample = true;
         } else if (arg == "--gpu-encode-output") {
             args.gpu_encode_output = true;
+        } else if (arg == "--prewarm-decode-bridge") {
+            args.prewarm_decode_bridge = true;
+        } else if (arg == "--compare-roundtrip-input") {
+            args.compare_roundtrip_input = true;
         } else if (arg == "--gpu-upload-latent-decode-input") {
             args.gpu_upload_latent_decode_input = true;
             args.gpu_latent_decode_input = true;
@@ -258,6 +273,8 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.split_decode_context = true;
         } else if (arg == "--gpu-decode-output") {
             args.gpu_decode_output = true;
+        } else if (arg == "--decode-twice") {
+            args.decode_twice = true;
         } else if (arg == "--download-gpu-output") {
             args.download_gpu_output = true;
         } else if (arg == "--download-gpu-output-buffer") {
@@ -273,6 +290,10 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.gpu_sample_output = true;
             args.sample = true;
             args.sample_without_init = true;
+        } else if (arg == "--import-noise-npy") {
+            const char* value = need_value("--import-noise-npy");
+            if (value == nullptr) return false;
+            args.import_noise_npy = value;
         } else if (arg == "--strict-gpu-resident") {
             args.strict_gpu_resident = true;
         } else if (arg == "--dump-gpu-handle-desc") {
@@ -312,11 +333,15 @@ static bool parse_args(int argc, char** argv, Args& args) {
     if ((args.model.empty() && args.diffusion_model.empty()) || args.image.empty()) {
         return false;
     }
-    if (args.condition_handles && args.gpu_init_sample_input) {
+    if (args.gpu_init_sample_input) {
         args.sample_without_init = false;
     }
     if (args.image_channels != 3 && args.image_channels != 4) {
         std::cerr << "--image-channels must be 3 or 4\n";
+        return false;
+    }
+    if (!args.import_noise_npy.empty() && !args.condition_handles) {
+        std::cerr << "--import-noise-npy currently requires --condition-handles so the imported-noise sampler API can be exercised\n";
         return false;
     }
     return true;
@@ -328,6 +353,127 @@ static void set_env_value(const char* name, const char* value) {
 #else
     setenv(name, value, 1);
 #endif
+}
+
+static bool load_f32_npy(const std::string& path, std::vector<float>& data, std::vector<int64_t>& shape) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        std::cerr << "failed to open npy: " << path << "\n";
+        return false;
+    }
+    char magic[6] = {};
+    in.read(magic, sizeof(magic));
+    if (std::memcmp(magic, "\x93NUMPY", 6) != 0) {
+        std::cerr << "not an npy file: " << path << "\n";
+        return false;
+    }
+    uint8_t major = 0;
+    uint8_t minor = 0;
+    in.read(reinterpret_cast<char*>(&major), sizeof(major));
+    in.read(reinterpret_cast<char*>(&minor), sizeof(minor));
+    uint32_t header_len = 0;
+    if (major == 1) {
+        uint16_t len16 = 0;
+        in.read(reinterpret_cast<char*>(&len16), sizeof(len16));
+        header_len = len16;
+    } else if (major == 2 || major == 3) {
+        in.read(reinterpret_cast<char*>(&header_len), sizeof(header_len));
+    } else {
+        std::cerr << "unsupported npy version: " << static_cast<int>(major) << "." << static_cast<int>(minor) << "\n";
+        return false;
+    }
+    std::string header(header_len, '\0');
+    in.read(header.data(), static_cast<std::streamsize>(header.size()));
+    if (!in.good()) {
+        std::cerr << "failed to read npy header: " << path << "\n";
+        return false;
+    }
+    if (header.find("'descr': '<f4'") == std::string::npos &&
+        header.find("\"descr\": \"<f4\"") == std::string::npos &&
+        header.find("'descr': '|f4'") == std::string::npos &&
+        header.find("\"descr\": \"|f4\"") == std::string::npos) {
+        std::cerr << "npy must be f32 little-endian: " << header << "\n";
+        return false;
+    }
+    if (header.find("True") != std::string::npos) {
+        std::cerr << "Fortran-order npy is not supported: " << header << "\n";
+        return false;
+    }
+    const size_t open = header.find('(');
+    const size_t close = header.find(')', open == std::string::npos ? 0 : open + 1);
+    if (open == std::string::npos || close == std::string::npos || close <= open + 1) {
+        std::cerr << "npy shape missing: " << header << "\n";
+        return false;
+    }
+    std::string shape_text = header.substr(open + 1, close - open - 1);
+    shape.clear();
+    std::stringstream ss(shape_text);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        size_t first = token.find_first_not_of(" \t\r\n");
+        size_t last = token.find_last_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            continue;
+        }
+        int64_t dim = std::strtoll(token.substr(first, last - first + 1).c_str(), nullptr, 10);
+        if (dim <= 0) {
+            std::cerr << "invalid npy shape dim: " << token << "\n";
+            return false;
+        }
+        shape.push_back(dim);
+    }
+    if (shape.empty()) {
+        std::cerr << "empty npy shape: " << header << "\n";
+        return false;
+    }
+    uint64_t elements = 1;
+    for (int64_t dim : shape) {
+        elements *= static_cast<uint64_t>(dim);
+    }
+    data.resize(static_cast<size_t>(elements));
+    in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(elements * sizeof(float)));
+    if (!in.good()) {
+        std::cerr << "failed to read npy data: " << path << "\n";
+        return false;
+    }
+    return true;
+}
+
+static sd_gpu_handle_t upload_noise_npy_as_gpu_latent(sd_ctx_t* ctx, const std::string& path) {
+    std::vector<float> data;
+    std::vector<int64_t> shape;
+    if (!load_f32_npy(path, data, shape)) {
+        return 0;
+    }
+    if (shape.size() != 4 || shape[0] != 1) {
+        std::cerr << "noise npy must have shape NCHW with N=1, got [";
+        for (size_t i = 0; i < shape.size(); ++i) {
+            if (i != 0) std::cerr << ", ";
+            std::cerr << shape[i];
+        }
+        std::cerr << "]\n";
+        return 0;
+    }
+    const uint32_t c = static_cast<uint32_t>(shape[1]);
+    const uint32_t h = static_cast<uint32_t>(shape[2]);
+    const uint32_t w = static_cast<uint32_t>(shape[3]);
+    sd_latent_t* latent = sd_latent_import_f32(data.data(), data.size(), w, h, c);
+    if (latent == nullptr) {
+        std::cerr << "sd_latent_import_f32 failed for noise npy\n";
+        return 0;
+    }
+    sd_gpu_handle_t handle = 0;
+    if (!sd_cpu_latent_upload(ctx, latent, &handle, nullptr)) {
+        std::cerr << "sd_cpu_latent_upload failed for imported noise\n";
+        free_sd_latent(latent);
+        return 0;
+    }
+    free_sd_latent(latent);
+    std::cout << "imported_noise_gpu_handle=" << handle
+              << " source=\"" << path << "\""
+              << " shape_nchw=1x" << c << "x" << h << "x" << w
+              << " elements=" << data.size() << "\n";
+    return handle;
 }
 
 static sd_ctx_t* create_context(const Args& args, bool vae_decode_only) {
@@ -410,6 +556,15 @@ static void print_vae_report(const char* label, const sd_vae_memory_report_t& re
               << " direct_conv=" << (report.used_direct_conv ? "true" : "false")
               << " device_resident=" << (report.device_resident_stages ? "true" : "false")
               << " compact=" << (report.compact_activation_storage ? "true" : "false")
+              << " decode_setup_ms=" << report.decode_setup_ms
+              << " decode_context_ms=" << report.decode_context_ms
+              << " decode_latent_d2d_ms=" << report.decode_latent_d2d_ms
+              << " decode_graph_ms=" << report.decode_graph_ms
+              << " decode_image_d2d_ms=" << report.decode_image_d2d_ms
+              << " decode_download_ms=" << report.decode_download_ms
+              << " decode_context_reuse=" << report.decode_context_reuse
+              << " decode_same_context_attempted=" << report.decode_same_context_attempted
+              << " decode_same_context_succeeded=" << report.decode_same_context_succeeded
               << " math_policy=\"" << report.math_dtype_policy << "\""
               << " fallback=\"" << report.fallback_reason << "\""
               << "\n";
@@ -435,6 +590,52 @@ static void print_gpu_desc(sd_ctx_t* ctx, const char* label, sd_gpu_handle_t han
               << " bytes=" << desc.byte_size
               << " flags=" << desc.flags
               << " refcount=" << desc.refcount << "\n";
+}
+
+static void print_rgb_diff_against_input(const char* label,
+                                         const std::vector<uint8_t>& reference,
+                                         uint32_t reference_width,
+                                         uint32_t reference_height,
+                                         uint32_t reference_channels,
+                                         const uint8_t* candidate,
+                                         uint32_t candidate_width,
+                                         uint32_t candidate_height,
+                                         uint32_t candidate_channels) {
+    if (reference.empty() || candidate == nullptr ||
+        reference_width != candidate_width ||
+        reference_height != candidate_height ||
+        reference_channels < 3 ||
+        candidate_channels < 3) {
+        std::cout << label << " skipped=true reason=shape_or_channel_mismatch"
+                  << " reference=" << reference_width << "x" << reference_height << "x" << reference_channels
+                  << " candidate=" << candidate_width << "x" << candidate_height << "x" << candidate_channels << "\n";
+        return;
+    }
+
+    const uint64_t pixels = static_cast<uint64_t>(reference_width) * reference_height;
+    double abs_sum = 0.0;
+    double mse_sum = 0.0;
+    uint32_t max_abs = 0;
+    for (uint64_t i = 0; i < pixels; ++i) {
+        const uint64_t ref_base = i * reference_channels;
+        const uint64_t cand_base = i * candidate_channels;
+        for (uint32_t c = 0; c < 3; ++c) {
+            const int diff = static_cast<int>(candidate[cand_base + c]) -
+                             static_cast<int>(reference[ref_base + c]);
+            const uint32_t abs_diff = static_cast<uint32_t>(std::abs(diff));
+            abs_sum += static_cast<double>(abs_diff);
+            mse_sum += static_cast<double>(diff * diff);
+            max_abs = std::max(max_abs, abs_diff);
+        }
+    }
+
+    const double samples = static_cast<double>(pixels) * 3.0;
+    const double mean_abs = samples > 0.0 ? abs_sum / samples : 0.0;
+    const double mse = samples > 0.0 ? mse_sum / samples : 0.0;
+    const double psnr = mse > 0.0 ? 20.0 * std::log10(255.0 / std::sqrt(mse)) : 99.0;
+    std::cout << label << " mean_abs=" << mean_abs
+              << " psnr=" << psnr
+              << " max_abs=" << max_abs << "\n";
 }
 
 static void print_conditioning_desc(sd_ctx_t* ctx, const char* label, sd_conditioning_handle_t handle) {
@@ -484,7 +685,17 @@ static bool download_gpu_float_tensor(sd_ctx_t* ctx,
         return false;
     }
     out.resize(static_cast<size_t>(desc.byte_size / sizeof(float)));
-    if (!sd_gpu_tensor_download(ctx, handle, out.data(), desc.byte_size, nullptr)) {
+    if (desc.kind == SD_GPU_RESOURCE_LATENT) {
+        sd_latent_view_t view{};
+        if (!sd_gpu_latent_export_f32_nchw_debug(ctx, handle, out.data(), out.size(), &view, nullptr)) {
+            std::cerr << "sd_gpu_latent_export_f32_nchw_debug failed for handle=" << handle << "\n";
+            return false;
+        }
+        std::cout << "debug_export_gpu_latent handle=" << handle
+                  << " shape_nchw=" << view.n << "x" << view.c << "x" << view.h << "x" << view.w
+                  << " elements=" << view.element_count
+                  << " flags=" << view.flags << "\n";
+    } else if (!sd_gpu_tensor_download(ctx, handle, out.data(), desc.byte_size, nullptr)) {
         std::cerr << "sd_gpu_tensor_download failed for handle=" << handle << "\n";
         return false;
     }
@@ -498,14 +709,38 @@ static bool download_cpu_latent_as_float_tensor(sd_ctx_t* ctx,
                                                 const sd_latent_t* latent,
                                                 std::vector<float>& out,
                                                 sd_gpu_tensor_desc_t* out_desc = nullptr) {
-    sd_gpu_handle_t uploaded = 0;
-    if (!sd_cpu_latent_upload(ctx, latent, &uploaded, nullptr)) {
-        std::cerr << "sd_cpu_latent_upload failed for comparison\n";
+    sd_latent_view_t view{};
+    if (!sd_latent_get_view(latent, &view)) {
+        std::cerr << "sd_latent_get_view failed for comparison\n";
         return false;
     }
-    bool ok = download_gpu_float_tensor(ctx, uploaded, out, out_desc);
-    sd_gpu_handle_release(ctx, uploaded);
-    return ok;
+    out.resize(static_cast<size_t>(view.element_count));
+    if (!sd_latent_export_f32(latent, out.data(), out.size(), &view)) {
+        std::cerr << "sd_latent_export_f32 failed for comparison\n";
+        return false;
+    }
+    if (out_desc != nullptr) {
+        *out_desc = {};
+        out_desc->struct_size = sizeof(sd_gpu_tensor_desc_t);
+        out_desc->version = SD_VAE_API_VERSION;
+        out_desc->kind = SD_GPU_RESOURCE_LATENT;
+        out_desc->backend = SD_BACKEND_CPU;
+        out_desc->dtype = SD_DTYPE_F32;
+        out_desc->layout = SD_LAYOUT_NCHW;
+        out_desc->n = view.n;
+        out_desc->c = view.c;
+        out_desc->h = view.h;
+        out_desc->w = view.w;
+        out_desc->stride_n = view.stride_n;
+        out_desc->stride_c = view.stride_c;
+        out_desc->stride_h = view.stride_h;
+        out_desc->stride_w = view.stride_w;
+        out_desc->byte_size = view.byte_size;
+        out_desc->flags = view.flags;
+    }
+    std::cout << "debug_export_cpu_latent shape_nchw=" << view.n << "x" << view.c << "x" << view.h << "x" << view.w
+              << " elements=" << view.element_count << "\n";
+    return true;
 }
 
 static LatentDiffStats compare_float_tensors(const std::vector<float>& a,
@@ -730,6 +965,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "loaded image " << image.width << "x" << image.height << "x" << image.channel << "\n";
+    std::vector<uint8_t> roundtrip_reference;
+    uint32_t roundtrip_reference_width = image.width;
+    uint32_t roundtrip_reference_height = image.height;
+    uint32_t roundtrip_reference_channels = image.channel;
+    if (args.compare_roundtrip_input) {
+        const size_t bytes = static_cast<size_t>(image.width) *
+                             static_cast<size_t>(image.height) *
+                             static_cast<size_t>(image.channel);
+        roundtrip_reference.assign(image.data, image.data + bytes);
+    }
 
     if (args.marigold_iid) {
         sd_marigold_iid_options_t iid_options;
@@ -840,6 +1085,18 @@ int main(int argc, char** argv) {
     } else {
         std::cout << "skipping sd_encode_image; sampler init latent is null\n";
     }
+    if (args.prewarm_decode_bridge) {
+        sd_vae_memory_report_t prewarm_report;
+        if (!sd_prewarm_vae_decode_bridge(ctx, &vae_options, &prewarm_report)) {
+            std::cerr << "sd_prewarm_vae_decode_bridge failed\n";
+            if (encoded_gpu_latent != 0) sd_gpu_handle_release(ctx, encoded_gpu_latent);
+            if (encoded != nullptr) free_sd_latent(encoded);
+            free(image.data);
+            free_sd_ctx(ctx);
+            return 1;
+        }
+        print_vae_report("prewarm_decode_bridge_report", prewarm_report);
+    }
     free(image.data);
 
     sd_latent_t* latent_to_decode = encoded;
@@ -883,6 +1140,7 @@ int main(int argc, char** argv) {
 
         sd_conditioning_handle_t positive_condition = 0;
         sd_conditioning_handle_t negative_condition = 0;
+        sd_gpu_handle_t imported_noise_gpu = 0;
         if (args.condition_handles) {
             sd_conditioning_capabilities_t condition_caps{};
             if (!sd_get_conditioning_capabilities(ctx, &condition_caps) ||
@@ -934,6 +1192,19 @@ int main(int argc, char** argv) {
                 return 1;
             }
             print_conditioning_desc(ctx, "negative_condition", negative_condition);
+
+            if (!args.import_noise_npy.empty()) {
+                imported_noise_gpu = upload_noise_npy_as_gpu_latent(ctx, args.import_noise_npy);
+                if (imported_noise_gpu == 0) {
+                    sd_conditioning_release(ctx, positive_condition);
+                    sd_conditioning_release(ctx, negative_condition);
+                    if (ref_image.data != nullptr) free(ref_image.data);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                print_gpu_desc(ctx, "imported_noise_gpu_latent", imported_noise_gpu);
+            }
         }
 
         if (args.compare_gpu_sampler_backend_euler) {
@@ -1026,7 +1297,64 @@ int main(int argc, char** argv) {
 
         if (args.gpu_sample_output) {
             if (args.condition_handles) {
-                if (args.gpu_init_sample_input && !args.sample_without_init) {
+                if (imported_noise_gpu != 0) {
+                    if (args.condition_handles_reuse) {
+                        std::cerr << "--import-noise-npy does not support --condition-handles-reuse in this smoke\n";
+                        sd_gpu_handle_release(ctx, imported_noise_gpu);
+                        sd_conditioning_release(ctx, positive_condition);
+                        sd_conditioning_release(ctx, negative_condition);
+                        if (ref_image.data != nullptr) free(ref_image.data);
+                        if (encoded != nullptr) free_sd_latent(encoded);
+                        free_sd_ctx(ctx);
+                        return 1;
+                    }
+                    if (args.gpu_init_sample_input && !args.sample_without_init) {
+                        if (encoded_gpu_latent != 0) {
+                            sample_init_gpu_latent = encoded_gpu_latent;
+                        } else if (encoded != nullptr) {
+                            if (!sd_cpu_latent_upload(ctx, encoded, &sample_init_gpu_latent, nullptr)) {
+                                std::cerr << "sd_cpu_latent_upload for imported-noise sampler init failed\n";
+                                sd_gpu_handle_release(ctx, imported_noise_gpu);
+                                sd_conditioning_release(ctx, positive_condition);
+                                sd_conditioning_release(ctx, negative_condition);
+                                if (ref_image.data != nullptr) free(ref_image.data);
+                                if (encoded != nullptr) free_sd_latent(encoded);
+                                free_sd_ctx(ctx);
+                                return 1;
+                            }
+                            sample_init_gpu_latent_owned = true;
+                            print_gpu_desc(ctx, "gpu_sample_init_uploaded_latent", sample_init_gpu_latent);
+                        }
+                        if (sample_init_gpu_latent == 0) {
+                            std::cerr << "--gpu-init-sample-input requires an encoded or uploaded GPU latent\n";
+                            sd_gpu_handle_release(ctx, imported_noise_gpu);
+                            sd_conditioning_release(ctx, positive_condition);
+                            sd_conditioning_release(ctx, negative_condition);
+                            if (ref_image.data != nullptr) free(ref_image.data);
+                            if (encoded != nullptr) free_sd_latent(encoded);
+                            free_sd_ctx(ctx);
+                            return 1;
+                        }
+                    }
+                    std::cout << "calling sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu\n";
+                    if (!sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu(ctx,
+                                                                                           &gen_params,
+                                                                                           sample_init_gpu_latent,
+                                                                                           imported_noise_gpu,
+                                                                                           positive_condition,
+                                                                                           negative_condition,
+                                                                                           &sampled_gpu_latent)) {
+                        std::cerr << "sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu failed\n";
+                        if (sample_init_gpu_latent_owned) sd_gpu_handle_release(ctx, sample_init_gpu_latent);
+                        sd_gpu_handle_release(ctx, imported_noise_gpu);
+                        sd_conditioning_release(ctx, positive_condition);
+                        sd_conditioning_release(ctx, negative_condition);
+                        if (ref_image.data != nullptr) free(ref_image.data);
+                        if (encoded != nullptr) free_sd_latent(encoded);
+                        free_sd_ctx(ctx);
+                        return 1;
+                    }
+                } else if (args.gpu_init_sample_input && !args.sample_without_init) {
                     if (encoded_gpu_latent != 0) {
                         sample_init_gpu_latent = encoded_gpu_latent;
                     } else if (encoded != nullptr) {
@@ -1189,6 +1517,9 @@ int main(int argc, char** argv) {
         if (negative_condition != 0) {
             sd_conditioning_release(ctx, negative_condition);
         }
+        if (imported_noise_gpu != 0) {
+            sd_gpu_handle_release(ctx, imported_noise_gpu);
+        }
     }
     if (sample_init_gpu_latent_owned) {
         sd_gpu_handle_release(ctx, sample_init_gpu_latent);
@@ -1222,9 +1553,10 @@ int main(int argc, char** argv) {
         if (args.gpu_decode_output) {
             sd_gpu_handle_t gpu_image = 0;
             sd_gpu_handle_t uploaded_gpu_latent = 0;
+            sd_gpu_handle_t decode_gpu_latent = 0;
             bool decode_ok = false;
             if (args.gpu_latent_decode_input) {
-                sd_gpu_handle_t decode_gpu_latent = sampled_gpu_latent != 0 ? sampled_gpu_latent : encoded_gpu_latent;
+                decode_gpu_latent = sampled_gpu_latent != 0 ? sampled_gpu_latent : encoded_gpu_latent;
                 if (decode_gpu_latent == 0 && args.gpu_upload_latent_decode_input && latent_to_decode != nullptr) {
                     if (!sd_cpu_latent_upload(ctx, latent_to_decode, &uploaded_gpu_latent, nullptr)) {
                         std::cerr << "sd_cpu_latent_upload failed\n";
@@ -1292,6 +1624,7 @@ int main(int argc, char** argv) {
             }
             if (args.download_gpu_output) {
                 sd_image_t output{};
+                const auto download_start = std::chrono::steady_clock::now();
                 if (!sd_gpu_image_download(decode_ctx, gpu_image, &output, nullptr)) {
                     std::cerr << "sd_gpu_image_download failed\n";
                     sd_gpu_handle_release(decode_ctx, gpu_image);
@@ -1304,6 +1637,7 @@ int main(int argc, char** argv) {
                     free_sd_ctx(ctx);
                     return 1;
                 }
+                const auto download_end = std::chrono::steady_clock::now();
                 if (!write_image_to_file(args.output, output.data, output.width, output.height, output.channel)) {
                     std::cerr << "failed to write output: " << args.output << "\n";
                     sd_free_downloaded_image(output.data);
@@ -1318,6 +1652,20 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 std::cout << "explicit_download_wrote " << args.output << "\n";
+                std::cout << "explicit_download_ms="
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(download_end - download_start).count()
+                          << "\n";
+                if (args.compare_roundtrip_input) {
+                    print_rgb_diff_against_input("roundtrip_input_diff",
+                                                 roundtrip_reference,
+                                                 roundtrip_reference_width,
+                                                 roundtrip_reference_height,
+                                                 roundtrip_reference_channels,
+                                                 output.data,
+                                                 output.width,
+                                                 output.height,
+                                                 output.channel);
+                }
                 sd_free_downloaded_image(output.data);
             }
             if (args.download_gpu_output_buffer) {
@@ -1337,6 +1685,7 @@ int main(int argc, char** argv) {
                 const uint64_t stride = static_cast<uint64_t>(desc.w) * 4u;
                 const uint64_t bytes = stride * static_cast<uint64_t>(desc.h);
                 std::vector<uint8_t> rgba(static_cast<size_t>(bytes));
+                const auto download_start = std::chrono::steady_clock::now();
                 if (!sd_gpu_image_download_to_buffer(decode_ctx, gpu_image, rgba.data(), bytes, stride, nullptr)) {
                     std::cerr << "sd_gpu_image_download_to_buffer failed\n";
                     sd_gpu_handle_release(decode_ctx, gpu_image);
@@ -1349,6 +1698,7 @@ int main(int argc, char** argv) {
                     free_sd_ctx(ctx);
                     return 1;
                 }
+                const auto download_end = std::chrono::steady_clock::now();
                 if (!write_image_to_file(args.output, rgba.data(), static_cast<uint32_t>(desc.w), static_cast<uint32_t>(desc.h), 4)) {
                     std::cerr << "failed to write caller-owned output: " << args.output << "\n";
                     sd_gpu_handle_release(decode_ctx, gpu_image);
@@ -1364,6 +1714,56 @@ int main(int argc, char** argv) {
                 std::cout << "caller_owned_download_wrote " << args.output
                           << " bytes=" << bytes
                           << " stride=" << stride << "\n";
+                std::cout << "caller_owned_download_ms="
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(download_end - download_start).count()
+                          << "\n";
+                if (args.compare_roundtrip_input) {
+                    print_rgb_diff_against_input("roundtrip_input_diff",
+                                                 roundtrip_reference,
+                                                 roundtrip_reference_width,
+                                                 roundtrip_reference_height,
+                                                 roundtrip_reference_channels,
+                                                 rgba.data(),
+                                                 static_cast<uint32_t>(desc.w),
+                                                 static_cast<uint32_t>(desc.h),
+                                                 4);
+                }
+            }
+            if (args.decode_twice) {
+                if (!args.gpu_latent_decode_input || decode_gpu_latent == 0) {
+                    std::cerr << "--decode-twice currently requires --gpu-latent-decode-input\n";
+                    sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (uploaded_gpu_latent != 0) sd_gpu_handle_release(ctx, uploaded_gpu_latent);
+                    if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
+                    if (encoded_gpu_latent != 0) sd_gpu_handle_release(ctx, encoded_gpu_latent);
+                    if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                    if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                sd_gpu_handle_t second_gpu_image = 0;
+                sd_vae_memory_report_t second_decode_report;
+                const auto second_start = std::chrono::steady_clock::now();
+                if (!sd_decode_gpu_latent_normal_gpu(decode_ctx, decode_gpu_latent, &vae_options, &second_gpu_image, &second_decode_report)) {
+                    std::cerr << "second sd_decode_gpu_latent_normal_gpu failed\n";
+                    sd_gpu_handle_release(decode_ctx, gpu_image);
+                    if (uploaded_gpu_latent != 0) sd_gpu_handle_release(ctx, uploaded_gpu_latent);
+                    if (sampled_gpu_latent != 0) sd_gpu_handle_release(ctx, sampled_gpu_latent);
+                    if (encoded_gpu_latent != 0) sd_gpu_handle_release(ctx, encoded_gpu_latent);
+                    if (decode_ctx != ctx) free_sd_ctx(decode_ctx);
+                    if (latent_to_decode != encoded) free_sd_latent(latent_to_decode);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                const auto second_end = std::chrono::steady_clock::now();
+                print_vae_report("decode_report_second", second_decode_report);
+                std::cout << "second_gpu_decode_handle=" << second_gpu_image << "\n";
+                std::cout << "second_decode_total_ms="
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(second_end - second_start).count()
+                          << "\n";
+                sd_gpu_handle_release(decode_ctx, second_gpu_image);
             }
             if (!sd_gpu_handle_release(decode_ctx, gpu_image)) {
                 std::cerr << "sd_gpu_handle_release failed\n";

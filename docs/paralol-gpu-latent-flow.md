@@ -177,6 +177,11 @@ input is the source image bytes passed into the public CPU-image API. The
 resulting diffusion latent is an owned backend buffer, not a transient graph
 tensor.
 
+The true GPU encode path must apply the same VAE input transform as the CPU
+path: source RGB bytes are converted to planar float `[0, 1]`, then the encoder
+graph receives `[-1, 1]` values. If that transform is skipped, encoded-latent
+roundtrips become washed out even though BF16 decode itself is correct.
+
 The earlier same-context decode path for VAE-encoded handles was unsafe: it
 could trip a CUDA illegal memory access inside the implicit-GEMM VAE decode
 convolution after a VAE encode on the same VAE object. The fixed path keeps the
@@ -195,12 +200,45 @@ The VAE report marks this honestly:
 - `device_resident_stages=true`
 - `host_copies=0`
 - `device_copies` includes the two extra D2D context handoff copies
+- `decode_context_ms`, `decode_setup_ms`, `decode_latent_d2d_ms`,
+  `decode_graph_ms`, `decode_image_d2d_ms`, and `decode_context_reuse` split
+  pure graph time from isolated-context overhead
 - `fallback_reason` explains the isolated VAE decode context
 
 This is an all-GPU handoff across the VAE Encode -> Latent Decode boundary. It
 does use an isolated decode context because the same-context VAE reuse path is
 currently unsafe, but it does not download or upload the latent through CPU
 memory.
+
+The isolated decode context is cached on the owning `sd_ctx_t`. A cold
+encoded-latent decode therefore includes one decode-only context creation/load
+cost, while later decodes on the same resident context report
+`decode_context_reuse=1` and should have near-zero `decode_context_ms`.
+Paralol can explicitly prewarm this cache with:
+
+- `sd_prewarm_vae_decode_bridge(sd_ctx_t*, const sd_vae_run_options_t*, sd_vae_memory_report_t*)`
+
+That API does not decode pixels; it creates and configures the isolated
+decode-only VAE context so the later Latent Decode report separates the real
+VAE graph time from the prewarm cost. The same-context probe remains opt-in
+through `SDCPP_EXPERIMENTAL_VAE_SAME_CONTEXT_DECODE=1`; it is not a production
+path because the known same-context encoded-latent decode fault still
+reproduces.
+
+Paralol should surface the report fields directly:
+
+- `vaeDecodeSetupMs` -> `decode_setup_ms`
+- `vaeDecodeContextMs` -> `decode_context_ms`
+- `vaeDecodeD2dMs` -> `decode_latent_d2d_ms`
+- `vaeDecodeGraphMs` -> `decode_graph_ms`
+- `vaeDecodeImageD2dMs` -> `decode_image_d2d_ms`
+- `vaeDecodeDownloadMs` -> `decode_download_ms`
+- `vaeDecodeContextReuse` -> `decode_context_reuse != 0`
+
+For encoded-latent I2I, the first cold decode is expected to show non-zero
+`decode_context_ms`. A prewarmed or already resident decode context should make
+`decode_context_ms` near zero while leaving `decode_graph_ms` around the actual
+BF16 COMFY_NORMAL graph time.
 
 Anima uses the Wan/Qwen bridge instead of the SDXL cached decode-only bridge;
 the decode report should say

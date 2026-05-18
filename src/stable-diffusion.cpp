@@ -23,10 +23,16 @@
 #include "name_conversion.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <new>
+#include <sstream>
 #include <unordered_map>
 
 const char* model_version_to_str[] = {
@@ -159,6 +165,414 @@ private:
     std::string previous_;
 };
 
+static bool trace_euler_parity_stats_enabled() {
+    const char* value = std::getenv("SDCPP_TRACE_EULER_PARITY_STATS");
+    if (value != nullptr && value[0] != '\0' && value[0] != '0') {
+        return true;
+    }
+    const char* tensor_value = std::getenv("SDCPP_TRACE_EULER_PARITY_TENSORS");
+    return tensor_value != nullptr && tensor_value[0] != '\0' && tensor_value[0] != '0';
+}
+
+static bool trace_euler_parity_tensors_enabled() {
+    const char* value = std::getenv("SDCPP_TRACE_EULER_PARITY_TENSORS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static std::filesystem::path trace_euler_parity_tensor_dir() {
+    const char* value = std::getenv("SDCPP_TRACE_EULER_PARITY_TENSOR_DIR");
+    if (value != nullptr && value[0] != '\0') {
+        return std::filesystem::path(value);
+    }
+    return std::filesystem::path("euler-parity-tensors");
+}
+
+static std::string sanitize_euler_parity_filename(const char* label) {
+    std::string result = label != nullptr && label[0] != '\0' ? label : "tensor";
+    for (char& ch : result) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::isalnum(uch) == 0 && ch != '-' && ch != '_') {
+            ch = '_';
+        }
+    }
+    while (!result.empty() && result.front() == '_') {
+        result.erase(result.begin());
+    }
+    if (result.empty()) {
+        result = "tensor";
+    }
+    return result;
+}
+
+static std::string json_escape_for_parity(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (char ch : value) {
+        switch (ch) {
+            case '\\': escaped += "\\\\"; break;
+            case '"': escaped += "\\\""; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default: escaped.push_back(ch); break;
+        }
+    }
+    return escaped;
+}
+
+static bool trace_euler_parity_step_enabled(int step, int steps) {
+    if (!trace_euler_parity_stats_enabled()) {
+        return false;
+    }
+    const char* value = std::getenv("SDCPP_TRACE_EULER_PARITY_STEP");
+    if (value == nullptr || value[0] == '\0') {
+        return step == 0 || step == steps - 1;
+    }
+    std::string spec(value);
+    size_t start = 0;
+    while (start <= spec.size()) {
+        size_t end = spec.find(',', start);
+        std::string token = spec.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char ch) { return std::isspace(ch) != 0; }), token.end());
+        std::transform(token.begin(), token.end(), token.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (token == "all" || token == "*") {
+            return true;
+        }
+        if ((token == "first" && step == 0) || (token == "last" && step == steps - 1)) {
+            return true;
+        }
+        if (!token.empty()) {
+            char* parse_end = nullptr;
+            long parsed = std::strtol(token.c_str(), &parse_end, 10);
+            if (parse_end != token.c_str() && *parse_end == '\0' && parsed == step) {
+                return true;
+            }
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
+static void log_sigma_schedule_for_parity(const char* label, const std::vector<float>& sigmas) {
+    if (!trace_euler_parity_stats_enabled()) {
+        return;
+    }
+    std::string values;
+    const size_t count = sigmas.size();
+    for (size_t i = 0; i < count; ++i) {
+        char item[64];
+        snprintf(item, sizeof(item), "%s%.9g", values.empty() ? "" : ",", sigmas[i]);
+        values += item;
+    }
+    LOG_INFO("[EulerParity] %s sigma_schedule count=%zu values=[%s]",
+             label != nullptr ? label : "sampler",
+             count,
+             values.c_str());
+}
+
+static void log_timestep_schedule_for_parity(const char* label, const std::vector<std::vector<float>>& timesteps_by_step) {
+    if (!trace_euler_parity_stats_enabled()) {
+        return;
+    }
+    std::string values;
+    for (size_t step = 0; step < timesteps_by_step.size(); ++step) {
+        if (!values.empty()) {
+            values += ",";
+        }
+        values += "step";
+        values += std::to_string(step);
+        values += "=[";
+        const auto& timesteps = timesteps_by_step[step];
+        for (size_t i = 0; i < timesteps.size(); ++i) {
+            char item[64];
+            snprintf(item, sizeof(item), "%s%.9g", i == 0 ? "" : ",", timesteps[i]);
+            values += item;
+        }
+        values += "]";
+    }
+    LOG_INFO("[EulerParity] %s timestep_schedule count=%zu values=[%s]",
+             label != nullptr ? label : "sampler",
+             timesteps_by_step.size(),
+             values.c_str());
+}
+
+static std::string tensor_shape_for_parity(const sd::Tensor<float>& tensor) {
+    if (tensor.empty()) {
+        return "empty";
+    }
+    return sd::tensor_shape_to_string(tensor.shape());
+}
+
+static uint64_t parity_tensor_checksum(const sd::Tensor<float>& tensor) {
+    uint64_t checksum = 1469598103934665603ull;
+    for (int64_t i = 0; i < tensor.numel(); ++i) {
+        const int64_t quantized = static_cast<int64_t>(std::llround(static_cast<double>(tensor[i]) * 1000000.0));
+        checksum ^= static_cast<uint64_t>(quantized);
+        checksum *= 1099511628211ull;
+    }
+    return checksum;
+}
+
+static std::vector<int64_t> parity_export_shape_for_tensor(const char* label, const sd::Tensor<float>& tensor, const char** out_layout) {
+    if (out_layout != nullptr) {
+        *out_layout = "explicit_shape_order";
+    }
+    if (tensor.dim() == 3 && tensor.shape().size() == 3 && tensor.shape()[2] > 0) {
+        std::string name = label != nullptr ? label : "";
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        const bool latent_like = name.find("latent") != std::string::npos ||
+                                 name.find("noise") != std::string::npos ||
+                                 name.find("model_input") != std::string::npos ||
+                                 name.find("model_output") != std::string::npos ||
+                                 name.find("denoised") != std::string::npos ||
+                                 name.find("derivative") != std::string::npos ||
+                                 name.find("post_update") != std::string::npos ||
+                                 name.find("x_before") != std::string::npos;
+        if (latent_like) {
+            if (out_layout != nullptr) {
+                *out_layout = "nchw_batch1_from_ggml_whc";
+            }
+            return {1, tensor.shape()[2], tensor.shape()[1], tensor.shape()[0]};
+        }
+    }
+    return tensor.shape();
+}
+
+static bool write_euler_parity_npy(const std::filesystem::path& path,
+                                   const sd::Tensor<float>& tensor,
+                                   const std::vector<int64_t>& export_shape) {
+    std::ostringstream shape;
+    shape << "(";
+    const auto& tensor_shape = export_shape;
+    for (size_t i = 0; i < tensor_shape.size(); ++i) {
+        if (i != 0) {
+            shape << ", ";
+        }
+        shape << tensor_shape[i];
+    }
+    if (tensor_shape.size() == 1) {
+        shape << ",";
+    }
+    shape << ")";
+
+    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': " + shape.str() + ", }";
+    const size_t preamble_size = 10;  // magic(6) + version(2) + header_len(2)
+    size_t padded_header_len = header.size() + 1;
+    while ((preamble_size + padded_header_len) % 16 != 0) {
+        ++padded_header_len;
+    }
+    header.append(padded_header_len - header.size() - 1, ' ');
+    header.push_back('\n');
+    if (header.size() > std::numeric_limits<uint16_t>::max()) {
+        return false;
+    }
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out.is_open()) {
+        return false;
+    }
+    const char magic[] = "\x93NUMPY";
+    out.write(magic, 6);
+    const uint8_t major = 1;
+    const uint8_t minor = 0;
+    out.write(reinterpret_cast<const char*>(&major), sizeof(major));
+    out.write(reinterpret_cast<const char*>(&minor), sizeof(minor));
+    const uint16_t header_len = static_cast<uint16_t>(header.size());
+    out.write(reinterpret_cast<const char*>(&header_len), sizeof(header_len));
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    out.write(reinterpret_cast<const char*>(tensor.data()), static_cast<std::streamsize>(tensor.numel() * sizeof(float)));
+    return out.good();
+}
+
+static void maybe_dump_tensor_for_euler_parity(const char* prefix,
+                                               const char* label,
+                                               const sd::Tensor<float>& tensor,
+                                               uint64_t checksum) {
+    if (!trace_euler_parity_tensors_enabled() || tensor.empty()) {
+        return;
+    }
+    static std::atomic<uint64_t> dump_counter{0};
+    const uint64_t index = dump_counter.fetch_add(1, std::memory_order_relaxed);
+    std::error_code ec;
+    std::filesystem::path out_dir = trace_euler_parity_tensor_dir();
+    std::filesystem::create_directories(out_dir, ec);
+    if (ec) {
+        LOG_WARN("%s %s tensor_export failed: create_dir path=%s error=%s",
+                 prefix != nullptr ? prefix : "[EulerParity]",
+                 label != nullptr ? label : "tensor",
+                 out_dir.string().c_str(),
+                 ec.message().c_str());
+        return;
+    }
+
+    char index_prefix[32];
+    snprintf(index_prefix, sizeof(index_prefix), "%04" PRIu64 "_", index);
+    const std::string safe_label = sanitize_euler_parity_filename(label);
+    std::filesystem::path npy_path = out_dir / (std::string(index_prefix) + safe_label + ".npy");
+    std::filesystem::path json_path = out_dir / (std::string(index_prefix) + safe_label + ".json");
+    const char* export_layout = nullptr;
+    const std::vector<int64_t> export_shape = parity_export_shape_for_tensor(label, tensor, &export_layout);
+    if (!write_euler_parity_npy(npy_path, tensor, export_shape)) {
+        LOG_WARN("%s %s tensor_export failed: write path=%s",
+                 prefix != nullptr ? prefix : "[EulerParity]",
+                 label != nullptr ? label : "tensor",
+                 npy_path.string().c_str());
+        return;
+    }
+
+    std::ofstream meta(json_path, std::ios::binary);
+    if (meta.is_open()) {
+        std::error_code abs_ec;
+        std::filesystem::path abs_npy_for_meta = std::filesystem::absolute(npy_path, abs_ec);
+        meta << "{\n";
+        meta << "  \"label\": \"" << json_escape_for_parity(safe_label) << "\",\n";
+        meta << "  \"dtype\": \"f32\",\n";
+        meta << "  \"layout\": \"" << (export_layout != nullptr ? export_layout : "explicit_shape_order") << "\",\n";
+        meta << "  \"shape\": [";
+        for (size_t i = 0; i < export_shape.size(); ++i) {
+            if (i != 0) {
+                meta << ", ";
+            }
+            meta << export_shape[i];
+        }
+        meta << "],\n";
+        meta << "  \"source_shape\": [";
+        const auto& source_shape = tensor.shape();
+        for (size_t i = 0; i < source_shape.size(); ++i) {
+            if (i != 0) {
+                meta << ", ";
+            }
+            meta << source_shape[i];
+        }
+        meta << "],\n";
+        meta << "  \"numel\": " << tensor.numel() << ",\n";
+        meta << "  \"checksum\": \"0x" << std::hex << std::setw(16) << std::setfill('0') << checksum << std::dec << "\",\n";
+        meta << "  \"npy\": \"" << json_escape_for_parity((abs_ec ? npy_path : abs_npy_for_meta).string()) << "\"\n";
+        meta << "}\n";
+    }
+
+    std::error_code abs_ec;
+    std::filesystem::path abs_npy = std::filesystem::absolute(npy_path, abs_ec);
+    LOG_INFO("%s %s tensor_export dtype=f32 shape=%s path=%s metadata=%s checksum=0x%016" PRIx64,
+             prefix != nullptr ? prefix : "[EulerParity]",
+             label != nullptr ? label : "tensor",
+             sd::tensor_shape_to_string(export_shape).c_str(),
+             (abs_ec ? npy_path : abs_npy).string().c_str(),
+             json_path.string().c_str(),
+             checksum);
+}
+
+static void log_tensor_stats_for_parity(const char* prefix, const char* label, const sd::Tensor<float>& tensor) {
+    if (!trace_euler_parity_stats_enabled()) {
+        return;
+    }
+    const char* tag = prefix != nullptr ? prefix : "[SamplerParity]";
+    const char* name = label != nullptr ? label : "tensor";
+    if (tensor.empty()) {
+        LOG_WARN("%s %s stats unavailable: empty tensor", tag, name);
+        return;
+    }
+
+    const int64_t count = tensor.numel();
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    double abs_sum = 0.0;
+    float min_value = std::numeric_limits<float>::infinity();
+    float max_value = -std::numeric_limits<float>::infinity();
+    for (int64_t i = 0; i < count; ++i) {
+        const float value = tensor[i];
+        min_value = std::min(min_value, value);
+        max_value = std::max(max_value, value);
+        sum += static_cast<double>(value);
+        sum_sq += static_cast<double>(value) * static_cast<double>(value);
+        abs_sum += std::abs(static_cast<double>(value));
+    }
+    const uint64_t checksum = parity_tensor_checksum(tensor);
+    const double denom = count > 0 ? static_cast<double>(count) : 1.0;
+    const double mean = sum / denom;
+    const double variance = std::max(0.0, sum_sq / denom - mean * mean);
+    const double stddev = std::sqrt(variance);
+    const double mean_abs = abs_sum / denom;
+    LOG_INFO("%s %s stats dtype=f32 shape=%s numel=%" PRId64 " min=%.9g max=%.9g mean=%.9g std=%.9g mean_abs=%.9g checksum=0x%016" PRIx64,
+             tag,
+             name,
+             sd::tensor_shape_to_string(tensor.shape()).c_str(),
+             count,
+             static_cast<double>(min_value),
+             static_cast<double>(max_value),
+             mean,
+             stddev,
+             mean_abs,
+             checksum);
+    maybe_dump_tensor_for_euler_parity(tag, name, tensor, checksum);
+}
+
+static void log_conditioning_tensors_for_parity(const char* label,
+                                                const SDCondition& cond,
+                                                const SDCondition& uncond,
+                                                int clip_skip,
+                                                SDVersion version) {
+    if (!trace_euler_parity_stats_enabled()) {
+        return;
+    }
+    LOG_INFO("[SamplerParity] %s conditioning_fields model_version=%d clip_skip=%d positive_crossattn_present=%s negative_crossattn_present=%s positive_pooled_vector_present=%s negative_pooled_vector_present=%s sdxl_conditioning=%s",
+             label != nullptr ? label : "conditioning",
+             static_cast<int>(version),
+             clip_skip,
+             cond.c_crossattn.empty() ? "false" : "true",
+             uncond.c_crossattn.empty() ? "false" : "true",
+             cond.c_vector.empty() ? "false" : "true",
+             uncond.c_vector.empty() ? "false" : "true",
+             sd_version_is_sdxl(version) ? "true" : "false");
+    log_tensor_stats_for_parity("[SamplerParity]", "positive_crossattn", cond.c_crossattn);
+    log_tensor_stats_for_parity("[SamplerParity]", "negative_crossattn", uncond.c_crossattn);
+    log_tensor_stats_for_parity("[SamplerParity]", "positive_pooled_vector", cond.c_vector);
+    log_tensor_stats_for_parity("[SamplerParity]", "negative_pooled_vector", uncond.c_vector);
+}
+
+static void log_cfg_conditioning_summary_for_parity(const char* label,
+                                                    const SDCondition& cond,
+                                                    const SDCondition& uncond,
+                                                    const sd_guidance_params_t& guidance) {
+    if (!trace_euler_parity_stats_enabled()) {
+        return;
+    }
+    LOG_INFO("[SamplerParity] %s cfg_scale=%.9g img_cfg_scale=%.9g distilled_guidance=%.9g uncond_present=%s cond_crossattn_shape=%s uncond_crossattn_shape=%s cond_vector_present=%s cond_vector_shape=%s uncond_vector_present=%s uncond_vector_shape=%s cond_concat_present=%s uncond_concat_present=%s",
+             label != nullptr ? label : "conditioning",
+             static_cast<double>(guidance.txt_cfg),
+             static_cast<double>(guidance.img_cfg),
+             static_cast<double>(guidance.distilled_guidance),
+             uncond.empty() ? "false" : "true",
+             tensor_shape_for_parity(cond.c_crossattn).c_str(),
+             tensor_shape_for_parity(uncond.c_crossattn).c_str(),
+             cond.c_vector.empty() ? "false" : "true",
+             tensor_shape_for_parity(cond.c_vector).c_str(),
+             uncond.c_vector.empty() ? "false" : "true",
+             tensor_shape_for_parity(uncond.c_vector).c_str(),
+             cond.c_concat.empty() ? "false" : "true",
+             uncond.c_concat.empty() ? "false" : "true");
+}
+
+static void log_backend_tensor_stats_for_parity(const char* label, const GgmlBackendTensorResource* resource) {
+    if (!trace_euler_parity_stats_enabled()) {
+        return;
+    }
+    if (resource == nullptr || resource->empty() || resource->tensor == nullptr) {
+        LOG_WARN("[EulerParity] %s stats unavailable: empty resource", label != nullptr ? label : "tensor");
+        return;
+    }
+    sd::Tensor<float> tensor = sd::make_sd_tensor_from_ggml<float>(resource->tensor);
+    if (tensor.empty()) {
+        LOG_WARN("[EulerParity] %s stats unavailable: download failed", label != nullptr ? label : "tensor");
+        return;
+    }
+
+    log_tensor_stats_for_parity("[EulerParity]", label != nullptr ? label : "tensor", tensor);
+}
+
 class LatentBackendGraphRunner : public GGMLRunner {
 public:
     explicit LatentBackendGraphRunner(ggml_backend_t backend)
@@ -272,6 +686,34 @@ public:
         return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
     }
 
+    std::unique_ptr<GgmlBackendTensorResource> batch_view(const GgmlBackendTensorResource& input,
+                                                          int batch_index,
+                                                          int n_threads,
+                                                          const char* output_name) {
+        if (batch_index < 0) {
+            return nullptr;
+        }
+        auto get_graph = [&]() -> ggml_cgraph* {
+            ggml_cgraph* gf = new_graph_custom(16);
+            ggml_tensor* x = make_backend_input(input);
+            GGML_ASSERT(x->ne[3] > batch_index);
+            ggml_tensor* out = ggml_view_4d(compute_ctx,
+                                            x,
+                                            x->ne[0],
+                                            x->ne[1],
+                                            x->ne[2],
+                                            1,
+                                            x->nb[1],
+                                            x->nb[2],
+                                            x->nb[3],
+                                            x->nb[3] * batch_index);
+            out = ggml_cont(compute_ctx, out);
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        };
+        return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
+    }
+
     std::unique_ptr<GgmlBackendTensorResource> concat_batch2(const GgmlBackendTensorResource& input,
                                                              int n_threads,
                                                              const char* output_name) {
@@ -279,6 +721,27 @@ public:
             ggml_cgraph* gf = new_graph_custom(16);
             ggml_tensor* x = make_backend_input(input);
             ggml_tensor* out = ggml_concat(compute_ctx, x, x, 3);
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        };
+        return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> euler_derivative_from_denoised(const GgmlBackendTensorResource& x,
+                                                                              const GgmlBackendTensorResource& denoised,
+                                                                              float sigma,
+                                                                              int n_threads,
+                                                                              const char* output_name) {
+        if (sigma == 0.0f) {
+            return nullptr;
+        }
+        auto get_graph = [&]() -> ggml_cgraph* {
+            ggml_cgraph* gf = new_graph_custom(32);
+            ggml_tensor* x_in = make_backend_input(x);
+            ggml_tensor* denoised_in = make_backend_input(denoised);
+            ggml_tensor* out = ggml_scale(compute_ctx,
+                                          ggml_sub(compute_ctx, x_in, denoised_in),
+                                          1.0f / sigma);
             ggml_build_forward_expand(gf, out);
             return gf;
         };
@@ -2483,6 +2946,8 @@ public:
         const int steps = static_cast<int>(sigmas.size()) - 1;
         const int64_t t0 = ggml_time_us();
         LOG_WARN("true GPU sampler spike uses deterministic device procedural Gaussian noise, not production Philox Gaussian noise");
+        log_sigma_schedule_for_parity("true_gpu_spike", sigmas);
+        log_backend_tensor_stats_for_parity("true_gpu_spike_initial_noise", x.get());
         for (int i = 0; i < steps; ++i) {
             const float sigma = sigmas[i];
             std::vector<float> scaling = denoiser->get_scalings(sigma);
@@ -2548,6 +3013,7 @@ public:
         if (work_diffusion_model) {
             work_diffusion_model->free_compute_buffer();
         }
+        log_backend_tensor_stats_for_parity("true_gpu_spike_final_latent", x.get());
         return x;
     }
 
@@ -2755,8 +3221,21 @@ public:
         const int64_t t0 = ggml_time_us();
         int unet_calls = 0;
         int backend_post_graphs = 0;
+        log_cfg_conditioning_summary_for_parity("gpu_euler_conditioning", cond, uncond, guidance);
+        log_sigma_schedule_for_parity("gpu_euler_after_denoise_slice", sigmas);
+        if (trace_euler_parity_stats_enabled()) {
+            std::vector<std::vector<float>> parity_timesteps;
+            parity_timesteps.reserve(static_cast<size_t>(steps));
+            for (int i = 0; i < steps; ++i) {
+                parity_timesteps.push_back(prepare_sample_timesteps(sigmas[i], shifted_timestep));
+            }
+            log_timestep_schedule_for_parity("gpu_euler_after_denoise_slice", parity_timesteps);
+        }
+        log_backend_tensor_stats_for_parity("gpu_euler_starting_latent_before_denoise", x.get());
         for (int i = 0; i < steps; ++i) {
             const float sigma = sigmas[i];
+            const float sigma_next = sigmas[i + 1];
+            const bool trace_step = trace_euler_parity_step_enabled(i, steps);
             std::vector<float> scaling = denoiser->get_scalings(sigma);
             GGML_ASSERT(scaling.size() == 3);
             const float c_skip = scaling[0];
@@ -2773,6 +3252,20 @@ public:
                 return nullptr;
             }
             backend_post_graphs += 1;
+            if (trace_step) {
+                LOG_INFO("[EulerParity] step=%d sigma=%.9g sigma_next=%.9g c_in=%.9g c_skip=%.9g c_out=%.9g",
+                         i,
+                         static_cast<double>(sigma),
+                         static_cast<double>(sigma_next),
+                         static_cast<double>(c_in),
+                         static_cast<double>(c_skip),
+                         static_cast<double>(c_out));
+                char label[128];
+                snprintf(label, sizeof(label), "step%d_x_before_model_call", i);
+                log_backend_tensor_stats_for_parity(label, x.get());
+                snprintf(label, sizeof(label), "step%d_model_input_after_c_in", i);
+                log_backend_tensor_stats_for_parity(label, noised_input.get());
+            }
 
             auto run_condition = [&](const SDCondition& condition, const char* pass_name) -> std::unique_ptr<GgmlBackendTensorResource> {
                 DiffusionParams diffusion_params;
@@ -2854,6 +3347,66 @@ public:
                 return nullptr;
             }
 
+            if (trace_step) {
+                char label[128];
+                GgmlBackendTensorResource* cond_for_trace = model_output.get();
+                std::unique_ptr<GgmlBackendTensorResource> batched_cond_for_trace;
+                std::unique_ptr<GgmlBackendTensorResource> batched_uncond_for_trace;
+                GgmlBackendTensorResource* uncond_for_trace = separate_uncond_output.get();
+                if (model_output_is_batched_cfg) {
+                    batched_cond_for_trace = latent_runner.batch_view(*model_output,
+                                                                      0,
+                                                                      n_threads,
+                                                                      "gpu_euler_parity_batched_cond_output");
+                    batched_uncond_for_trace = latent_runner.batch_view(*model_output,
+                                                                        1,
+                                                                        n_threads,
+                                                                        "gpu_euler_parity_batched_uncond_output");
+                    cond_for_trace = batched_cond_for_trace.get();
+                    uncond_for_trace = batched_uncond_for_trace.get();
+                }
+
+                snprintf(label, sizeof(label), "step%d_cond_model_output", i);
+                log_backend_tensor_stats_for_parity(label, cond_for_trace);
+                if (uncond_for_trace != nullptr && !uncond_for_trace->empty()) {
+                    snprintf(label, sizeof(label), "step%d_uncond_model_output", i);
+                    log_backend_tensor_stats_for_parity(label, uncond_for_trace);
+                }
+
+                std::unique_ptr<GgmlBackendTensorResource> guided_for_trace;
+                GgmlBackendTensorResource* guided_model_output = cond_for_trace;
+                if (cond_for_trace != nullptr && !cond_for_trace->empty() &&
+                    uncond_for_trace != nullptr && !uncond_for_trace->empty()) {
+                    guided_for_trace = latent_runner.cfg_blend(*cond_for_trace,
+                                                               *uncond_for_trace,
+                                                               guidance.txt_cfg,
+                                                               n_threads,
+                                                               "gpu_euler_parity_cfg_guided_model_output");
+                    guided_model_output = guided_for_trace.get();
+                }
+                if (guided_model_output != nullptr && !guided_model_output->empty()) {
+                    snprintf(label, sizeof(label), "step%d_cfg_guided_model_output", i);
+                    log_backend_tensor_stats_for_parity(label, guided_model_output);
+                    auto denoised_for_trace = latent_runner.denoised_from_model_output(*guided_model_output,
+                                                                                       *x,
+                                                                                       c_out,
+                                                                                       c_skip,
+                                                                                       n_threads,
+                                                                                       "gpu_euler_parity_cfg_denoised");
+                    snprintf(label, sizeof(label), "step%d_cfg_combined_denoised", i);
+                    log_backend_tensor_stats_for_parity(label, denoised_for_trace.get());
+                    if (denoised_for_trace != nullptr && !denoised_for_trace->empty()) {
+                        auto derivative_for_trace = latent_runner.euler_derivative_from_denoised(*x,
+                                                                                                 *denoised_for_trace,
+                                                                                                 sigma,
+                                                                                                 n_threads,
+                                                                                                 "gpu_euler_parity_derivative");
+                        snprintf(label, sizeof(label), "step%d_euler_derivative_d", i);
+                        log_backend_tensor_stats_for_parity(label, derivative_for_trace.get());
+                    }
+                }
+            }
+
             std::unique_ptr<GgmlBackendTensorResource> next_x;
             if (separate_uncond_output != nullptr && !separate_uncond_output->empty()) {
                 next_x = latent_runner.euler_update_from_cfg_outputs(*model_output,
@@ -2863,7 +3416,7 @@ public:
                                                                      c_out,
                                                                      c_skip,
                                                                      sigma,
-                                                                     sigmas[i + 1],
+                                                                     sigma_next,
                                                                      n_threads,
                                                                      "gpu_euler_fused_separate_cfg_denoise_update");
             } else {
@@ -2874,7 +3427,7 @@ public:
                                                                       c_out,
                                                                       c_skip,
                                                                       sigma,
-                                                                      sigmas[i + 1],
+                                                                      sigma_next,
                                                                       n_threads,
                                                                       "gpu_euler_fused_cfg_denoise_update");
             }
@@ -2884,6 +3437,11 @@ public:
             }
             backend_post_graphs += 1;
             x = std::move(next_x);
+            if (trace_step) {
+                char label[128];
+                snprintf(label, sizeof(label), "step%d_post_update_x", i);
+                log_backend_tensor_stats_for_parity(label, x.get());
+            }
 
             const float avg_step_seconds = (ggml_time_us() - t0) / 1000000.f / static_cast<float>(i + 1);
             pretty_progress(i + 1, steps, avg_step_seconds);
@@ -2898,6 +3456,7 @@ public:
                  uncond.empty() ? "cond_only" : (use_batched_cfg ? "batched" : "separate"),
                  unet_calls,
                  backend_post_graphs);
+        log_backend_tensor_stats_for_parity("gpu_euler_final_sampled_latent_before_vae_decode", x.get());
         return x;
     }
 
@@ -3933,6 +4492,8 @@ struct SamplePlan {
     int total_steps                               = 0;
     float moe_boundary                            = 0.f;
     int start_merge_step                          = -1;
+    scheduler_t scheduler                         = DISCRETE_SCHEDULER;
+    bool custom_sigmas                            = false;
     std::vector<float> sigmas;
 
     SamplePlan(sd_ctx_t* sd_ctx,
@@ -3974,6 +4535,7 @@ struct SamplePlan {
         total_steps = sample_steps + std::max(0, high_noise_sample_steps);
 
         if (sample_params->custom_sigmas_count > 0) {
+            custom_sigmas = true;
             sigmas      = std::vector<float>(sample_params->custom_sigmas,
                                         sample_params->custom_sigmas + sample_params->custom_sigmas_count);
             total_steps = static_cast<int>(sigmas.size()) - 1;
@@ -3987,9 +4549,9 @@ struct SamplePlan {
                 LOG_WARN("total_steps != custom_sigmas_count - 1, set high_noise_sample_steps to %d", high_noise_sample_steps);
             }
         } else {
-            scheduler_t scheduler = resolve_scheduler(sd_ctx,
-                                                      sample_params->scheduler,
-                                                      sample_method);
+            scheduler = resolve_scheduler(sd_ctx,
+                                          sample_params->scheduler,
+                                          sample_method);
             sigmas                = sd_ctx->sd->denoiser->get_sigmas(total_steps,
                                                                      sd_ctx->sd->get_image_seq_len(request->height, request->width),
                                                                      scheduler,
@@ -4120,6 +4682,7 @@ public:
 static sd::Tensor<float> encode_image_tensor_for_generation(sd_ctx_t* sd_ctx,
                                                             const sd::Tensor<float>& image_tensor,
                                                             const char* label);
+static void apply_latent_strength_to_plan(sd_ctx_t* sd_ctx, const GenerationRequest& request, SamplePlan* plan);
 
 static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd_ctx_t* sd_ctx,
                                                                               const sd_img_gen_params_t* sd_img_gen_params,
@@ -4135,15 +4698,7 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         LOG_INFO("IMG2IMG");
 
         if (request->strength < 1.f) {
-            size_t t_enc = static_cast<size_t>(plan->sample_steps * request->strength);
-            if (t_enc == static_cast<size_t>(plan->sample_steps)) {
-                t_enc--;
-            }
-            LOG_INFO("target t_enc is %zu steps", t_enc);
-            std::vector<float> sigma_sched;
-            sigma_sched.assign(plan->sigmas.begin() + plan->sample_steps - t_enc - 1, plan->sigmas.end());
-            plan->sigmas       = std::move(sigma_sched);
-            plan->sample_steps = static_cast<int>(plan->sigmas.size() - 1);
+            apply_latent_strength_to_plan(sd_ctx, *request, plan);
         }
 
         init_image_tensor = sd_image_to_tensor(sd_img_gen_params->init_image, request->width, request->height);
@@ -4625,8 +5180,138 @@ static sd_latent_source_t sd_latent_source(const sd_latent_t* latent) {
     return private_latent->source;
 }
 
+static bool sd_fill_latent_view_from_shape(sd_latent_view_t* out_view,
+                                           const std::vector<int64_t>& shape,
+                                           uint64_t flags,
+                                           const float* data) {
+    if (out_view == nullptr || shape.empty()) {
+        return false;
+    }
+
+    int64_t w = shape.size() > 0 ? shape[0] : 1;
+    int64_t h = shape.size() > 1 ? shape[1] : 1;
+    int64_t c = shape.size() > 2 ? shape[2] : 1;
+    int64_t n = shape.size() > 3 ? shape[3] : 1;
+    if (shape.size() == 5) {
+        c = shape[3];
+        n = shape[4];
+    }
+    if (w <= 0 || h <= 0 || c <= 0 || n <= 0) {
+        return false;
+    }
+
+    const uint64_t element_count = static_cast<uint64_t>(w) *
+                                   static_cast<uint64_t>(h) *
+                                   static_cast<uint64_t>(c) *
+                                   static_cast<uint64_t>(n);
+    *out_view = {};
+    out_view->struct_size = sizeof(sd_latent_view_t);
+    out_view->version = SD_VAE_API_VERSION;
+    out_view->dtype = SD_DTYPE_F32;
+    // The fork's latent tensors are stored as ggml WHCN with W as the fastest
+    // dimension. That is byte-compatible with an exported NCHW view where W is
+    // also fastest, so debug export can copy without touching sampler paths.
+    out_view->layout = SD_LAYOUT_NCHW;
+    out_view->n = n;
+    out_view->c = c;
+    out_view->h = h;
+    out_view->w = w;
+    out_view->stride_w = 1;
+    out_view->stride_h = w;
+    out_view->stride_c = w * h;
+    out_view->stride_n = w * h * c;
+    out_view->element_count = element_count;
+    out_view->byte_size = element_count * sizeof(float);
+    out_view->data = data;
+    out_view->flags = static_cast<uint32_t>(flags);
+    return true;
+}
+
+SD_API bool sd_latent_get_view(const sd_latent_t* latent,
+                               sd_latent_view_t* out_view) {
+    const sd::Tensor<float>* tensor = sd_latent_tensor(latent);
+    if (tensor == nullptr || tensor->empty()) {
+        return false;
+    }
+    return sd_fill_latent_view_from_shape(out_view,
+                                          tensor->shape(),
+                                          0,
+                                          tensor->data());
+}
+
+SD_API bool sd_latent_export_f32(const sd_latent_t* latent,
+                                 float* dst,
+                                 uint64_t dst_elements,
+                                 sd_latent_view_t* out_view) {
+    const sd::Tensor<float>* tensor = sd_latent_tensor(latent);
+    if (tensor == nullptr || tensor->empty() || dst == nullptr) {
+        return false;
+    }
+    sd_latent_view_t view;
+    if (!sd_fill_latent_view_from_shape(&view,
+                                        tensor->shape(),
+                                        0,
+                                        nullptr)) {
+        return false;
+    }
+    if (dst_elements < view.element_count) {
+        LOG_ERROR("sd_latent_export_f32 destination too small: dst=%" PRIu64 " required=%" PRIu64,
+                  dst_elements,
+                  view.element_count);
+        return false;
+    }
+    std::memcpy(dst, tensor->data(), static_cast<size_t>(view.byte_size));
+    if (out_view != nullptr) {
+        view.data = dst;
+        *out_view = view;
+    }
+    return true;
+}
+
 static sd_latent_t* make_sd_latent(sd::Tensor<float>&& tensor,
-                                   sd_latent_source_t source = sd_latent_source_t::unknown) {
+                                   sd_latent_source_t source = sd_latent_source_t::unknown);
+
+SD_API sd_latent_t* sd_latent_import_f32(const float* data,
+                                         uint64_t element_count,
+                                         uint32_t w,
+                                         uint32_t h,
+                                         uint32_t c) {
+    if (data == nullptr || w == 0 || h == 0 || c == 0) {
+        LOG_ERROR("sd_latent_import_f32 received invalid input");
+        return nullptr;
+    }
+    const uint64_t expected_elements = static_cast<uint64_t>(w) *
+                                       static_cast<uint64_t>(h) *
+                                       static_cast<uint64_t>(c);
+    if (element_count != expected_elements || element_count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        LOG_ERROR("sd_latent_import_f32 element count mismatch: got=%" PRIu64 " expected=%" PRIu64,
+                  element_count,
+                  expected_elements);
+        return nullptr;
+    }
+
+    std::vector<float> values;
+    try {
+        values.assign(data, data + element_count);
+    } catch (...) {
+        LOG_ERROR("sd_latent_import_f32 failed to allocate %" PRIu64 " elements", element_count);
+        return nullptr;
+    }
+
+    // Import accepts the same flat order exported by sd_latent_export_f32:
+    // NCHW with W fastest. For batch 1 this is byte-compatible with the fork's
+    // internal ggml WHCN latent tensor shape {W,H,C,1}. This API is intended for
+    // explicit parity/debug transfers; normal sampler paths remain GPU-resident.
+    sd::Tensor<float> tensor({static_cast<int64_t>(w),
+                              static_cast<int64_t>(h),
+                              static_cast<int64_t>(c),
+                              1},
+                             values);
+    return make_sd_latent(std::move(tensor), sd_latent_source_t::unknown);
+}
+
+static sd_latent_t* make_sd_latent(sd::Tensor<float>&& tensor,
+                                   sd_latent_source_t source) {
     if (tensor.empty()) {
         return nullptr;
     }
@@ -5049,6 +5734,10 @@ static bool sd_strict_gpu_resident_enabled() {
     return StableDiffusionGGML::env_flag_enabled("SDCPP_STRICT_GPU_RESIDENT");
 }
 
+static bool sd_experimental_vae_same_context_decode_enabled() {
+    return StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_VAE_SAME_CONTEXT_DECODE");
+}
+
 static bool sd_gpu_resource_is_cuda(const sd_gpu_resource_private_t& resource) {
     return resource.tensor != nullptr &&
            !resource.tensor->empty() &&
@@ -5295,7 +5984,7 @@ static sd_vae_exec_mode_t resolve_vae_exec_mode(StableDiffusionGGML* sd, sd_vae_
 }
 
 static void log_vae_report(const char* operation, const sd_vae_memory_report_t& report) {
-    LOG_INFO("[VAE] %s report: requested_mode=%s resolved_mode=%s direct_conv=%s tiled=%s taesd=%s im2col=%s stages=%u graphs=%u host_copies=%u device_copies=%u planned=%.2fMB requested_dtype=%s resolved_dtype=%s fallback=\"%s\"",
+    LOG_INFO("[VAE] %s report: requested_mode=%s resolved_mode=%s direct_conv=%s tiled=%s taesd=%s im2col=%s stages=%u graphs=%u host_copies=%u device_copies=%u planned=%.2fMB requested_dtype=%s resolved_dtype=%s decode_setup_ms=%u decode_context_ms=%u decode_latent_d2d_ms=%u decode_graph_ms=%u decode_image_d2d_ms=%u decode_download_ms=%u decode_context_reuse=%u decode_same_context_attempted=%u decode_same_context_succeeded=%u fallback=\"%s\"",
              operation,
              sd_vae_exec_mode_name(report.requested_mode),
              sd_vae_exec_mode_name(report.resolved_mode),
@@ -5310,6 +5999,15 @@ static void log_vae_report(const char* operation, const sd_vae_memory_report_t& 
              report.planned_workspace_bytes / 1024.0 / 1024.0,
              sd_vae_dtype_name(report.requested_storage_dtype),
              sd_vae_dtype_name(report.resolved_storage_dtype),
+             report.decode_setup_ms,
+             report.decode_context_ms,
+             report.decode_latent_d2d_ms,
+             report.decode_graph_ms,
+             report.decode_image_d2d_ms,
+             report.decode_download_ms,
+             report.decode_context_reuse,
+             report.decode_same_context_attempted,
+             report.decode_same_context_succeeded,
              report.fallback_reason);
 }
 
@@ -5622,17 +6320,47 @@ static bool validate_init_latent_shape(sd_ctx_t* sd_ctx,
     return false;
 }
 
-static void apply_latent_strength_to_plan(const GenerationRequest& request, SamplePlan* plan) {
-    if (plan == nullptr || request.strength >= 1.f || plan->sample_steps <= 0 || plan->sigmas.empty()) {
+static void apply_latent_strength_to_plan(sd_ctx_t* sd_ctx, const GenerationRequest& request, SamplePlan* plan) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_ctx->sd->denoiser == nullptr ||
+        plan == nullptr || request.strength >= 1.f || request.strength <= 0.f ||
+        plan->sample_steps <= 0 || plan->sigmas.empty()) {
         return;
     }
-    size_t t_enc = static_cast<size_t>(plan->sample_steps * request.strength);
-    if (t_enc == static_cast<size_t>(plan->sample_steps)) {
-        t_enc--;
+
+    const int requested_steps = plan->sample_steps;
+    if (plan->custom_sigmas || plan->high_noise_sample_steps > 0) {
+        size_t t_enc = static_cast<size_t>(requested_steps * request.strength);
+        if (t_enc == static_cast<size_t>(requested_steps)) {
+            t_enc--;
+        }
+        LOG_INFO("target t_enc is %zu steps", t_enc);
+        std::vector<float> sigma_sched;
+        sigma_sched.assign(plan->sigmas.begin() + requested_steps - t_enc - 1, plan->sigmas.end());
+        plan->sigmas       = std::move(sigma_sched);
+        plan->sample_steps = static_cast<int>(plan->sigmas.size() - 1);
+        return;
     }
-    LOG_INFO("target t_enc is %zu steps", t_enc);
-    std::vector<float> sigma_sched;
-    sigma_sched.assign(plan->sigmas.begin() + plan->sample_steps - t_enc - 1, plan->sigmas.end());
+
+    const int comfy_steps = std::max(requested_steps, static_cast<int>(requested_steps / request.strength));
+    std::vector<float> full_sigmas = sd_ctx->sd->denoiser->get_sigmas(comfy_steps,
+                                                                      sd_ctx->sd->get_image_seq_len(request.height, request.width),
+                                                                      plan->scheduler,
+                                                                      sd_ctx->sd->version);
+    if (full_sigmas.size() < static_cast<size_t>(requested_steps + 1)) {
+        LOG_ERROR("Comfy denoise schedule generation failed: requested_steps=%d denoise=%.6g generated=%zu",
+                  requested_steps,
+                  static_cast<double>(request.strength),
+                  full_sigmas.size());
+        return;
+    }
+
+    std::vector<float> sigma_sched(full_sigmas.end() - (requested_steps + 1), full_sigmas.end());
+    LOG_INFO("Comfy denoise schedule: requested_steps=%d denoise=%.6g new_steps=%d sliced_count=%zu first_sigma=%.9g",
+             requested_steps,
+             static_cast<double>(request.strength),
+             comfy_steps,
+             sigma_sched.size(),
+             sigma_sched.empty() ? 0.0 : static_cast<double>(sigma_sched.front()));
     plan->sigmas       = std::move(sigma_sched);
     plan->sample_steps = static_cast<int>(plan->sigmas.size() - 1);
 }
@@ -5904,7 +6632,7 @@ SD_API sd_latent_t* sd_sample_latent(sd_ctx_t* sd_ctx,
             return nullptr;
         }
         latents.init_latent = *init_tensor;
-        apply_latent_strength_to_plan(request, &plan);
+        apply_latent_strength_to_plan(sd_ctx, request, &plan);
     }
 
     int64_t prompt_encode_start = ggml_time_ms();
@@ -6032,7 +6760,7 @@ static sd_latent_t* sd_sample_latent_with_conditioning_internal(sd_ctx_t* sd_ctx
             return nullptr;
         }
         latents.init_latent = *init_tensor;
-        apply_latent_strength_to_plan(request, &plan);
+        apply_latent_strength_to_plan(sd_ctx, request, &plan);
     }
 
     int64_t condition_bind_start = ggml_time_ms();
@@ -6105,6 +6833,7 @@ static sd_latent_t* sd_sample_latent_with_conditioning_internal(sd_ctx_t* sd_ctx
 static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
                                                     const sd_img_gen_params_t* sd_img_gen_params,
                                                     sd_gpu_handle_t init_gpu_latent,
+                                                    sd_gpu_handle_t noise_gpu_latent,
                                                     bool use_conditioning_handles,
                                                     sd_conditioning_handle_t positive,
                                                     sd_conditioning_handle_t negative,
@@ -6127,6 +6856,7 @@ SD_API bool sd_sample_latent_gpu_with_conditioning(sd_ctx_t* sd_ctx,
         StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER")) {
         if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
                                                     sd_img_gen_params,
+                                                    0,
                                                     0,
                                                     true,
                                                     positive,
@@ -6298,6 +7028,7 @@ SD_API bool sd_sample_latent_gpu_true_euler_spike(sd_ctx_t* sd_ctx,
 static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
                                                     const sd_img_gen_params_t* sd_img_gen_params,
                                                     sd_gpu_handle_t init_gpu_latent,
+                                                    sd_gpu_handle_t noise_gpu_latent,
                                                     bool use_conditioning_handles,
                                                     sd_conditioning_handle_t positive,
                                                     sd_conditioning_handle_t negative,
@@ -6323,6 +7054,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     }
 
     const bool has_gpu_init = init_gpu_latent != 0;
+    const bool has_imported_noise = noise_gpu_latent != 0;
     int64_t t0 = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
     GenerationRequest request(sd_ctx, sd_img_gen_params);
@@ -6364,6 +7096,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     }
 
     auto init_resource = has_gpu_init ? sd_gpu_resource_lookup(sd_ctx, init_gpu_latent) : nullptr;
+    auto imported_noise_resource = has_imported_noise ? sd_gpu_resource_lookup(sd_ctx, noise_gpu_latent) : nullptr;
     uint32_t init_flags = 0;
     if (has_gpu_init) {
         if (init_resource == nullptr ||
@@ -6371,7 +7104,13 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
             return false;
         }
         init_flags = init_resource->flags;
-        apply_latent_strength_to_plan(request, &plan);
+        apply_latent_strength_to_plan(sd_ctx, request, &plan);
+    }
+    if (has_imported_noise) {
+        if (imported_noise_resource == nullptr ||
+            !sd_gpu_latent_matches_request(sd_ctx, *imported_noise_resource, request, name)) {
+            return false;
+        }
     }
 
     int64_t latent_prepare_start = ggml_time_ms();
@@ -6404,52 +7143,92 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
         return false;
     }
     ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+    log_conditioning_tensors_for_parity("gpu_euler_after_conditioning", embeds.cond, embeds.uncond, request.clip_skip, sd_ctx->sd->version);
     int64_t condition_end = ggml_time_ms();
 
     int64_t init_start = ggml_time_ms();
     LatentBackendGraphRunner latent_runner(sd_ctx->sd->backend);
     std::vector<int64_t> latent_shape;
     std::unique_ptr<GgmlBackendTensorResource> x_resource;
+    const bool max_denoise = !has_gpu_init || request.strength >= 1.f;
+    const float initial_noise_scale = max_denoise
+                                          ? std::sqrt(1.0f + plan.sigmas[0] * plan.sigmas[0])
+                                          : plan.sigmas[0];
+    if (trace_euler_parity_stats_enabled()) {
+        LOG_INFO("[SamplerParity] gpu_euler_initial_noise_scaling max_denoise=%s sigma=%.9g scale=%.9g noise_source=%s",
+                 max_denoise ? "true" : "false",
+                 static_cast<double>(plan.sigmas[0]),
+                 static_cast<double>(initial_noise_scale),
+                 has_imported_noise ? "imported_gpu_handle" : "cuda_philox");
+    }
     if (has_gpu_init) {
         ggml_tensor* tensor = init_resource->tensor->tensor;
         latent_shape = {tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]};
-        auto init_copy = sd_copy_gpu_resource_to_backend(sd_ctx,
-                                                         init_resource->tensor.get(),
-                                                         sd_ctx->sd->backend,
-                                                         "gpu_euler_init_latent_d2d");
-        if (init_copy == nullptr || init_copy->empty()) {
-            LOG_ERROR("%s failed to copy GPU init latent into sampler backend", name);
-            return false;
-        }
-        auto noise_resource = sd_create_backend_philox_noise_resource(sd_ctx,
-                                                                      latent_shape,
-                                                                      request.seed,
-                                                                      0,
-                                                                      "gpu_euler_init_noise_philox");
+        std::unique_ptr<GgmlBackendTensorResource> noise_resource =
+            has_imported_noise
+                ? sd_copy_gpu_resource_to_backend(sd_ctx,
+                                                  imported_noise_resource->tensor.get(),
+                                                  sd_ctx->sd->backend,
+                                                  "gpu_euler_imported_noise_d2d")
+                : sd_create_backend_philox_noise_resource(sd_ctx,
+                                                          latent_shape,
+                                                          request.seed,
+                                                          0,
+                                                          "gpu_euler_init_noise_philox");
         if (noise_resource == nullptr || noise_resource->empty()) {
-            LOG_ERROR("%s refused CPU noise fallback; CUDA Philox noise resource could not be created", name);
+            LOG_ERROR("%s refused CPU noise fallback; %s noise resource could not be created",
+                      name,
+                      has_imported_noise ? "imported CUDA" : "CUDA Philox");
             return false;
         }
-        x_resource = latent_runner.add_scaled(*init_copy,
-                                              *noise_resource,
-                                              plan.sigmas[0],
-                                              sd_ctx->sd->n_threads,
-                                              "gpu_euler_init_latent_plus_noise");
+        log_backend_tensor_stats_for_parity("gpu_euler_initial_noise_before_denoise", noise_resource.get());
+        if (max_denoise) {
+            x_resource = latent_runner.scale(*noise_resource,
+                                             initial_noise_scale,
+                                             sd_ctx->sd->n_threads,
+                                             "gpu_euler_init_max_denoise_noise");
+        } else {
+            auto init_copy = sd_copy_gpu_resource_to_backend(sd_ctx,
+                                                             init_resource->tensor.get(),
+                                                             sd_ctx->sd->backend,
+                                                             "gpu_euler_init_latent_d2d");
+            if (init_copy == nullptr || init_copy->empty()) {
+                LOG_ERROR("%s failed to copy GPU init latent into sampler backend", name);
+                return false;
+            }
+            log_backend_tensor_stats_for_parity("gpu_euler_i2i_init_latent_after_process_in", init_copy.get());
+            x_resource = latent_runner.add_scaled(*init_copy,
+                                                  *noise_resource,
+                                                  initial_noise_scale,
+                                                  sd_ctx->sd->n_threads,
+                                                  "gpu_euler_init_latent_plus_noise");
+        }
+        log_backend_tensor_stats_for_parity("gpu_euler_i2i_noised_starting_latent_after_strength_noise", x_resource.get());
     } else {
         latent_shape = latents.init_latent.shape();
-        auto noise_resource = sd_create_backend_philox_noise_resource(sd_ctx,
-                                                                      latent_shape,
-                                                                      request.seed,
-                                                                      0,
-                                                                      "gpu_euler_initial_philox_noise");
+        std::unique_ptr<GgmlBackendTensorResource> noise_resource =
+            has_imported_noise
+                ? sd_copy_gpu_resource_to_backend(sd_ctx,
+                                                  imported_noise_resource->tensor.get(),
+                                                  sd_ctx->sd->backend,
+                                                  "gpu_euler_imported_noise_d2d")
+                : sd_create_backend_philox_noise_resource(sd_ctx,
+                                                          latent_shape,
+                                                          request.seed,
+                                                          0,
+                                                          "gpu_euler_initial_philox_noise");
         if (noise_resource == nullptr || noise_resource->empty()) {
-            LOG_ERROR("%s refused CPU noise fallback; CUDA Philox noise resource could not be created", name);
+            LOG_ERROR("%s refused CPU noise fallback; %s noise resource could not be created",
+                      name,
+                      has_imported_noise ? "imported CUDA" : "CUDA Philox");
             return false;
         }
+        log_backend_tensor_stats_for_parity("gpu_euler_initial_noise_before_denoise", noise_resource.get());
         x_resource = latent_runner.scale(*noise_resource,
-                                         plan.sigmas[0],
+                                         initial_noise_scale,
                                          sd_ctx->sd->n_threads,
                                          "gpu_euler_initial_latent_device_philox");
+        log_backend_tensor_stats_for_parity("gpu_euler_noised_starting_latent_after_strength_noise", x_resource.get());
     }
     int64_t init_end = ggml_time_ms();
     if (x_resource == nullptr || x_resource->empty()) {
@@ -6585,6 +7364,12 @@ static bool sd_sample_latent_gpu_euler_backend_bridge(sd_ctx_t* sd_ctx,
     sd_ctx->sd->sampler_rng->manual_seed(request.seed);
     LatentBackendGraphRunner latent_runner(sd_ctx->sd->backend);
     bool initial_noise_bridge_upload = false;
+    const float initial_noise_scale = std::sqrt(1.0f + plan.sigmas[0] * plan.sigmas[0]);
+    if (trace_euler_parity_stats_enabled()) {
+        LOG_INFO("[SamplerParity] gpu_euler_initial_noise_scaling max_denoise=true sigma=%.9g scale=%.9g",
+                 static_cast<double>(plan.sigmas[0]),
+                 static_cast<double>(initial_noise_scale));
+    }
     auto noise_resource = sd_create_backend_philox_noise_resource(sd_ctx,
                                                                   latents.init_latent.shape(),
                                                                   request.seed,
@@ -6592,17 +7377,19 @@ static bool sd_sample_latent_gpu_euler_backend_bridge(sd_ctx_t* sd_ctx,
                                                                   "gpu_euler_initial_philox_noise");
     std::unique_ptr<GgmlBackendTensorResource> x_resource;
     if (noise_resource != nullptr && !noise_resource->empty()) {
+        log_backend_tensor_stats_for_parity("gpu_euler_initial_noise_before_denoise", noise_resource.get());
         x_resource = latent_runner.scale(*noise_resource,
-                                         plan.sigmas[0],
+                                         initial_noise_scale,
                                          sd_ctx->sd->n_threads,
                                          "gpu_euler_initial_latent_device_philox");
+        log_backend_tensor_stats_for_parity("gpu_euler_noised_starting_latent_after_strength_noise", x_resource.get());
     } else {
         if (strict_gpu_resident) {
             LOG_ERROR("GPU Euler sampler backend path refused by strict mode; CUDA Philox noise resource could not be created without CPU upload");
             return false;
         }
         sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd_ctx->sd->rng);
-        sd::Tensor<float> x_t = sd_ctx->sd->denoiser->noise_scaling(plan.sigmas[0], noise, latents.init_latent);
+        sd::Tensor<float> x_t = noise * initial_noise_scale;
         x_resource = sd_upload_tensor_to_backend_resource(sd_ctx, x_t, "gpu_euler_initial_latent_bridge");
         initial_noise_bridge_upload = true;
     }
@@ -6670,6 +7457,7 @@ SD_API bool sd_sample_latent_gpu(sd_ctx_t* sd_ctx,
         StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER")) {
         return sd_sample_latent_gpu_euler_backend_true(sd_ctx,
                                                        sd_img_gen_params,
+                                                       0,
                                                        0,
                                                        false,
                                                        0,
@@ -6820,6 +7608,7 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
         if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
                                                     sd_img_gen_params,
                                                     init_gpu_latent,
+                                                    0,
                                                     false,
                                                     0,
                                                     0,
@@ -6898,6 +7687,7 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning(sd_ctx_t* sd_ctx
         if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
                                                     sd_img_gen_params,
                                                     init_gpu_latent,
+                                                    0,
                                                     true,
                                                     positive,
                                                     negative,
@@ -6955,6 +7745,47 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning(sd_ctx_t* sd_ctx
                  *out_gpu_latent);
     }
     return ok;
+}
+
+SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu(sd_ctx_t* sd_ctx,
+                                                                             const sd_img_gen_params_t* sd_img_gen_params,
+                                                                             sd_gpu_handle_t init_gpu_latent,
+                                                                             sd_gpu_handle_t noise_gpu_latent,
+                                                                             sd_conditioning_handle_t positive,
+                                                                             sd_conditioning_handle_t negative,
+                                                                             sd_gpu_handle_t* out_gpu_latent) {
+    if (out_gpu_latent != nullptr) {
+        *out_gpu_latent = 0;
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr || out_gpu_latent == nullptr) {
+        return false;
+    }
+    if (noise_gpu_latent == 0) {
+        return sd_sample_latent_gpu_with_init_gpu_and_conditioning(sd_ctx,
+                                                                   sd_img_gen_params,
+                                                                   init_gpu_latent,
+                                                                   positive,
+                                                                   negative,
+                                                                   out_gpu_latent);
+    }
+    if (!StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER")) {
+        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu requires SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1");
+        return false;
+    }
+    const bool use_conditioning_handles = positive != 0 || negative != 0;
+    if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
+                                                sd_img_gen_params,
+                                                init_gpu_latent,
+                                                noise_gpu_latent,
+                                                use_conditioning_handles,
+                                                positive,
+                                                negative,
+                                                "sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu",
+                                                out_gpu_latent)) {
+        return true;
+    }
+    LOG_ERROR("sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu failed; imported-noise parity path does not fall back to generated noise");
+    return false;
 }
 
 SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
@@ -7046,9 +7877,14 @@ SD_API sd_image_t* sd_decode_latent_normal(sd_ctx_t* sd_ctx,
         return nullptr;
     }
     sd_image_t output{};
+    int64_t t_download0 = ggml_time_ms();
     if (!sd_gpu_image_download(sd_ctx, gpu_image, &output, nullptr)) {
         sd_gpu_handle_release(sd_ctx, gpu_image);
         return nullptr;
+    }
+    int64_t t_download1 = ggml_time_ms();
+    if (report != nullptr) {
+        report->decode_download_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_download1 - t_download0));
     }
     sd_gpu_handle_release(sd_ctx, gpu_image);
     sd_image_t* result = static_cast<sd_image_t*>(calloc(1, sizeof(sd_image_t)));
@@ -7695,6 +8531,25 @@ SD_API bool sd_gpu_tensor_download(sd_ctx_t* sd_ctx,
     return true;
 }
 
+SD_API bool sd_gpu_latent_export_f32_nchw_debug(sd_ctx_t* sd_ctx,
+                                                sd_gpu_handle_t gpu_latent,
+                                                float* dst,
+                                                uint64_t dst_elements,
+                                                sd_latent_view_t* out_view,
+                                                const sd_download_options_t* options) {
+    SD_UNUSED(sd_ctx);
+    SD_UNUSED(gpu_latent);
+    SD_UNUSED(dst);
+    SD_UNUSED(dst_elements);
+    SD_UNUSED(out_view);
+    SD_UNUSED(options);
+    // This symbol is retained only as a fail-closed compatibility probe.
+    // The supported debug path is sd_gpu_latent_download -> sd_latent_export_f32.
+    // Do not touch caller pointers or context state here; Paralol observed SEH
+    // crashes before the internal fallback could complete when this API did work.
+    return false;
+}
+
 SD_API sd_latent_t* sd_gpu_latent_download(sd_ctx_t* sd_ctx,
                                            sd_gpu_handle_t gpu_latent,
                                            const sd_download_options_t* options) {
@@ -7765,6 +8620,7 @@ SD_API bool sd_gpu_image_download(sd_ctx_t* sd_ctx,
         resource->tensor == nullptr || resource->tensor->empty()) {
         return false;
     }
+    int64_t t0 = ggml_time_ms();
     sd::Tensor<float> image = sd::make_sd_tensor_from_ggml<float>(resource->tensor->tensor);
     if (image.empty()) {
         return false;
@@ -7776,9 +8632,15 @@ SD_API bool sd_gpu_image_download(sd_ctx_t* sd_ctx,
         scale_vae_decode_output_to_image_range(&image);
     }
     sd_image_t output = tensor_to_sd_image(image);
+    int64_t t1 = ggml_time_ms();
     *out_cpu_image = output;
     if (trace_gpu_handles_enabled()) {
-        LOG_INFO("[GPU] image download id=%" PRIu64 " %ux%ux%u", gpu_image, output.width, output.height, output.channel);
+        LOG_INFO("[GPU] image download id=%" PRIu64 " %ux%ux%u download_ms=%" PRId64,
+                 gpu_image,
+                 output.width,
+                 output.height,
+                 output.channel,
+                 t1 - t0);
     }
     return true;
 }
@@ -7841,6 +8703,7 @@ SD_API bool sd_gpu_image_download_to_buffer(sd_ctx_t* sd_ctx,
         return false;
     }
 
+    int64_t t0 = ggml_time_ms();
     sd::Tensor<float> image = sd::make_sd_tensor_from_ggml<float>(resource->tensor->tensor);
     if (image.empty()) {
         return false;
@@ -7876,13 +8739,15 @@ SD_API bool sd_gpu_image_download_to_buffer(sd_ctx_t* sd_ctx,
             out[3] = channels == 4 ? to_u8(src[pixel_index + 3u * plane]) : 255;
         }
     }
+    int64_t t1 = ggml_time_ms();
     if (trace_gpu_handles_enabled()) {
-        LOG_INFO("[GPU] image download to caller buffer id=%" PRIu64 " %" PRIu64 "x%" PRIu64 " stride=%" PRIu64 " bytes=%" PRIu64,
+        LOG_INFO("[GPU] image download to caller buffer id=%" PRIu64 " %" PRIu64 "x%" PRIu64 " stride=%" PRIu64 " bytes=%" PRIu64 " download_ms=%" PRId64,
                  gpu_image,
                  width,
                  height,
                  dst_stride_bytes,
-                 required_bytes);
+                 required_bytes,
+                 t1 - t0);
     }
     return true;
 }
@@ -7924,17 +8789,10 @@ static bool sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx_t* sd_ctx,
     }
 
     int64_t t0 = ggml_time_ms();
+    const bool bridge_ctx_reused = sd_ctx->vae_decode_bridge_ctx != nullptr;
     sd_ctx_t* decode_ctx = sd_ctx_get_vae_decode_bridge_ctx(sd_ctx);
+    int64_t t_context = ggml_time_ms();
     if (decode_ctx == nullptr || decode_ctx->sd == nullptr) {
-        return false;
-    }
-
-    auto latent_copy = sd_copy_gpu_resource_to_context(decode_ctx,
-                                                       resource->tensor.get(),
-                                                       "vae_encode_latent_d2d_for_isolated_decode");
-    int64_t t1 = ggml_time_ms();
-    if (latent_copy == nullptr || latent_copy->empty()) {
-        LOG_ERROR("sd_decode_gpu_latent_normal_gpu failed to copy VAE-encoded latent to isolated decode context");
         return false;
     }
 
@@ -7949,6 +8807,17 @@ static bool sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx_t* sd_ctx,
         return false;
     }
     ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
+    int64_t t_setup = ggml_time_ms();
+
+    auto latent_copy = sd_copy_gpu_resource_to_context(decode_ctx,
+                                                       resource->tensor.get(),
+                                                       "vae_encode_latent_d2d_for_isolated_decode");
+    int64_t t_latent_copy = ggml_time_ms();
+    if (latent_copy == nullptr || latent_copy->empty()) {
+        LOG_ERROR("sd_decode_gpu_latent_normal_gpu failed to copy VAE-encoded latent to isolated decode context");
+        return false;
+    }
+    log_backend_tensor_stats_for_parity("vae_decode_isolated_input_latent", latent_copy.get());
 
     auto decoded_in_bridge_ctx = decode_ctx->sd->first_stage_model->decode_latent_resource_to_backend_resource(
         decode_ctx->sd->n_threads,
@@ -7956,10 +8825,10 @@ static bool sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx_t* sd_ctx,
         decode_ctx->sd->vae_tiling_params,
         decode_ctx->sd->circular_x,
         decode_ctx->sd->circular_y);
-    int64_t t2 = ggml_time_ms();
+    int64_t t_graph = ggml_time_ms();
     if (decoded_in_bridge_ctx == nullptr || decoded_in_bridge_ctx->empty()) {
         LOG_ERROR("sd_decode_gpu_latent_normal_gpu VAE encoded-latent isolated GPU decode failed after %.2fs",
-                  (t2 - t0) * 1.0f / 1000);
+                  (t_graph - t0) * 1.0f / 1000);
         return false;
     }
 
@@ -7980,7 +8849,7 @@ static bool sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx_t* sd_ctx,
     auto gpu_image = sd_copy_gpu_resource_to_context(sd_ctx,
                                                      decoded_in_bridge_ctx.get(),
                                                      "vae_decode_rgb_f32_from_vae_encode_d2d");
-    int64_t t3 = ggml_time_ms();
+    int64_t t_image_copy = ggml_time_ms();
     if (gpu_image == nullptr || gpu_image->empty()) {
         LOG_ERROR("sd_decode_gpu_latent_normal_gpu VAE encoded-latent isolated decode failed to copy decoded image to caller context");
         return false;
@@ -8005,6 +8874,15 @@ static bool sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx_t* sd_ctx,
                       : (input_vae_encode
                              ? "VAE Encode GPU latent decoded in isolated VAE context with device-to-device handoff; no CPU latent materialization"
                              : "Sampler output from a GPU init latent decoded in isolated VAE context with device-to-device handoff; no CPU latent materialization"));
+    full_report.decode_context_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_context - t0));
+    full_report.decode_setup_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_setup - t_context));
+    full_report.decode_latent_d2d_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_latent_copy - t_setup));
+    full_report.decode_graph_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_graph - t_latent_copy));
+    full_report.decode_image_d2d_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_image_copy - t_graph));
+    full_report.decode_download_ms = 0;
+    full_report.decode_context_reuse = bridge_ctx_reused ? 1u : 0u;
+    full_report.decode_same_context_attempted = 0;
+    full_report.decode_same_context_succeeded = 0;
     log_vae_report("decode_gpu_latent_vae_encode_d2d", full_report);
     if (report != nullptr) {
         *report = full_report;
@@ -8022,11 +8900,14 @@ static bool sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx_t* sd_ctx,
         return false;
     }
     *out_gpu_image = handle;
-    LOG_INFO("sd_decode_gpu_latent_normal_gpu VAE encoded-latent D2D isolated decode completed, total=%.2fs latent_d2d=%.2fs decode=%.2fs image_d2d=%.2fs input_handle=%" PRIu64 " output_handle=%" PRIu64 " input_cpu_bridge=%s",
-             (t3 - t0) * 1.0f / 1000,
-             (t1 - t0) * 1.0f / 1000,
-             (t2 - t1) * 1.0f / 1000,
-             (t3 - t2) * 1.0f / 1000,
+    LOG_INFO("sd_decode_gpu_latent_normal_gpu VAE encoded-latent D2D isolated decode completed, total=%.2fs context=%.2fs setup=%.2fs latent_d2d=%.2fs decode_graph=%.2fs image_d2d=%.2fs context_reuse=%s input_handle=%" PRIu64 " output_handle=%" PRIu64 " input_cpu_bridge=%s",
+             (t_image_copy - t0) * 1.0f / 1000,
+             (t_context - t0) * 1.0f / 1000,
+             (t_setup - t_context) * 1.0f / 1000,
+             (t_latent_copy - t_setup) * 1.0f / 1000,
+             (t_graph - t_latent_copy) * 1.0f / 1000,
+             (t_image_copy - t_graph) * 1.0f / 1000,
+             bridge_ctx_reused ? "true" : "false",
              gpu_latent,
              handle,
              input_cpu_bridge ? "true" : "false");
@@ -8117,6 +8998,7 @@ SD_API bool sd_encode_image_normal_gpu(sd_ctx_t* sd_ctx,
             LOG_ERROR("sd_encode_image_normal_gpu failed after %.2fs", (t1 - t0) * 1.0f / 1000);
             return false;
         }
+        log_backend_tensor_stats_for_parity("vae_encode_gpu_diffusion_latent", resource.get());
 
         sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
                                                           std::move(resource),
@@ -8190,6 +9072,78 @@ SD_API bool sd_encode_image_normal_gpu(sd_ctx_t* sd_ctx,
     return true;
 }
 
+SD_API bool sd_prewarm_vae_decode_bridge(sd_ctx_t* sd_ctx,
+                                          const sd_vae_run_options_t* options,
+                                          sd_vae_memory_report_t* report) {
+    if (report != nullptr) {
+        sd_vae_memory_report_init(report);
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    if (!sd_model_supports_gpu_latent_decode(sd_ctx->sd->version) ||
+        sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version)) {
+        LOG_ERROR("sd_prewarm_vae_decode_bridge unsupported for model version %d",
+                  static_cast<int>(sd_ctx->sd->version));
+        return false;
+    }
+
+    int64_t t0 = ggml_time_ms();
+    const bool bridge_ctx_reused = sd_ctx->vae_decode_bridge_ctx != nullptr;
+    sd_ctx_t* decode_ctx = sd_ctx_get_vae_decode_bridge_ctx(sd_ctx);
+    int64_t t_context = ggml_time_ms();
+    if (decode_ctx == nullptr || decode_ctx->sd == nullptr) {
+        return false;
+    }
+
+    sd_vae_run_options_t effective = effective_vae_options(options);
+    sd_vae_exec_mode_t resolved_mode = SD_VAE_EXEC_AUTO;
+    bool used_taesd = false;
+    if (!prepare_normal_vae_run(decode_ctx, effective, &resolved_mode, &used_taesd)) {
+        return false;
+    }
+    int64_t t_setup = ggml_time_ms();
+    if (resolved_mode != SD_VAE_EXEC_COMFY_NORMAL) {
+        LOG_ERROR("sd_prewarm_vae_decode_bridge currently requires COMFY_NORMAL");
+        return false;
+    }
+
+    sd_vae_memory_report_t full_report;
+    sd_vae_memory_report_init(&full_report);
+    full_report.requested_mode = effective.mode;
+    full_report.resolved_mode = resolved_mode;
+    full_report.requested_storage_dtype = effective.storage_dtype;
+    std::string fallback_reason;
+    full_report.resolved_storage_dtype = resolve_vae_storage_dtype(effective, resolved_mode, &fallback_reason);
+    full_report.used_direct_conv = true;
+    full_report.used_tiling = false;
+    full_report.used_taesd = used_taesd;
+    full_report.used_im2col = false;
+    full_report.device_resident_stages = true;
+    full_report.decode_context_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_context - t0));
+    full_report.decode_setup_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_setup - t_context));
+    full_report.decode_context_reuse = bridge_ctx_reused ? 1u : 0u;
+    std::snprintf(full_report.math_dtype_policy,
+                  sizeof(full_report.math_dtype_policy),
+                  "storage=%s math=f32 reductions=f32",
+                  sd_vae_dtype_name(full_report.resolved_storage_dtype));
+    std::snprintf(full_report.fallback_reason,
+                  sizeof(full_report.fallback_reason),
+                  "prewarmed isolated VAE decode context; dtype=%s%s%s",
+                  sd_vae_dtype_name(full_report.resolved_storage_dtype),
+                  fallback_reason.empty() ? "" : "; ",
+                  fallback_reason.empty() ? "" : "see dtype policy log");
+    log_vae_report("prewarm_vae_decode_bridge", full_report);
+    if (report != nullptr) {
+        *report = full_report;
+    }
+    LOG_INFO("sd_prewarm_vae_decode_bridge completed, context=%.2fs setup=%.2fs context_reuse=%s",
+             (t_context - t0) * 1.0f / 1000,
+             (t_setup - t_context) * 1.0f / 1000,
+             bridge_ctx_reused ? "true" : "false");
+    return true;
+}
+
 SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
                                             sd_gpu_handle_t gpu_latent,
                                             const sd_vae_run_options_t* options,
@@ -8233,15 +9187,26 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         }
         return false;
     }
-    if ((resource->flags & (SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT |
-                            SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE)) != 0 &&
-        !sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version)) {
+    const bool resource_requests_isolated_decode =
+        (resource->flags & (SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT |
+                            SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE)) != 0;
+    const bool try_same_context_decode =
+        resource_requests_isolated_decode &&
+        !sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version) &&
+        sd_experimental_vae_same_context_decode_enabled();
+    if (resource_requests_isolated_decode &&
+        !sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version) &&
+        !try_same_context_decode) {
         return sd_decode_vae_encoded_gpu_latent_bridge(sd_ctx,
                                                        gpu_latent,
                                                        resource,
                                                        options,
                                                        out_gpu_image,
                                                        report);
+    }
+    if (try_same_context_decode) {
+        LOG_INFO("sd_decode_gpu_latent_normal_gpu experimental same-context decode enabled for VAE-encoded latent handle=%" PRIu64,
+                 gpu_latent);
     }
 
     if (sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version)) {
@@ -8340,6 +9305,7 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         return true;
     }
 
+    int64_t t_setup0 = ggml_time_ms();
     sd_vae_run_options_t effective = effective_vae_options(options);
     sd_vae_exec_mode_t resolved_mode = SD_VAE_EXEC_AUTO;
     bool used_taesd = false;
@@ -8351,6 +9317,7 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         return false;
     }
     ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
+    int64_t t_setup1 = ggml_time_ms();
 
     int64_t t0 = ggml_time_ms();
     auto gpu_image = sd_ctx->sd->first_stage_model->decode_latent_resource_to_backend_resource(sd_ctx->sd->n_threads,
@@ -8359,10 +9326,20 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
                                                                                                sd_ctx->sd->circular_x,
                                                                                                sd_ctx->sd->circular_y);
     int64_t t1 = ggml_time_ms();
+    log_backend_tensor_stats_for_parity("vae_decode_input_latent", resource->tensor.get());
     sd_vae_memory_report_t graph_report = sd_ctx->sd->first_stage_model->get_last_graph_report();
     sd_vae_memory_report_t full_report;
     sd_vae_memory_report_init(&full_report);
     copy_vae_report(&full_report, graph_report, effective, resolved_mode, false, used_taesd);
+    full_report.decode_setup_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_setup1 - t_setup0));
+    full_report.decode_context_ms = 0;
+    full_report.decode_latent_d2d_ms = 0;
+    full_report.decode_graph_ms = static_cast<uint32_t>(std::max<int64_t>(0, t1 - t0));
+    full_report.decode_image_d2d_ms = 0;
+    full_report.decode_download_ms = 0;
+    full_report.decode_context_reuse = 0;
+    full_report.decode_same_context_attempted = try_same_context_decode ? 1u : 0u;
+    full_report.decode_same_context_succeeded = try_same_context_decode ? 1u : 0u;
     log_vae_report("decode_gpu_latent", full_report);
     if (report != nullptr) {
         *report = full_report;

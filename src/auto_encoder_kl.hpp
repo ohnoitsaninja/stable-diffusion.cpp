@@ -1398,7 +1398,11 @@ struct AutoEncoderKL : public VAE {
             return nullptr;
         }
         int64_t t0 = ggml_time_ms();
-        auto vae_output = _compute_staged_resource(n_threads, x, false);
+        sd::Tensor<float> input = x;
+        if (scale_input) {
+            scale_tensor_to_minus1_1(&input);
+        }
+        auto vae_output = _compute_staged_resource(n_threads, input, false);
         sd_vae_memory_report_t aggregate = get_last_graph_report();
         if (vae_output == nullptr || vae_output->empty()) {
             LOG_ERROR("vae encode GPU output compute failed");
