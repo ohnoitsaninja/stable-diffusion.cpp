@@ -3197,17 +3197,19 @@ public:
 
         SDCondition batched_cfg_condition;
         std::string batched_cfg_fallback_reason;
-        const bool cfg_batching_requested = env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG");
+        const bool cfg_batching_disabled = env_flag_enabled("SDCPP_DISABLE_GPU_EULER_BATCHED_CFG");
+        const bool cfg_batching_requested =
+            !cfg_batching_disabled || env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG");
         const bool use_batched_cfg =
             cfg_batching_requested &&
             !uncond.empty() &&
             make_batched_cfg_condition(&batched_cfg_condition, &batched_cfg_fallback_reason);
         if (!uncond.empty()) {
             if (use_batched_cfg) {
-                LOG_INFO("GPU Euler sampler backend using batched CFG UNet evaluation");
+                LOG_INFO("GPU Euler sampler backend using batched CFG UNet evaluation; set SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1 to use separate cond/uncond calls");
             } else {
-                if (!cfg_batching_requested) {
-                    LOG_INFO("GPU Euler sampler backend using separate CFG UNet evaluation; set SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG=1 to test batched CFG");
+                if (cfg_batching_disabled) {
+                    LOG_INFO("GPU Euler sampler backend using separate CFG UNet evaluation because SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1");
                 } else {
                     LOG_WARN("GPU Euler sampler backend using separate CFG UNet evaluation%s%s",
                              batched_cfg_fallback_reason.empty() ? "" : ": ",

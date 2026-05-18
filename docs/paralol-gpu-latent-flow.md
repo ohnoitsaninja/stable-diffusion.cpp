@@ -365,10 +365,11 @@ The complete all-GPU KSampler project is still broader than this first lane.
 The env-gated SDXL/SD1 Euler backend path now keeps T2I and GPU-init I2I sampler
 state as backend tensors and uses implicit-GEMM direct diffusion conv by
 default, with `SDCPP_DISABLE_GPU_EULER_DIFFUSION_IMPLICIT_GEMM_CONV=1` as an
-escape hatch. Explicit batch CFG is available only for investigation with
-`SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG=1`; it is not the default because the
-current batch-2 UNet graph is not consistently faster. Non-Euler samplers, flow
-denoisers, ControlNet, reference/edit/image-CFG, and model-family-specific
-paths still need backend tensor/resource variants instead of `sd::Tensor<float>`
-host values. The concrete blocker map is in
+escape hatch. Eligible SDXL/SD1 Euler CFG now defaults to a Comfy-style
+batched cond/uncond UNet call for parity; set
+`SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1` to use separate cond/uncond calls for
+diagnostics or speed comparison. Non-Euler samplers, flow denoisers,
+ControlNet, reference/edit/image-CFG, and model-family-specific paths still
+need backend tensor/resource variants instead of `sd::Tensor<float>` host
+values. The concrete blocker map is in
 `docs/paralol-true-gpu-sampler-plan.md`.

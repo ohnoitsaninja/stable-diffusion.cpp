@@ -90,10 +90,11 @@ The first CFG performance pass found two separate issues:
   now preserves the batch dimension when flash attention returns
   `[d_head, heads * batch, tokens]`, so SDXL batch-2 UNet graphs no longer
   abort during the attention output reshape.
-- plain cond/uncond batching is not a default win on this fork yet. With legacy
-  diffusion conv lowering, batch-2 UNet doubles the large IM2COL workspaces. The
-  experimental batch mode is therefore gated behind
-  `SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG=1`.
+- plain cond/uncond batching is now the default for eligible SDXL/SD1 Euler
+  CFG in the backend sampler path because same-noise Comfy parity improves
+  measurably. It can still be disabled with
+  `SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1` when comparing speed or isolating
+  CFG behavior.
 
 For the env-gated GPU Euler sampler, the default SDXL/SD1 UNet path now enables
 diffusion direct conv and routes CUDA `CONV_2D` through the imported
@@ -108,14 +109,16 @@ In a bounded SDXL 1024, 8-step, CFG 1.2 real-prompt smoke, this lowered the
 per-UNet compute buffer from about `491.99 MB` to `270.86 MB`. The same smoke
 reported:
 
-- direct implicit-GEMM CFG-separate path: `denoise_ms=2480`
+- direct implicit-GEMM CFG-separate path: `denoise_ms=2384`
 - legacy diffusion conv escape hatch: `denoise_ms=2839`
-- explicit batch CFG plus implicit-GEMM conv: `denoise_ms=2576`
+- default batch CFG plus implicit-GEMM conv: `denoise_ms=2647`
 
 Those numbers vary with cache/interleaving, but the result is clear enough for
 the fork contract: implicit-GEMM diffusion conv is the useful default for the
-narrow GPU Euler backend; batch CFG remains opt-in until the backend has better
-batch-2 UNet graph efficiency.
+narrow GPU Euler backend, and batch CFG is the parity default. The separate
+CFG path remains available through `SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1`
+because the batch-2 graph is currently a little slower on the reference SDXL
+1024 run.
 
 ## Required refactor
 
