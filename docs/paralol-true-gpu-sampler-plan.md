@@ -1,8 +1,7 @@
 # Paralol True GPU Sampler Plan
 
-This note explains why the default KSampler GPU APIs are compatibility bridges
-and tracks the first experimental path where `SDCPP_STRICT_GPU_RESIDENT=1`
-can allow sampler output.
+This note explains which KSampler GPU APIs are true device-resident paths and
+which paths remain compatibility bridges.
 
 ## Current blocker
 
@@ -20,27 +19,33 @@ and internal currency:
 - `src/ggml_extend.hpp`: `GGMLRunner::compute<T>(...)` materializes graph
   output with `sd::make_sd_tensor_from_ggml<T>(...)`.
 
-Because of those contracts, the default `sd_sample_latent_gpu(...)` still runs
-the existing sampler, receives a CPU latent, then uploads it into an owned CUDA
-`SD_GPU_RESOURCE_LATENT`. `sd_sample_latent_gpu_with_init_gpu(...)` validates
-its CUDA init latent, downloads it into the CPU sampler, then returns the same
-bridge-uploaded output.
+Because of those contracts, unsupported samplers and model families still run
+the existing sampler, receive a CPU latent, then upload it into an owned CUDA
+`SD_GPU_RESOURCE_LATENT`. The supported exception is the env-gated SD1/SDXL
+Euler backend path described below.
 
-The capability API is intentionally honest:
+Without `SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1`, the capability API remains
+intentionally honest:
 
 - `supports_sampler_gpu_latent_output=false`
 - `supports_sampler_gpu_latent_bridge_output=true`
 - `supports_sampler_gpu_init_latent_input=false`
 - `supports_sampler_gpu_init_latent_bridge_input=true`
 
-Strict mode must keep refusing those default bridge APIs until the contracts
-above are replaced or an explicitly supported true path is selected.
+With `SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1` on SD1/SDXL CUDA contexts, the
+true Euler path reports:
 
-## Spike status
+- `supports_sampler_gpu_latent_output=true`
+- `supports_sampler_gpu_latent_bridge_output=true`
+- `supports_sampler_gpu_init_latent_input=true`
+- `supports_sampler_gpu_init_latent_bridge_input=true`
 
-The `codex/true-gpu-sampler-spike` branch now proves the first backend-resident
-sampler seam for SDXL/SD1 Euler without changing the production capability
-contract.
+Strict mode refuses bridge fallbacks and allows only the true path.
+
+## Implemented status
+
+The fork now has the first backend-resident sampler seam for SDXL/SD1 Euler.
+It remains env-gated and narrow, but it is no longer only a proof API.
 
 Two env-gated paths exist:
 
@@ -51,14 +56,13 @@ Two env-gated paths exist:
   no CPU bridge flags. It deliberately uses deterministic device-procedural
   Gaussian noise instead of production Philox, so it proves residency, not
   image parity.
-- `SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1` changes
-  `sd_sample_latent_gpu(...)` for SDXL/SD1 T2I Euler to use a backend tensor
-  sampler loop. This path now creates the initial Philox Gaussian noise on
-  CUDA, scales it on the backend, and keeps per-step latent state and sampler
-  math on the backend. The returned handle has no CPU bridge flags when CUDA
-  Philox allocation succeeds. If CUDA Philox allocation fails, non-strict mode
-  falls back to the older one-time CPU noise upload and marks the handle
-  `CPU_BRIDGE_UPLOAD`; strict mode refuses that fallback.
+- `SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1` changes the SDXL/SD1 Euler GPU
+  sampler APIs to use a backend tensor sampler loop. T2I creates Philox
+  Gaussian noise on CUDA, scales it on the backend, and keeps per-step latent
+  state and sampler math on the backend. I2I validates the CUDA init latent,
+  copies it device-to-device into the sampler backend, creates matching CUDA
+  noise, applies strength on the backend, then samples without downloading the
+  init latent. The returned handle has no CPU bridge flags on success.
 
 The practical backend path has been checked against the existing CPU sampler
 with `sd-latent-smoke --compare-gpu-sampler-backend-euler` on SDXL 1024,
@@ -73,11 +77,10 @@ Euler, 8 steps, CFG 1.2:
 - strict mode allows the experimental path when the descriptor has flags `4`
   (`SAMPLER_OUTPUT`) and no CPU bridge flags
 
-This is enough to prove the sampler-loop/backend-tensor refactor is feasible
-and usable for the narrow SDXL/SD1 T2I Euler lane. It is not enough to promote
-`supports_sampler_gpu_latent_output=true` globally: the path is env-gated,
-limited to T2I Euler, and non-Euler samplers plus init-latent sampling still
-need backend implementations.
+This proves the sampler-loop/backend-tensor refactor is feasible and usable for
+the narrow SDXL/SD1 Euler lane. It is not a global sampler implementation: the
+path is env-gated and limited to Euler, batch 1, no masks, no ControlNet, no
+reference/edit/image-CFG paths, and non-flow denoisers.
 
 ## CFG and UNet conv update
 
@@ -183,7 +186,9 @@ For SDXL 1024:
   thresholds for a fixed seed.
 - bridge paths still work and remain visibly marked as bridges.
 
-Those conditions are now met only for the env-gated SDXL/SD1 T2I Euler path.
-Paralol should continue treating default sampler GPU output, sampler GPU
-init-latent input, and all unsupported sampler/model combinations as bridge
-paths only.
+Those conditions are now met for the env-gated SDXL/SD1 Euler T2I path and the
+env-gated SDXL/SD1 Euler I2I path where the init latent is already an
+`SD_GPU_RESOURCE_LATENT`. Paralol should continue treating unsupported
+samplers, model families, masks, ControlNet, reference/edit/image-CFG paths,
+and requests without `SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1` as bridge paths
+only.

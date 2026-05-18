@@ -217,6 +217,22 @@ public:
         return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
     }
 
+    std::unique_ptr<GgmlBackendTensorResource> add_scaled(const GgmlBackendTensorResource& input,
+                                                          const GgmlBackendTensorResource& scaled_input,
+                                                          float factor,
+                                                          int n_threads,
+                                                          const char* output_name) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            ggml_cgraph* gf = new_graph_custom(32);
+            ggml_tensor* x = make_backend_input(input);
+            ggml_tensor* y = make_backend_input(scaled_input);
+            ggml_tensor* out = ggml_add(compute_ctx, x, ggml_scale(compute_ctx, y, factor));
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        };
+        return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
+    }
+
     std::unique_ptr<GgmlBackendTensorResource> denoised_from_model_output(const GgmlBackendTensorResource& model_output,
                                                                           const GgmlBackendTensorResource& x,
                                                                           float c_out,
@@ -5000,6 +5016,35 @@ static std::unique_ptr<GgmlBackendTensorResource> sd_copy_gpu_resource_to_contex
     return handle;
 }
 
+static std::unique_ptr<GgmlBackendTensorResource> sd_copy_gpu_resource_to_backend(sd_ctx_t* dst_ctx,
+                                                                                  const GgmlBackendTensorResource* src,
+                                                                                  ggml_backend_t dst_backend,
+                                                                                  const char* name) {
+    if (dst_ctx == nullptr || dst_ctx->sd == nullptr || src == nullptr || src->empty() || dst_backend == nullptr) {
+        return nullptr;
+    }
+    auto handle = std::make_unique<GgmlBackendTensorResource>();
+    ggml_init_params params;
+    params.mem_size = static_cast<size_t>(MAX_PARAMS_TENSOR_NUM * ggml_tensor_overhead());
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    handle->ctx = ggml_init(params);
+    if (handle->ctx == nullptr) {
+        return nullptr;
+    }
+    handle->tensor = ggml_dup_tensor(handle->ctx, src->tensor);
+    if (name != nullptr) {
+        ggml_set_name(handle->tensor, name);
+    }
+    handle->buffer = ggml_backend_alloc_ctx_tensors(handle->ctx, dst_backend);
+    if (handle->buffer == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_tensor_copy(src->tensor, handle->tensor);
+    ggml_backend_synchronize(dst_backend);
+    return handle;
+}
+
 static bool sd_strict_gpu_resident_enabled() {
     return StableDiffusionGGML::env_flag_enabled("SDCPP_STRICT_GPU_RESIDENT");
 }
@@ -5055,6 +5100,64 @@ static bool sd_gpu_latent_shape_is_supported(SDVersion version, const sd_gpu_res
            tensor->type == GGML_TYPE_F32 &&
            tensor->ne[2] == expected_channels &&
            tensor->ne[3] == 1;
+}
+
+static bool sd_gpu_latent_matches_request(sd_ctx_t* sd_ctx,
+                                          const sd_gpu_resource_private_t& resource,
+                                          const GenerationRequest& request,
+                                          const char* api_name) {
+    const char* name = api_name != nullptr ? api_name : "GPU sampler";
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || resource.kind != SD_GPU_RESOURCE_LATENT ||
+        resource.tensor == nullptr || resource.tensor->empty()) {
+        LOG_ERROR("%s requires a valid GPU latent handle", name);
+        return false;
+    }
+    if (!sd_gpu_resource_is_cuda(resource)) {
+        LOG_ERROR("%s requires a CUDA latent handle", name);
+        return false;
+    }
+    if (!sd_gpu_latent_shape_is_supported(sd_ctx->sd->version, resource)) {
+        sd_gpu_tensor_desc_t desc;
+        if (sd_gpu_fill_desc(resource, &desc)) {
+            LOG_ERROR("%s unsupported GPU init latent dtype/shape: dtype=%d shape_nchw=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " expected_channels=%u",
+                      name,
+                      static_cast<int>(desc.dtype),
+                      desc.n,
+                      desc.c,
+                      desc.h,
+                      desc.w,
+                      expected_diffusion_latent_channels(sd_ctx->sd->version));
+        } else {
+            LOG_ERROR("%s unsupported GPU init latent descriptor", name);
+        }
+        return false;
+    }
+    if (request.vae_scale_factor <= 0 ||
+        request.width % request.vae_scale_factor != 0 ||
+        request.height % request.vae_scale_factor != 0) {
+        LOG_ERROR("%s invalid request dimensions %dx%d for VAE scale factor %d",
+                  name,
+                  request.width,
+                  request.height,
+                  request.vae_scale_factor);
+        return false;
+    }
+    ggml_tensor* tensor = resource.tensor->tensor;
+    const int64_t expected_w = request.width / request.vae_scale_factor;
+    const int64_t expected_h = request.height / request.vae_scale_factor;
+    if (tensor->ne[0] != expected_w || tensor->ne[1] != expected_h) {
+        LOG_ERROR("%s GPU init latent shape does not match request: expected shape_nchw=1x%ux%" PRId64 "x%" PRId64 " got shape_nchw=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
+                  name,
+                  expected_diffusion_latent_channels(sd_ctx->sd->version),
+                  expected_h,
+                  expected_w,
+                  tensor->ne[3],
+                  tensor->ne[2],
+                  tensor->ne[1],
+                  tensor->ne[0]);
+        return false;
+    }
+    return true;
 }
 
 static void scale_vae_decode_output_to_image_range(sd::Tensor<float>* tensor) {
@@ -5999,6 +6102,15 @@ static sd_latent_t* sd_sample_latent_with_conditioning_internal(sd_ctx_t* sd_ctx
     return make_sd_latent(std::move(final_latent), sd_latent_source_t::sampler);
 }
 
+static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
+                                                    const sd_img_gen_params_t* sd_img_gen_params,
+                                                    sd_gpu_handle_t init_gpu_latent,
+                                                    bool use_conditioning_handles,
+                                                    sd_conditioning_handle_t positive,
+                                                    sd_conditioning_handle_t negative,
+                                                    const char* api_name,
+                                                    sd_gpu_handle_t* out_gpu_latent);
+
 SD_API bool sd_sample_latent_gpu_with_conditioning(sd_ctx_t* sd_ctx,
                                                    const sd_img_gen_params_t* sd_img_gen_params,
                                                    const sd_latent_t* init_latent,
@@ -6010,6 +6122,23 @@ SD_API bool sd_sample_latent_gpu_with_conditioning(sd_ctx_t* sd_ctx,
     }
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr || out_gpu_latent == nullptr) {
         return false;
+    }
+    if (init_latent == nullptr &&
+        StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER")) {
+        if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
+                                                    sd_img_gen_params,
+                                                    0,
+                                                    true,
+                                                    positive,
+                                                    negative,
+                                                    "sd_sample_latent_gpu_with_conditioning",
+                                                    out_gpu_latent)) {
+            return true;
+        }
+        if (sd_strict_gpu_resident_enabled()) {
+            LOG_ERROR("sd_sample_latent_gpu_with_conditioning strict mode refused fallback after true GPU Euler path failed");
+            return false;
+        }
     }
     if (sd_strict_gpu_resident_enabled()) {
         LOG_ERROR("sd_sample_latent_gpu_with_conditioning strict mode refused CPU-backed sampler bridge; conditioning handles are resident but sampler output still materializes through sd::Tensor<float>");
@@ -6163,6 +6292,220 @@ SD_API bool sd_sample_latent_gpu_true_euler_spike(sd_ctx_t* sd_ctx,
     LOG_INFO("sd_sample_latent_gpu_true_euler_spike completed handle=%" PRIu64 " bridge_upload=false strict_gpu_resident=%s",
              handle,
              sd_strict_gpu_resident_enabled() ? "true" : "false");
+    return true;
+}
+
+static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
+                                                    const sd_img_gen_params_t* sd_img_gen_params,
+                                                    sd_gpu_handle_t init_gpu_latent,
+                                                    bool use_conditioning_handles,
+                                                    sd_conditioning_handle_t positive,
+                                                    sd_conditioning_handle_t negative,
+                                                    const char* api_name,
+                                                    sd_gpu_handle_t* out_gpu_latent) {
+    if (out_gpu_latent != nullptr) {
+        *out_gpu_latent = 0;
+    }
+    const char* name = api_name != nullptr ? api_name : "sd_sample_latent_gpu_euler_backend_true";
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr || out_gpu_latent == nullptr) {
+        return false;
+    }
+    if (!StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER")) {
+        LOG_ERROR("%s requires SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1", name);
+        return false;
+    }
+    if (sd_ctx->sd->vae_decode_only ||
+        sd_ctx->sd->diffusion_model == nullptr ||
+        sd_ctx->sd->denoiser == nullptr ||
+        (!use_conditioning_handles && sd_ctx->sd->cond_stage_model == nullptr)) {
+        LOG_ERROR("%s requires a full SD context; recreate with vae_decode_only=false", name);
+        return false;
+    }
+
+    const bool has_gpu_init = init_gpu_latent != 0;
+    int64_t t0 = ggml_time_ms();
+    sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
+    GenerationRequest request(sd_ctx, sd_img_gen_params);
+    if (request.batch_count != 1) {
+        LOG_ERROR("%s currently supports batch_count=1, got %d", name, request.batch_count);
+        return false;
+    }
+    if (!sd_version_is_sdxl(sd_ctx->sd->version) && !sd_version_is_sd1(sd_ctx->sd->version)) {
+        LOG_ERROR("%s currently supports SDXL/SD1 UNet models only", name);
+        return false;
+    }
+    if (sd_img_gen_params->init_image.data != nullptr ||
+        sd_img_gen_params->mask_image.data != nullptr ||
+        sd_img_gen_params->control_image.data != nullptr ||
+        sd_img_gen_params->ref_images_count > 0 ||
+        request.use_img_cond) {
+        LOG_ERROR("%s supports text-only SDXL/SD1 Euler sampling with an optional GPU init latent; init-image/mask/control/ref/image-CFG inputs are not supported", name);
+        return false;
+    }
+    if (use_conditioning_handles && !conditioning_handle_sampler_supports_request(sd_ctx, sd_img_gen_params, nullptr, request)) {
+        return false;
+    }
+
+    sd_ctx->sd->rng->manual_seed(request.seed);
+    sd_ctx->sd->sampler_rng->manual_seed(request.seed);
+    sd_ctx->sd->set_flow_shift(sd_img_gen_params->sample_params.flow_shift);
+    sd_ctx->sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count);
+
+    ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
+
+    SamplePlan plan(sd_ctx, sd_img_gen_params, request);
+    if (plan.sample_method != EULER_SAMPLE_METHOD) {
+        LOG_ERROR("%s only supports Euler sampling", name);
+        return false;
+    }
+    if (sd_ctx->sd->is_flow_denoiser()) {
+        LOG_ERROR("%s does not support flow denoisers yet", name);
+        return false;
+    }
+
+    auto init_resource = has_gpu_init ? sd_gpu_resource_lookup(sd_ctx, init_gpu_latent) : nullptr;
+    uint32_t init_flags = 0;
+    if (has_gpu_init) {
+        if (init_resource == nullptr ||
+            !sd_gpu_latent_matches_request(sd_ctx, *init_resource, request, name)) {
+            return false;
+        }
+        init_flags = init_resource->flags;
+        apply_latent_strength_to_plan(request, &plan);
+    }
+
+    int64_t latent_prepare_start = ggml_time_ms();
+    auto latents_opt = prepare_image_generation_latents(sd_ctx,
+                                                        sd_img_gen_params,
+                                                        &request,
+                                                        &plan);
+    if (!latents_opt.has_value()) {
+        return false;
+    }
+    ImageGenerationLatents latents = std::move(*latents_opt);
+    int64_t latent_prepare_end = ggml_time_ms();
+
+    int64_t condition_start = ggml_time_ms();
+    std::optional<ImageGenerationEmbeds> embeds_opt;
+    if (use_conditioning_handles) {
+        embeds_opt = prepare_image_generation_embeds_from_conditioning_handles(sd_ctx,
+                                                                               &request,
+                                                                               &latents,
+                                                                               positive,
+                                                                               negative);
+    } else {
+        embeds_opt = prepare_image_generation_embeds(sd_ctx,
+                                                     sd_img_gen_params,
+                                                     &request,
+                                                     &plan,
+                                                     &latents);
+    }
+    if (!embeds_opt.has_value()) {
+        return false;
+    }
+    ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+    int64_t condition_end = ggml_time_ms();
+
+    int64_t init_start = ggml_time_ms();
+    LatentBackendGraphRunner latent_runner(sd_ctx->sd->backend);
+    std::vector<int64_t> latent_shape;
+    std::unique_ptr<GgmlBackendTensorResource> x_resource;
+    if (has_gpu_init) {
+        ggml_tensor* tensor = init_resource->tensor->tensor;
+        latent_shape = {tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]};
+        auto init_copy = sd_copy_gpu_resource_to_backend(sd_ctx,
+                                                         init_resource->tensor.get(),
+                                                         sd_ctx->sd->backend,
+                                                         "gpu_euler_init_latent_d2d");
+        if (init_copy == nullptr || init_copy->empty()) {
+            LOG_ERROR("%s failed to copy GPU init latent into sampler backend", name);
+            return false;
+        }
+        auto noise_resource = sd_create_backend_philox_noise_resource(sd_ctx,
+                                                                      latent_shape,
+                                                                      request.seed,
+                                                                      0,
+                                                                      "gpu_euler_init_noise_philox");
+        if (noise_resource == nullptr || noise_resource->empty()) {
+            LOG_ERROR("%s refused CPU noise fallback; CUDA Philox noise resource could not be created", name);
+            return false;
+        }
+        x_resource = latent_runner.add_scaled(*init_copy,
+                                              *noise_resource,
+                                              plan.sigmas[0],
+                                              sd_ctx->sd->n_threads,
+                                              "gpu_euler_init_latent_plus_noise");
+    } else {
+        latent_shape = latents.init_latent.shape();
+        auto noise_resource = sd_create_backend_philox_noise_resource(sd_ctx,
+                                                                      latent_shape,
+                                                                      request.seed,
+                                                                      0,
+                                                                      "gpu_euler_initial_philox_noise");
+        if (noise_resource == nullptr || noise_resource->empty()) {
+            LOG_ERROR("%s refused CPU noise fallback; CUDA Philox noise resource could not be created", name);
+            return false;
+        }
+        x_resource = latent_runner.scale(*noise_resource,
+                                         plan.sigmas[0],
+                                         sd_ctx->sd->n_threads,
+                                         "gpu_euler_initial_latent_device_philox");
+    }
+    int64_t init_end = ggml_time_ms();
+    if (x_resource == nullptr || x_resource->empty()) {
+        LOG_ERROR("%s failed to create backend sampler initial latent", name);
+        return false;
+    }
+
+    int64_t sampling_start = ggml_time_ms();
+    auto resource = sd_ctx->sd->sample_euler_gpu_backend(sd_ctx->sd->diffusion_model,
+                                                         std::move(x_resource),
+                                                         embeds.cond,
+                                                         embeds.uncond,
+                                                         request.guidance,
+                                                         request.shifted_timestep,
+                                                         plan.sigmas);
+    int64_t sampling_end = ggml_time_ms();
+    if (sd_ctx->sd->free_params_immediately) {
+        sd_ctx->sd->diffusion_model->free_params_buffer();
+    }
+    if (resource == nullptr || resource->empty()) {
+        LOG_ERROR("%s failed after %.2fs", name, (sampling_end - sampling_start) * 1.0f / 1000);
+        return false;
+    }
+
+    uint32_t output_flags = SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT;
+    if ((init_flags & (SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT |
+                       SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE)) != 0) {
+        output_flags |= SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE;
+    }
+    sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
+                                                      std::move(resource),
+                                                      SD_GPU_RESOURCE_LATENT,
+                                                      SD_LAYOUT_WHCN_GGML,
+                                                      output_flags,
+                                                      has_gpu_init ? "sampler_latent_gpu_euler_true_init" : "sampler_latent_gpu_euler_true_t2i");
+    if (handle == 0) {
+        LOG_ERROR("%s failed to register GPU sampler latent handle", name);
+        return false;
+    }
+    *out_gpu_latent = handle;
+    int64_t t1 = ggml_time_ms();
+    LOG_INFO("[Timing] %s latent_prepare_ms=%" PRId64 " %s_ms=%" PRId64 " init_backend_ms=%" PRId64 " denoise_ms=%" PRId64 " total_ms=%" PRId64 " sampler_math_residency=gpu_backend_tensor init_latent=%s init_bridge_download=false output_bridge_upload=false condition_input=%s",
+             name,
+             latent_prepare_end - latent_prepare_start,
+             use_conditioning_handles ? "condition_bind" : "prompt_encode",
+             condition_end - condition_start,
+             init_end - init_start,
+             sampling_end - sampling_start,
+             t1 - t0,
+             has_gpu_init ? "gpu_handle" : "none",
+             use_conditioning_handles ? "handle" : "prompt");
+    LOG_INFO("%s completed handle=%" PRIu64 " bridge_upload=false init_bridge_download=false strict_gpu_resident=%s flags=%u",
+             name,
+             handle,
+             sd_strict_gpu_resident_enabled() ? "true" : "false",
+             output_flags);
     return true;
 }
 
@@ -6325,7 +6668,14 @@ SD_API bool sd_sample_latent_gpu(sd_ctx_t* sd_ctx,
     }
     if (init_latent == nullptr &&
         StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER")) {
-        return sd_sample_latent_gpu_euler_backend_bridge(sd_ctx, sd_img_gen_params, out_gpu_latent);
+        return sd_sample_latent_gpu_euler_backend_true(sd_ctx,
+                                                       sd_img_gen_params,
+                                                       0,
+                                                       false,
+                                                       0,
+                                                       0,
+                                                       "sd_sample_latent_gpu",
+                                                       out_gpu_latent);
     }
     if (sd_strict_gpu_resident_enabled()) {
         LOG_ERROR("sd_sample_latent_gpu strict mode refused CPU-backed sampler bridge; sampler math still materializes sd::Tensor<float>");
@@ -6466,6 +6816,22 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
     if (init_gpu_latent == 0) {
         return sd_sample_latent_gpu(sd_ctx, sd_img_gen_params, nullptr, out_gpu_latent);
     }
+    if (StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER")) {
+        if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
+                                                    sd_img_gen_params,
+                                                    init_gpu_latent,
+                                                    false,
+                                                    0,
+                                                    0,
+                                                    "sd_sample_latent_gpu_with_init_gpu",
+                                                    out_gpu_latent)) {
+            return true;
+        }
+        if (sd_strict_gpu_resident_enabled()) {
+            LOG_ERROR("sd_sample_latent_gpu_with_init_gpu strict mode refused fallback after true GPU init-latent Euler path failed");
+            return false;
+        }
+    }
     if (sd_strict_gpu_resident_enabled()) {
         LOG_ERROR("sd_sample_latent_gpu_with_init_gpu strict mode refused bridge path; sampler init latent is downloaded before existing CPU-backed sampler math");
         return false;
@@ -6527,6 +6893,22 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning(sd_ctx_t* sd_ctx
                                                       positive,
                                                       negative,
                                                       out_gpu_latent);
+    }
+    if (StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER")) {
+        if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
+                                                    sd_img_gen_params,
+                                                    init_gpu_latent,
+                                                    true,
+                                                    positive,
+                                                    negative,
+                                                    "sd_sample_latent_gpu_with_init_gpu_and_conditioning",
+                                                    out_gpu_latent)) {
+            return true;
+        }
+        if (sd_strict_gpu_resident_enabled()) {
+            LOG_ERROR("sd_sample_latent_gpu_with_init_gpu_and_conditioning strict mode refused fallback after true GPU init-latent conditioning Euler path failed");
+            return false;
+        }
     }
     if (sd_strict_gpu_resident_enabled()) {
         LOG_ERROR("sd_sample_latent_gpu_with_init_gpu_and_conditioning strict mode refused bridge path; init latent is downloaded before CPU-backed sampler math and sampled latent is bridge-uploaded");
@@ -6800,7 +7182,15 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_cuda_gpu_handles = sd_ctx == nullptr || sd_ctx->sd == nullptr || !ggml_backend_is_cpu(sd_ctx->sd->backend);
     capabilities->supports_gpu_latent_output = true;
     capabilities->supports_gpu_latent_input = true;
-    capabilities->supports_sampler_gpu_latent_output = false;
+    const bool supports_true_gpu_euler_sampler =
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER") &&
+        (sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version)) &&
+        !sd_ctx->sd->is_flow_denoiser() &&
+        sd_ctx->sd->backend != nullptr &&
+        !ggml_backend_is_cpu(sd_ctx->sd->backend);
+    capabilities->supports_sampler_gpu_latent_output = supports_true_gpu_euler_sampler;
     capabilities->supports_sampler_gpu_latent_bridge_output = true;
     capabilities->supports_vae_gpu_latent_input = true;
     const bool true_vae_encode_gpu =
@@ -6820,7 +7210,7 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_cuda_pointer_borrow = true;
     capabilities->supports_cuda_ipc_export = false;
     capabilities->supports_external_memory_interop = false;
-    capabilities->supports_sampler_gpu_init_latent_input = false;
+    capabilities->supports_sampler_gpu_init_latent_input = supports_true_gpu_euler_sampler;
     capabilities->supports_sampler_gpu_init_latent_bridge_input = true;
     return true;
 }
@@ -6976,6 +7366,12 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
     capabilities->supports_comfy_reference_vae_encode =
         capabilities->supports_edit_reference_conditioning &&
         should_use_normal_vae_for_generation_encode(sd_ctx);
+    capabilities->strict_gpu_sample_is_true_resident =
+        StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER") &&
+        (sd_version_is_sd1(version) || sd_version_is_sdxl(version)) &&
+        !sd_ctx->sd->is_flow_denoiser() &&
+        sd_ctx->sd->backend != nullptr &&
+        !ggml_backend_is_cpu(sd_ctx->sd->backend);
 
     if (sd_version_is_dit(version)) {
         capabilities->default_cfg_scale = 1.0f;

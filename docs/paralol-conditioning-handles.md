@@ -29,8 +29,9 @@ The sampler handle path is intentionally narrow:
 - Batch size 1.
 - No init image, masks, ControlNet, reference image, edit mode, LoRA list, or
   image CFG.
-- KSampler output is still the existing sampled-latent bridge upload unless the
-  separate true GPU sampler path is used.
+- KSampler output is still a sampled-latent bridge upload unless
+  `SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1` selects the true SD1/SDXL Euler
+  backend sampler path.
 
 Unsupported requests fail clearly instead of falling back to prompt strings.
 
@@ -50,16 +51,17 @@ The handle-based sampler entrypoint bypasses CLIP prompt encoding and reports
 resources.
 
 For I2I, `sd_sample_latent_gpu_with_init_gpu_and_conditioning` combines the
-resident conditioning handles with the current non-strict GPU init-latent
-bridge. The function validates the GPU latent descriptor, downloads the init
-latent to the existing CPU sampler path, samples with cached conditioning, then
-uploads the sampled latent back to a GPU handle. It reports
-`init_bridge_download=true`, `output_bridge_upload=true`, and
-`prompt_encode_ms=0`.
+resident conditioning handles with a GPU init latent. With
+`SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1` on supported SD1/SDXL Euler requests,
+the function validates the CUDA latent descriptor, copies the latent
+device-to-device into the sampler backend, runs sampler math as backend tensors,
+and returns a sampled CUDA latent without CPU bridge flags. It reports
+`init_bridge_download=false`, `output_bridge_upload=false`, and
+`condition_input=handle`.
 
-`SDCPP_STRICT_GPU_RESIDENT=1` still refuses this I2I path because sampler math
-is not yet fully backend-resident. This is expected and keeps the capability
-contract honest.
+Without the experimental Euler path, the function falls back to the old
+non-strict bridge: init latent download, CPU-backed sampler math, and sampled
+latent upload. `SDCPP_STRICT_GPU_RESIDENT=1` refuses that bridge fallback.
 
 ## Lifetime
 
@@ -105,8 +107,10 @@ Recommended I2I integration:
 5. Latent Decode consumes the sampled GPU latent through
    `sd_decode_gpu_latent_normal_gpu`.
 
-This gives I2I the same CLIP-cache behavior as T2I while retaining the existing
-bridge labels for sampler init-latent and sampled-latent movement.
+This gives I2I the same CLIP-cache behavior as T2I. When the experimental
+Euler sampler is enabled, sampler init-latent and sampled-latent movement are
+true GPU-resident for the supported SD1/SDXL Euler lane. Otherwise Paralol must
+keep the old bridge labels.
 
 ## Smoke
 
@@ -164,7 +168,14 @@ Expected I2I markers:
 
 - `gpu_encoded_latent_desc ... kind=3 ... shape_nchw=1x4x128x128`
 - `calling sd_sample_latent_gpu_with_init_gpu_and_conditioning`
-- `sd_sample_latent_with_conditioning ... prompt_encode_ms=0 ... init_latent=true`
-- `sd_sample_latent_gpu_with_init_gpu_and_conditioning ... init_bridge_download=true output_bridge_upload=true`
+- `sd_sample_latent_gpu_with_init_gpu_and_conditioning ... condition_input=handle`
+- `sd_sample_latent_gpu_with_init_gpu_and_conditioning ... init_bridge_download=false output_bridge_upload=false`
 - GPU sampled latent descriptor `1x4x128x128`
 - GPU image descriptor `1x3x1024x1024`
+
+For strict true-GPU I2I, set both:
+
+```powershell
+$env:SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER = "1"
+$env:SDCPP_STRICT_GPU_RESIDENT = "1"
+```
