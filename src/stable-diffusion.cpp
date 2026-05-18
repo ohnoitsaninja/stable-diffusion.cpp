@@ -4412,13 +4412,12 @@ static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
         LOG_ERROR("conditioning handle sampler does not support inpaint/edit/flow model conditioning yet");
         return false;
     }
-    if (init_latent != nullptr ||
-        sd_img_gen_params->init_image.data != nullptr ||
+    if (sd_img_gen_params->init_image.data != nullptr ||
         sd_img_gen_params->mask_image.data != nullptr ||
         sd_img_gen_params->control_image.data != nullptr ||
         sd_img_gen_params->ref_images_count > 0 ||
         request.use_img_cond) {
-        LOG_ERROR("conditioning handle sampler currently supports text-only T2I; init/mask/control/ref/image-CFG inputs are not supported");
+        LOG_ERROR("conditioning handle sampler currently supports text conditioning with optional pre-encoded init latent only; init-image/mask/control/ref/image-CFG inputs are not supported");
         return false;
     }
     if (sd_img_gen_params->lora_count != 0) {
@@ -5920,6 +5919,19 @@ static sd_latent_t* sd_sample_latent_with_conditioning_internal(sd_ctx_t* sd_ctx
     ImageGenerationLatents latents = std::move(*latents_opt);
     int64_t latent_prepare_end = ggml_time_ms();
 
+    const sd::Tensor<float>* init_tensor = sd_latent_tensor(init_latent);
+    if (init_latent != nullptr && init_tensor == nullptr) {
+        LOG_ERROR("sd_sample_latent_with_conditioning received an invalid init latent");
+        return nullptr;
+    }
+    if (init_tensor != nullptr) {
+        if (!validate_init_latent_shape(sd_ctx, request, *init_tensor)) {
+            return nullptr;
+        }
+        latents.init_latent = *init_tensor;
+        apply_latent_strength_to_plan(request, &plan);
+    }
+
     int64_t condition_bind_start = ggml_time_ms();
     auto embeds_opt = prepare_image_generation_embeds_from_conditioning_handles(sd_ctx,
                                                                                 &request,
@@ -5977,11 +5989,12 @@ static sd_latent_t* sd_sample_latent_with_conditioning_internal(sd_ctx_t* sd_ctx
     sd_ctx->sd->lora_stat();
 
     int64_t t1 = ggml_time_ms();
-    LOG_INFO("[Timing] sd_sample_latent_with_conditioning latent_prepare_ms=%" PRId64 " condition_bind_ms=%" PRId64 " prompt_encode_ms=0 denoise_ms=%" PRId64 " total_ms=%" PRId64 " condition_input=handle conditioning_storage=host_tensor sampler_math_residency=cpu_tensor",
+    LOG_INFO("[Timing] sd_sample_latent_with_conditioning latent_prepare_ms=%" PRId64 " condition_bind_ms=%" PRId64 " prompt_encode_ms=0 denoise_ms=%" PRId64 " total_ms=%" PRId64 " init_latent=%s condition_input=handle conditioning_storage=host_tensor sampler_math_residency=cpu_tensor",
              latent_prepare_end - latent_prepare_start,
              condition_bind_end - condition_bind_start,
              sampling_end - sampling_start,
-             t1 - t0);
+             t1 - t0,
+             init_tensor != nullptr ? "true" : "false");
     LOG_INFO("sd_sample_latent_with_conditioning completed in %.2fs", (t1 - t0) * 1.0f / 1000);
     return make_sd_latent(std::move(final_latent), sd_latent_source_t::sampler);
 }
@@ -6352,6 +6365,94 @@ SD_API bool sd_sample_latent_gpu(sd_ctx_t* sd_ctx,
     return true;
 }
 
+static sd_latent_t* sd_bridge_download_sampler_init_latent(sd_ctx_t* sd_ctx,
+                                                           const sd_img_gen_params_t* sd_img_gen_params,
+                                                           sd_gpu_handle_t init_gpu_latent,
+                                                           const char* api_name,
+                                                           uint32_t* out_input_flags,
+                                                           int64_t* out_download_ms) {
+    if (out_input_flags != nullptr) {
+        *out_input_flags = 0;
+    }
+    if (out_download_ms != nullptr) {
+        *out_download_ms = 0;
+    }
+    const char* name = api_name != nullptr ? api_name : "sampler init latent bridge";
+    auto resource = sd_gpu_resource_lookup(sd_ctx, init_gpu_latent);
+    if (resource == nullptr || resource->kind != SD_GPU_RESOURCE_LATENT ||
+        resource->tensor == nullptr || resource->tensor->empty()) {
+        LOG_ERROR("%s requires a valid GPU latent handle", name);
+        return nullptr;
+    }
+    if (!sd_gpu_resource_is_cuda(*resource)) {
+        LOG_ERROR("%s requires a CUDA latent handle", name);
+        return nullptr;
+    }
+
+    GenerationRequest request(sd_ctx, sd_img_gen_params);
+    const uint32_t expected_channels = expected_diffusion_latent_channels(sd_ctx->sd->version);
+    ggml_tensor* tensor = resource->tensor->tensor;
+    if (tensor == nullptr || tensor->type != GGML_TYPE_F32 ||
+        tensor->ne[2] != expected_channels || tensor->ne[3] != 1) {
+        LOG_ERROR("%s unsupported init latent descriptor: dtype=%d shape_nchw=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " expected_channels=%u",
+                  name,
+                  tensor != nullptr ? static_cast<int>(tensor->type) : -1,
+                  tensor != nullptr ? tensor->ne[3] : 0,
+                  tensor != nullptr ? tensor->ne[2] : 0,
+                  tensor != nullptr ? tensor->ne[1] : 0,
+                  tensor != nullptr ? tensor->ne[0] : 0,
+                  expected_channels);
+        return nullptr;
+    }
+    if (request.vae_scale_factor <= 0 ||
+        request.width % request.vae_scale_factor != 0 ||
+        request.height % request.vae_scale_factor != 0) {
+        LOG_ERROR("%s invalid request dimensions %dx%d for VAE scale factor %d",
+                  name,
+                  request.width,
+                  request.height,
+                  request.vae_scale_factor);
+        return nullptr;
+    }
+    const int64_t expected_w = request.width / request.vae_scale_factor;
+    const int64_t expected_h = request.height / request.vae_scale_factor;
+    if (tensor->ne[0] != expected_w || tensor->ne[1] != expected_h) {
+        LOG_ERROR("%s init latent shape does not match request before bridge download: expected shape_nchw=1x%ux%" PRId64 "x%" PRId64 " got shape_nchw=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
+                  name,
+                  expected_channels,
+                  expected_h,
+                  expected_w,
+                  tensor->ne[3],
+                  tensor->ne[2],
+                  tensor->ne[1],
+                  tensor->ne[0]);
+        return nullptr;
+    }
+
+    int64_t t0 = ggml_time_ms();
+    sd_latent_t* init_latent = sd_gpu_latent_download(sd_ctx, init_gpu_latent, nullptr);
+    int64_t download_end = ggml_time_ms();
+    if (out_download_ms != nullptr) {
+        *out_download_ms = download_end - t0;
+    }
+    if (init_latent == nullptr) {
+        LOG_ERROR("%s failed to bridge-download init latent handle=%" PRIu64, name, init_gpu_latent);
+        return nullptr;
+    }
+    if (out_input_flags != nullptr) {
+        *out_input_flags = resource->flags;
+    }
+
+    LOG_INFO("%s using bridge-downloaded init latent handle=%" PRIu64 " bytes=%" PRIu64 " shape_nchw=1x%ux%" PRId64 "x%" PRId64,
+             name,
+             init_gpu_latent,
+             static_cast<uint64_t>(ggml_nbytes(tensor)),
+             expected_channels,
+             expected_h,
+             expected_w);
+    return init_latent;
+}
+
 SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
                                                const sd_img_gen_params_t* sd_img_gen_params,
                                                sd_gpu_handle_t init_gpu_latent,
@@ -6370,68 +6471,20 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
         return false;
     }
 
-    auto resource = sd_gpu_resource_lookup(sd_ctx, init_gpu_latent);
-    if (resource == nullptr || resource->kind != SD_GPU_RESOURCE_LATENT ||
-        resource->tensor == nullptr || resource->tensor->empty()) {
-        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu requires a valid GPU latent handle");
-        return false;
-    }
-    if (!sd_gpu_resource_is_cuda(*resource)) {
-        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu requires a CUDA latent handle");
-        return false;
-    }
-
-    GenerationRequest request(sd_ctx, sd_img_gen_params);
-    const uint32_t expected_channels = expected_diffusion_latent_channels(sd_ctx->sd->version);
-    ggml_tensor* tensor = resource->tensor->tensor;
-    if (tensor == nullptr || tensor->type != GGML_TYPE_F32 ||
-        tensor->ne[2] != expected_channels || tensor->ne[3] != 1) {
-        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu unsupported init latent descriptor: dtype=%d shape_nchw=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " expected_channels=%u",
-                  tensor != nullptr ? static_cast<int>(tensor->type) : -1,
-                  tensor != nullptr ? tensor->ne[3] : 0,
-                  tensor != nullptr ? tensor->ne[2] : 0,
-                  tensor != nullptr ? tensor->ne[1] : 0,
-                  tensor != nullptr ? tensor->ne[0] : 0,
-                  expected_channels);
-        return false;
-    }
-    if (request.vae_scale_factor <= 0 ||
-        request.width % request.vae_scale_factor != 0 ||
-        request.height % request.vae_scale_factor != 0) {
-        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu invalid request dimensions %dx%d for VAE scale factor %d",
-                  request.width,
-                  request.height,
-                  request.vae_scale_factor);
-        return false;
-    }
-    const int64_t expected_w = request.width / request.vae_scale_factor;
-    const int64_t expected_h = request.height / request.vae_scale_factor;
-    if (tensor->ne[0] != expected_w || tensor->ne[1] != expected_h) {
-        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu init latent shape does not match request before bridge download: expected shape_nchw=1x%ux%" PRId64 "x%" PRId64 " got shape_nchw=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
-                  expected_channels,
-                  expected_h,
-                  expected_w,
-                  tensor->ne[3],
-                  tensor->ne[2],
-                  tensor->ne[1],
-                  tensor->ne[0]);
-        return false;
-    }
-
     int64_t t0 = ggml_time_ms();
-    sd_latent_t* init_latent = sd_gpu_latent_download(sd_ctx, init_gpu_latent, nullptr);
-    int64_t download_end = ggml_time_ms();
+    uint32_t input_flags = 0;
+    int64_t download_ms = 0;
+    sd_latent_t* init_latent = sd_bridge_download_sampler_init_latent(sd_ctx,
+                                                                      sd_img_gen_params,
+                                                                      init_gpu_latent,
+                                                                      "sd_sample_latent_gpu_with_init_gpu",
+                                                                      &input_flags,
+                                                                      &download_ms);
+    int64_t download_end = t0 + download_ms;
     if (init_latent == nullptr) {
-        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu failed to bridge-download init latent handle=%" PRIu64, init_gpu_latent);
         return false;
     }
 
-    LOG_INFO("sd_sample_latent_gpu_with_init_gpu using bridge-downloaded init latent handle=%" PRIu64 " bytes=%" PRIu64 " shape_nchw=1x%ux%" PRId64 "x%" PRId64,
-             init_gpu_latent,
-             static_cast<uint64_t>(ggml_nbytes(tensor)),
-             expected_channels,
-             expected_h,
-             expected_w);
     bool ok = sd_sample_latent_gpu(sd_ctx, sd_img_gen_params, init_latent, out_gpu_latent);
     int64_t sample_end = ggml_time_ms();
     free_sd_latent(init_latent);
@@ -6439,8 +6492,8 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
         auto output_resource = sd_gpu_resource_lookup(sd_ctx, *out_gpu_latent);
         if (output_resource != nullptr) {
             output_resource->flags |= SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_DOWNLOAD;
-            if ((resource->flags & (SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT |
-                                    SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE)) != 0) {
+            if ((input_flags & (SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT |
+                                SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE)) != 0) {
                 output_resource->flags |= SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE;
             }
         }
@@ -6449,6 +6502,73 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
                  sample_end - download_end,
                  sample_end - t0);
         LOG_INFO("sd_sample_latent_gpu_with_init_gpu completed input_handle=%" PRIu64 " output_handle=%" PRIu64 " init_bridge_download=true output_bridge_upload=true output_flags_include_cpu_bridge_download=true",
+                 init_gpu_latent,
+                 *out_gpu_latent);
+    }
+    return ok;
+}
+
+SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning(sd_ctx_t* sd_ctx,
+                                                               const sd_img_gen_params_t* sd_img_gen_params,
+                                                               sd_gpu_handle_t init_gpu_latent,
+                                                               sd_conditioning_handle_t positive,
+                                                               sd_conditioning_handle_t negative,
+                                                               sd_gpu_handle_t* out_gpu_latent) {
+    if (out_gpu_latent != nullptr) {
+        *out_gpu_latent = 0;
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr || out_gpu_latent == nullptr) {
+        return false;
+    }
+    if (init_gpu_latent == 0) {
+        return sd_sample_latent_gpu_with_conditioning(sd_ctx,
+                                                      sd_img_gen_params,
+                                                      nullptr,
+                                                      positive,
+                                                      negative,
+                                                      out_gpu_latent);
+    }
+    if (sd_strict_gpu_resident_enabled()) {
+        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu_and_conditioning strict mode refused bridge path; init latent is downloaded before CPU-backed sampler math and sampled latent is bridge-uploaded");
+        return false;
+    }
+
+    int64_t t0 = ggml_time_ms();
+    uint32_t input_flags = 0;
+    int64_t download_ms = 0;
+    sd_latent_t* init_latent = sd_bridge_download_sampler_init_latent(sd_ctx,
+                                                                      sd_img_gen_params,
+                                                                      init_gpu_latent,
+                                                                      "sd_sample_latent_gpu_with_init_gpu_and_conditioning",
+                                                                      &input_flags,
+                                                                      &download_ms);
+    int64_t download_end = t0 + download_ms;
+    if (init_latent == nullptr) {
+        return false;
+    }
+
+    bool ok = sd_sample_latent_gpu_with_conditioning(sd_ctx,
+                                                     sd_img_gen_params,
+                                                     init_latent,
+                                                     positive,
+                                                     negative,
+                                                     out_gpu_latent);
+    int64_t sample_end = ggml_time_ms();
+    free_sd_latent(init_latent);
+    if (ok) {
+        auto output_resource = sd_gpu_resource_lookup(sd_ctx, *out_gpu_latent);
+        if (output_resource != nullptr) {
+            output_resource->flags |= SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_DOWNLOAD;
+            if ((input_flags & (SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT |
+                                SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE)) != 0) {
+                output_resource->flags |= SD_GPU_RESOURCE_FLAG_REQUIRES_ISOLATED_VAE_DECODE;
+            }
+        }
+        LOG_INFO("[Timing] sd_sample_latent_gpu_with_init_gpu_and_conditioning init_bridge_download_ms=%" PRId64 " sample_conditioning_bridge_ms=%" PRId64 " total_ms=%" PRId64 " prompt_encode_ms=0 init_bridge_download=true output_bridge_upload=true condition_input=handle",
+                 download_end - t0,
+                 sample_end - download_end,
+                 sample_end - t0);
+        LOG_INFO("sd_sample_latent_gpu_with_init_gpu_and_conditioning completed input_handle=%" PRIu64 " output_handle=%" PRIu64 " init_bridge_download=true output_bridge_upload=true output_flags_include_cpu_bridge_download=true condition_input=handle",
                  init_gpu_latent,
                  *out_gpu_latent);
     }
@@ -6721,6 +6841,8 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
     capabilities->supports_conditioning_handle_reuse =
         sd_ctx == nullptr || sd_ctx->sd == nullptr || !sd_ctx->sd->free_params_immediately;
     capabilities->supports_conditioning_cpu_resident = true;
+    capabilities->supports_sampler_conditioning_init_latent_input = capabilities->supports_sampler_conditioning_handle_input;
+    capabilities->supports_sampler_conditioning_gpu_init_latent_bridge_input = capabilities->supports_sampler_conditioning_handle_input;
     return true;
 }
 

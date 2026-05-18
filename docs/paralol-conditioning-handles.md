@@ -14,17 +14,20 @@ descriptor that KSampler re-encodes every run.
 - `sd_conditioning_get_desc`
 - `sd_conditioning_debug_name`
 - `sd_sample_latent_gpu_with_conditioning`
+- `sd_sample_latent_gpu_with_init_gpu_and_conditioning`
 
 The handle type is `sd_conditioning_handle_t`. Handles are scoped to the
 `sd_ctx_t` that created them and must not be used with another context.
 
 ## Supported Scope
 
-The initial sampler handle path is intentionally narrow:
+The sampler handle path is intentionally narrow:
 
 - SD1.x and SDXL text-to-image.
+- SD1.x and SDXL image-to-image when the init latent is already encoded and
+  passed as an `SD_GPU_RESOURCE_LATENT` handle.
 - Batch size 1.
-- No init latent, masks, ControlNet, reference image, edit mode, LoRA list, or
+- No init image, masks, ControlNet, reference image, edit mode, LoRA list, or
   image CFG.
 - KSampler output is still the existing sampled-latent bridge upload unless the
   separate true GPU sampler path is used.
@@ -45,6 +48,18 @@ Capabilities therefore report:
 The handle-based sampler entrypoint bypasses CLIP prompt encoding and reports
 `prompt_encode_ms=0`, but it does not yet make conditioning tensors true CUDA
 resources.
+
+For I2I, `sd_sample_latent_gpu_with_init_gpu_and_conditioning` combines the
+resident conditioning handles with the current non-strict GPU init-latent
+bridge. The function validates the GPU latent descriptor, downloads the init
+latent to the existing CPU sampler path, samples with cached conditioning, then
+uploads the sampled latent back to a GPU handle. It reports
+`init_bridge_download=true`, `output_bridge_upload=true`, and
+`prompt_encode_ms=0`.
+
+`SDCPP_STRICT_GPU_RESIDENT=1` still refuses this I2I path because sampler math
+is not yet fully backend-resident. This is expected and keeps the capability
+contract honest.
 
 ## Lifetime
 
@@ -68,7 +83,7 @@ For SDXL empty negative prompts, encode the negative conditioning with
 
 ## Paralol Dataflow
 
-Recommended first integration:
+Recommended T2I integration:
 
 1. `sd.native.clip_text_encode` calls `sd_conditioning_encode_text`.
 2. The node outputs an opaque conditioning handle value plus descriptor.
@@ -79,6 +94,19 @@ Recommended first integration:
 This removes prompt encoding from KSampler timing for supported SD1.x/SDXL T2I
 workflows while keeping capability flags honest about the remaining CPU-backed
 conditioning storage.
+
+Recommended I2I integration:
+
+1. `sd.native.clip_text_encode` calls `sd_conditioning_encode_text`.
+2. VAE Encode produces a GPU latent handle.
+3. `sd.native.ksampler` receives positive/negative handles plus the init latent
+   handle.
+4. KSampler calls `sd_sample_latent_gpu_with_init_gpu_and_conditioning`.
+5. Latent Decode consumes the sampled GPU latent through
+   `sd_decode_gpu_latent_normal_gpu`.
+
+This gives I2I the same CLIP-cache behavior as T2I while retaining the existing
+bridge labels for sampler init-latent and sampled-latent movement.
 
 ## Smoke
 
@@ -108,4 +136,35 @@ Expected markers:
 - `sd_sample_latent_with_conditioning ... prompt_encode_ms=0`
 - `conditioning_handle_reuse=true`
 - GPU latent descriptor `1x4x128x128`
+- GPU image descriptor `1x3x1024x1024`
+
+For the I2I combined path, add `--gpu-encode-output --gpu-init-sample-input`
+and use `--condition-handles` instead of `--condition-handles-reuse`:
+
+```powershell
+build\codex\bin\sd-latent-smoke.exe `
+  --model <sdxl-checkpoint> `
+  --image <rgba-image> `
+  --prompt "a clean studio product shot of a blue glass bottle on a white background" `
+  --negative-prompt "blurry, low quality, noisy" `
+  --width 1024 --height 1024 `
+  --steps 8 --cfg-scale 1.2 `
+  --sampling-method euler `
+  --type-f16 `
+  --gpu-encode-output `
+  --gpu-init-sample-input `
+  --condition-handles `
+  --gpu-latent-decode-input `
+  --gpu-decode-output `
+  --download-gpu-output-buffer `
+  --dump-gpu-handle-desc
+```
+
+Expected I2I markers:
+
+- `gpu_encoded_latent_desc ... kind=3 ... shape_nchw=1x4x128x128`
+- `calling sd_sample_latent_gpu_with_init_gpu_and_conditioning`
+- `sd_sample_latent_with_conditioning ... prompt_encode_ms=0 ... init_latent=true`
+- `sd_sample_latent_gpu_with_init_gpu_and_conditioning ... init_bridge_download=true output_bridge_upload=true`
+- GPU sampled latent descriptor `1x4x128x128`
 - GPU image descriptor `1x3x1024x1024`

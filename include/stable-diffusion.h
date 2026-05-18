@@ -498,6 +498,8 @@ typedef struct sd_conditioning_capabilities_t {
     bool supports_sampler_conditioning_handle_input;
     bool supports_conditioning_handle_reuse;
     bool supports_conditioning_cpu_resident;
+    bool supports_sampler_conditioning_init_latent_input;
+    bool supports_sampler_conditioning_gpu_init_latent_bridge_input;
     uint32_t reserved[16];
 } sd_conditioning_capabilities_t;
 
@@ -786,6 +788,12 @@ SD_API bool sd_sample_latent_gpu_with_conditioning(sd_ctx_t* sd_ctx,
                                                    sd_conditioning_handle_t positive,
                                                    sd_conditioning_handle_t negative,
                                                    sd_gpu_handle_t* out_gpu_latent);
+SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning(sd_ctx_t* sd_ctx,
+                                                               const sd_img_gen_params_t* sd_img_gen_params,
+                                                               sd_gpu_handle_t init_gpu_latent,
+                                                               sd_conditioning_handle_t positive,
+                                                               sd_conditioning_handle_t negative,
+                                                               sd_gpu_handle_t* out_gpu_latent);
 // Experimental SDXL/SD1 Euler proof path. Requires SDCPP_EXPERIMENTAL_TRUE_GPU_SAMPLER=1.
 // This is not production sampling: initial noise is device-procedural rather than seed-compatible Philox.
 SD_API bool sd_sample_latent_gpu_true_euler_spike(sd_ctx_t* sd_ctx,
