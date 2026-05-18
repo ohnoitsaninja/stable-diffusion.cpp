@@ -50,7 +50,15 @@ if ($dirty -and -not $Force) {
 }
 
 Write-Host "Resetting ggml to upstream base $ExpectedBase"
-& git -C $GgmlDir am --abort 2>$null
+$amAbortCmd = 'git -C "{0}" am --abort 2>&1' -f $GgmlDir
+$amAbortOutput = (& cmd.exe /d /c $amAbortCmd)
+$amAbortExit = $LASTEXITCODE
+if ($amAbortExit -ne 0 -and $amAbortOutput) {
+    $amAbortText = ($amAbortOutput | Out-String).Trim()
+    if ($amAbortText -and $amAbortText -notmatch "No am session|no am session") {
+        Write-Host "Ignoring git am --abort result: $amAbortText"
+    }
+}
 Invoke-Git -Args @("-C", $GgmlDir, "reset", "--hard", $ExpectedBase)
 Invoke-Git -Args @("-C", $GgmlDir, "clean", "-fd")
 
