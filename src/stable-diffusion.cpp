@@ -256,6 +256,37 @@ static bool trace_euler_parity_step_enabled(int step, int steps) {
     return false;
 }
 
+static std::vector<std::string> trace_euler_unet_boundary_names() {
+    if (!trace_euler_parity_stats_enabled()) {
+        return {};
+    }
+    const char* value = std::getenv("SDCPP_TRACE_EULER_UNET_BOUNDARIES");
+    if (value == nullptr || value[0] == '\0') {
+        value = std::getenv("SDCPP_TRACE_EULER_UNET_BOUNDARY");
+    }
+    if (value == nullptr || value[0] == '\0') {
+        return {};
+    }
+
+    std::vector<std::string> result;
+    std::string spec(value);
+    size_t start = 0;
+    while (start <= spec.size()) {
+        const size_t end = spec.find(',', start);
+        std::string token = spec.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        token.erase(token.begin(), std::find_if(token.begin(), token.end(), [](unsigned char ch) { return std::isspace(ch) == 0; }));
+        token.erase(std::find_if(token.rbegin(), token.rend(), [](unsigned char ch) { return std::isspace(ch) == 0; }).base(), token.end());
+        if (!token.empty()) {
+            result.push_back(std::move(token));
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return result;
+}
+
 static void log_sigma_schedule_for_parity(const char* label, const std::vector<float>& sigmas) {
     if (!trace_euler_parity_stats_enabled()) {
         return;
@@ -3223,6 +3254,14 @@ public:
         const int64_t t0 = ggml_time_us();
         int unet_calls = 0;
         int backend_post_graphs = 0;
+        const std::vector<std::string> unet_debug_boundaries = trace_euler_unet_boundary_names();
+        if (!unet_debug_boundaries.empty()) {
+            std::string names;
+            for (const auto& boundary : unet_debug_boundaries) {
+                names += names.empty() ? boundary : "," + boundary;
+            }
+            LOG_INFO("[EulerParity] unet_debug_boundaries enabled names=[%s]", names.c_str());
+        }
         log_cfg_conditioning_summary_for_parity("gpu_euler_conditioning", cond, uncond, guidance);
         log_sigma_schedule_for_parity("gpu_euler_after_denoise_slice", sigmas);
         if (trace_euler_parity_stats_enabled()) {
@@ -3269,6 +3308,50 @@ public:
                 log_backend_tensor_stats_for_parity(label, noised_input.get());
             }
 
+            auto trace_unet_debug_boundaries = [&](const DiffusionParams& diffusion_params,
+                                                   const char* pass_name,
+                                                   bool batched_cfg) {
+                if (!trace_step || unet_debug_boundaries.empty()) {
+                    return;
+                }
+                for (const auto& boundary : unet_debug_boundaries) {
+                    auto boundary_output = work_diffusion_model->compute_debug_boundary_to_backend_resource(n_threads,
+                                                                                                            diffusion_params,
+                                                                                                            boundary.c_str());
+                    if (boundary_output == nullptr || boundary_output->empty()) {
+                        LOG_WARN("[EulerParity] step%d_unet_%s_%s debug_boundary unavailable",
+                                 i,
+                                 boundary.c_str(),
+                                 pass_name != nullptr ? pass_name : "unknown");
+                        continue;
+                    }
+
+                    char label[192];
+                    if (batched_cfg) {
+                        auto cond_boundary = latent_runner.batch_view(*boundary_output,
+                                                                      0,
+                                                                      n_threads,
+                                                                      "gpu_euler_unet_boundary_batched_cond");
+                        auto uncond_boundary = latent_runner.batch_view(*boundary_output,
+                                                                        1,
+                                                                        n_threads,
+                                                                        "gpu_euler_unet_boundary_batched_uncond");
+                        snprintf(label, sizeof(label), "step%d_unet_%s_cond", i, boundary.c_str());
+                        log_backend_tensor_stats_for_parity(label, cond_boundary.get());
+                        snprintf(label, sizeof(label), "step%d_unet_%s_uncond", i, boundary.c_str());
+                        log_backend_tensor_stats_for_parity(label, uncond_boundary.get());
+                    } else {
+                        snprintf(label,
+                                 sizeof(label),
+                                 "step%d_unet_%s_%s",
+                                 i,
+                                 boundary.c_str(),
+                                 pass_name != nullptr ? pass_name : "unknown");
+                        log_backend_tensor_stats_for_parity(label, boundary_output.get());
+                    }
+                }
+            };
+
             auto run_condition = [&](const SDCondition& condition, const char* pass_name) -> std::unique_ptr<GgmlBackendTensorResource> {
                 DiffusionParams diffusion_params;
                 diffusion_params.x_backend = noised_input.get();
@@ -3276,6 +3359,7 @@ public:
                 diffusion_params.guidance  = &guidance_tensor;
                 diffusion_params.context   = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
                 diffusion_params.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                trace_unet_debug_boundaries(diffusion_params, pass_name, false);
                 auto output = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params);
                 if (output == nullptr || output->empty()) {
                     LOG_ERROR("GPU Euler sampler backend path diffusion model %s pass failed at step %d",
@@ -3313,6 +3397,7 @@ public:
                 diffusion_params.guidance  = &guidance_tensor;
                 diffusion_params.context   = batched_cfg_condition.c_crossattn.empty() ? nullptr : &batched_cfg_condition.c_crossattn;
                 diffusion_params.y         = batched_cfg_condition.c_vector.empty() ? nullptr : &batched_cfg_condition.c_vector;
+                trace_unet_debug_boundaries(diffusion_params, "batched_cfg", true);
                 model_output = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params);
                 if (model_output == nullptr || model_output->empty()) {
                     LOG_ERROR("GPU Euler sampler backend path batched CFG diffusion model pass failed at step %d", i + 1);

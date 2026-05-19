@@ -4,6 +4,8 @@
 #include "common_block.hpp"
 #include "model.h"
 
+#include <cstring>
+
 /*==================================================== UnetModel =====================================================*/
 
 #define UNET_GRAPH_SIZE 102400
@@ -435,13 +437,23 @@ public:
                          ggml_tensor* y                     = nullptr,
                          int num_video_frames               = -1,
                          std::vector<ggml_tensor*> controls = {},
-                         float control_strength             = 0.f) {
+                         float control_strength             = 0.f,
+                         const char* debug_boundary         = nullptr,
+                         ggml_tensor** debug_boundary_tensor = nullptr) {
         // x: [N, in_channels, h, w] or [N, in_channels/2, h, w]
         // timesteps: [N,]
         // context: [N, max_position, hidden_size] or [1, max_position, hidden_size]. for example, [N, 77, 768]
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         // return: [N, out_channels, h, w]
+        auto maybe_capture_debug_boundary = [&](const std::string& name, ggml_tensor* tensor) {
+            if (debug_boundary != nullptr &&
+                debug_boundary_tensor != nullptr &&
+                *debug_boundary_tensor == nullptr &&
+                name == debug_boundary) {
+                *debug_boundary_tensor = tensor;
+            }
+        };
         if (context != nullptr) {
             if (context->ne[2] != x->ne[3]) {
                 context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32, context->ne[0], context->ne[1], x->ne[3]));
@@ -491,6 +503,7 @@ public:
 
         // input block 0
         auto h = input_blocks_0_0->forward(ctx, x);
+        maybe_capture_debug_boundary("input_blocks.0.0", h);
 
         ggml_set_name(h, "bench-start");
         hs.push_back(h);
@@ -504,9 +517,11 @@ public:
                 input_block_idx += 1;
                 std::string name = "input_blocks." + std::to_string(input_block_idx) + ".0";
                 h                = resblock_forward(name, ctx, h, emb, num_video_frames);  // [N, mult*model_channels, h, w]
+                maybe_capture_debug_boundary(name, h);
                 if (std::find(attention_resolutions.begin(), attention_resolutions.end(), ds) != attention_resolutions.end()) {
                     std::string name = "input_blocks." + std::to_string(input_block_idx) + ".1";
                     h                = attention_layer_forward(name, ctx, h, context, num_video_frames);  // [N, mult*model_channels, h, w]
+                    maybe_capture_debug_boundary(name, h);
                 }
                 hs.push_back(h);
             }
@@ -521,6 +536,7 @@ public:
                 auto block       = std::dynamic_pointer_cast<DownSampleBlock>(blocks[name]);
 
                 h = block->forward(ctx, h);  // [N, mult*model_channels, h/(2^(i+1)), w/(2^(i+1))]
+                maybe_capture_debug_boundary(name, h);
                 hs.push_back(h);
             }
         }
@@ -529,9 +545,12 @@ public:
         // middle_block
         if (!tiny_unet) {
             h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
+            maybe_capture_debug_boundary("middle_block.0", h);
             if (version != VERSION_SDXL_SSD1B && version != VERSION_SDXL_VEGA) {
                 h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
+                maybe_capture_debug_boundary("middle_block.1", h);
                 h = resblock_forward("middle_block.2", ctx, h, emb, num_video_frames);             // [N, 4*model_channels, h/8, w/8]
+                maybe_capture_debug_boundary("middle_block.2", h);
             }
         }
         if (controls.size() > 0) {
@@ -624,7 +643,8 @@ struct UNetModelRunner : public GGMLRunner {
                              int num_video_frames                                  = -1,
                              const std::vector<sd::Tensor<float>>& controls_tensor = {},
                              const std::vector<ggml_tensor*>* backend_controls     = nullptr,
-                             float control_strength                                = 0.f) {
+                             float control_strength                                = 0.f,
+                             const char* debug_boundary                            = nullptr) {
         ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
 
         ggml_tensor* x         = make_input(x_tensor);
@@ -648,6 +668,7 @@ struct UNetModelRunner : public GGMLRunner {
 
         auto runner_ctx = get_context();
 
+        ggml_tensor* debug_boundary_tensor = nullptr;
         ggml_tensor* out = unet.forward(&runner_ctx,
                                         x,
                                         timesteps,
@@ -656,9 +677,15 @@ struct UNetModelRunner : public GGMLRunner {
                                         y,
                                         num_video_frames,
                                         controls,
-                                        control_strength);
+                                        control_strength,
+                                        debug_boundary,
+                                        &debug_boundary_tensor);
 
         ggml_build_forward_expand(gf, out);
+        if (debug_boundary != nullptr && debug_boundary_tensor != nullptr) {
+            ggml_tensor* debug_out = ggml_scale(compute_ctx, debug_boundary_tensor, 1.0f);
+            ggml_build_forward_expand(gf, debug_out);
+        }
 
         return gf;
     }
@@ -671,7 +698,8 @@ struct UNetModelRunner : public GGMLRunner {
                              int num_video_frames                                  = -1,
                              const std::vector<sd::Tensor<float>>& controls_tensor = {},
                              const std::vector<ggml_tensor*>* backend_controls     = nullptr,
-                             float control_strength                                = 0.f) {
+                             float control_strength                                = 0.f,
+                             const char* debug_boundary                            = nullptr) {
         ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
 
         ggml_tensor* x         = make_backend_input(x_resource);
@@ -695,6 +723,7 @@ struct UNetModelRunner : public GGMLRunner {
 
         auto runner_ctx = get_context();
 
+        ggml_tensor* debug_boundary_tensor = nullptr;
         ggml_tensor* out = unet.forward(&runner_ctx,
                                         x,
                                         timesteps,
@@ -703,9 +732,15 @@ struct UNetModelRunner : public GGMLRunner {
                                         y,
                                         num_video_frames,
                                         controls,
-                                        control_strength);
+                                        control_strength,
+                                        debug_boundary,
+                                        &debug_boundary_tensor);
 
         ggml_build_forward_expand(gf, out);
+        if (debug_boundary != nullptr && debug_boundary_tensor != nullptr) {
+            ggml_tensor* debug_out = ggml_scale(compute_ctx, debug_boundary_tensor, 1.0f);
+            ggml_build_forward_expand(gf, debug_out);
+        }
 
         return gf;
     }
@@ -748,6 +783,34 @@ struct UNetModelRunner : public GGMLRunner {
         };
 
         return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "unet_backend_output");
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_debug_boundary_to_backend_resource(
+        int n_threads,
+        const GgmlBackendTensorResource& x,
+        const sd::Tensor<float>& timesteps,
+        const sd::Tensor<float>& context                  = {},
+        const sd::Tensor<float>& c_concat                 = {},
+        const sd::Tensor<float>& y                        = {},
+        int num_video_frames                              = -1,
+        const std::vector<sd::Tensor<float>>& controls    = {},
+        const std::vector<ggml_tensor*>* backend_controls = nullptr,
+        float control_strength                            = 0.f,
+        const char* debug_boundary                        = nullptr) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            return build_graph(x,
+                               timesteps,
+                               context,
+                               c_concat,
+                               y,
+                               num_video_frames,
+                               controls,
+                               backend_controls,
+                               control_strength,
+                               debug_boundary);
+        };
+
+        return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "unet_debug_boundary_output");
     }
 
     void test() {

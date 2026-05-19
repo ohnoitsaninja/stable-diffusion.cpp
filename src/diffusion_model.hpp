@@ -49,6 +49,15 @@ struct DiffusionModel {
         SD_UNUSED(diffusion_params);
         return nullptr;
     }
+    virtual std::unique_ptr<GgmlBackendTensorResource> compute_debug_boundary_to_backend_resource(
+        int n_threads,
+        const DiffusionParams& diffusion_params,
+        const char* debug_boundary) {
+        SD_UNUSED(n_threads);
+        SD_UNUSED(diffusion_params);
+        SD_UNUSED(debug_boundary);
+        return nullptr;
+    }
     virtual void alloc_params_buffer()                                           = 0;
     virtual void free_params_buffer()                                            = 0;
     virtual void free_compute_buffer()                                           = 0;
@@ -143,6 +152,26 @@ struct UNetModel : public DiffusionModel {
                                                 diffusion_params.controls ? *diffusion_params.controls : empty_controls,
                                                 diffusion_params.backend_controls,
                                                 diffusion_params.control_strength);
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_debug_boundary_to_backend_resource(
+        int n_threads,
+        const DiffusionParams& diffusion_params,
+        const char* debug_boundary) override {
+        GGML_ASSERT(diffusion_params.x_backend != nullptr);
+        GGML_ASSERT(diffusion_params.timesteps != nullptr);
+        static const std::vector<sd::Tensor<float>> empty_controls;
+        return unet.compute_debug_boundary_to_backend_resource(n_threads,
+                                                               *diffusion_params.x_backend,
+                                                               *diffusion_params.timesteps,
+                                                               tensor_or_empty(diffusion_params.context),
+                                                               tensor_or_empty(diffusion_params.c_concat),
+                                                               tensor_or_empty(diffusion_params.y),
+                                                               diffusion_params.num_video_frames,
+                                                               diffusion_params.controls ? *diffusion_params.controls : empty_controls,
+                                                               diffusion_params.backend_controls,
+                                                               diffusion_params.control_strength,
+                                                               debug_boundary);
     }
 };
 
