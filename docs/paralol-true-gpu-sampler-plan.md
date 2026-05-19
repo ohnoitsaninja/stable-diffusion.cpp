@@ -116,7 +116,10 @@ For each smoke:
 
 - sampler math stayed `gpu_backend_tensor`
 - output handle was a CUDA latent with `SAMPLER_OUTPUT` and no CPU bridge flags
-- CFG used the same batch-2 UNet path as Euler
+- CFG stayed inside the backend sampler path without host latent materialization
+- conditioning handles reported `device_resident=true` and
+  `conditioning_storage=device_tensor`
+- sampler handle timing reported `conditioning_per_step_upload=false`
 - stochastic/ancestral paths generated step noise as CUDA Philox tensors
 - no VAE decode was required for the smoke
 
@@ -124,6 +127,13 @@ This proves the sampler-loop/backend-tensor refactor is feasible beyond Euler.
 It is not a global sampler implementation: the path is env-gated and currently
 limited to SDXL/SD1, batch 1, no masks, no ControlNet, no
 reference/edit/image-CFG paths, and non-flow denoisers.
+
+`SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT=1` forces the host-backed compatibility
+path. In that mode descriptors report `device_resident=false`, capabilities
+report `supports_conditioning_gpu_resident=false`, and sampler timing reports
+`conditioning_per_step_upload=true`. `SDCPP_STRICT_GPU_RESIDENT=1` refuses that
+fallback, which is the guard Paralol should use when validating the true
+GPU-resident lane.
 
 ## CFG and UNet conv update
 
@@ -133,11 +143,55 @@ The first CFG performance pass found two separate issues:
   now preserves the batch dimension when flash attention returns
   `[d_head, heads * batch, tokens]`, so SDXL batch-2 UNet graphs no longer
   abort during the attention output reshape.
-- plain cond/uncond batching is now the default for eligible SDXL/SD1 Euler
-  CFG in the backend sampler path because same-noise Comfy parity improves
-  measurably. It can still be disabled with
-  `SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1` when comparing speed or isolating
-  CFG behavior.
+- the current default for eligible SDXL/SD1 CFG is now a dual-branch UNet graph
+  with compute-buffer reuse. It keeps cond and uncond UNet branches in one
+  backend graph and returns a CFG-guided model output that sampler-specific
+  update code consumes. Euler keeps an additional fused graph that folds the
+  `c_in` scale, CFG blend, denoised reconstruction, and Euler update into that
+  graph because that update formula is Euler-specific. This cuts cond/uncond
+  UNet evaluation from two graph computes to one graph compute without changing
+  the public sampler API.
+- batch-2 CFG is still available as an explicit experiment through
+  `SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG=1`, but it is no longer the default
+  because the reference SDXL 1024 run was slower than separate/dual-branch CFG.
+
+Dual-branch controls:
+
+```text
+SDCPP_DISABLE_GPU_SAMPLER_DUAL_BRANCH_CFG=1
+SDCPP_DISABLE_GPU_EULER_DUAL_BRANCH_CFG=1
+```
+
+Use separate cond/uncond UNet graph calls. The Euler-specific name is retained
+as a compatibility alias for older local scripts.
+
+```text
+SDCPP_DISABLE_GPU_SAMPLER_UNET_REUSE=1
+SDCPP_DISABLE_GPU_SAMPLER_DUAL_BRANCH_REUSE=1
+SDCPP_DISABLE_GPU_EULER_UNET_REUSE=1
+SDCPP_DISABLE_GPU_EULER_DUAL_BRANCH_REUSE=1
+```
+
+Keep the dual-branch graph but free/reallocate the UNet compute buffer after
+each graph output. Either variable is accepted; the longer name is retained for
+older local scripts.
+
+```text
+SDCPP_DISABLE_GPU_EULER_FUSED_UPDATE=1
+```
+
+Keep generic dual-branch CFG for Euler, but use the normal sampler update graph
+instead of the Euler fused update graph.
+
+```text
+SDCPP_EXPERIMENTAL_GPU_SAMPLER_BATCHED_CFG=1
+SDCPP_DISABLE_GPU_SAMPLER_BATCHED_CFG=1
+SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG=1
+SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1
+```
+
+Force the older batch-2 CFG graph when compatible, or disable that explicit
+batch path. The Euler-specific names remain compatibility aliases.
 
 For the env-gated GPU Euler sampler, the default SDXL/SD1 UNet path now enables
 diffusion direct conv and routes CUDA `CONV_2D` through the imported
@@ -158,10 +212,60 @@ reported:
 
 Those numbers vary with cache/interleaving, but the result is clear enough for
 the fork contract: implicit-GEMM diffusion conv is the useful default for the
-narrow GPU Euler backend, and batch CFG is the parity default. The separate
-CFG path remains available through `SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1`
-because the batch-2 graph is currently a little slower on the reference SDXL
-1024 run.
+narrow GPU backend, while dual-branch CFG with compute-buffer reuse is the
+current speed default. The separate CFG path remains available through
+`SDCPP_DISABLE_GPU_SAMPLER_DUAL_BRANCH_CFG=1`, and explicit batch-2 CFG remains
+available through `SDCPP_EXPERIMENTAL_GPU_SAMPLER_BATCHED_CFG=1` for parity and
+kernel experiments.
+
+The Euler fused dual-branch path was verified with a strict SDXL 1024 T2I smoke
+using conditioning handles and GPU latent output:
+
+- `cfg_eval_mode=dual_branch_reuse`
+- `unet_calls=16`
+- `backend_graph_calls=8`
+- `sampler_math_residency=gpu_backend_tensor`
+- no init/output bridge flags
+- BF16 COMFY_NORMAL VAE remained active with `im2col=false`, `tiled=false`,
+  `taesd=false`, and `host_copies=0`
+
+The escape hatch was verified in the same fork build with
+`SDCPP_DISABLE_GPU_EULER_DUAL_BRANCH_CFG=1`, producing
+`cfg_eval_mode=separate` and `backend_graph_calls=16`.
+
+The generic dual-branch CFG model-output path was then smoke-tested with bounded
+512px / 2-step strict no-decode runs for the SDXL/SD1 public non-flow sampler
+set:
+
+- Euler: `cfg_eval_mode=dual_branch_reuse`, `unet_calls=4`,
+  `backend_graph_calls=2`
+- Euler A: `cfg_eval_mode=dual_branch_reuse`, `unet_calls=4`,
+  `backend_graph_calls=8`
+- Heun: `cfg_eval_mode=dual_branch_reuse`, `unet_calls=6`,
+  `backend_graph_calls=12`
+- DPM2: `cfg_eval_mode=dual_branch_reuse`, `unet_calls=6`,
+  `backend_graph_calls=12`
+- DPM++ 2S A: `cfg_eval_mode=dual_branch_reuse`, `unet_calls=6`,
+  `backend_graph_calls=9`
+- DPM++ 2M and modified DPM++ 2M: `cfg_eval_mode=dual_branch_reuse`,
+  `unet_calls=4`, `backend_graph_calls=6`
+- iPNDM, iPNDM_v, DDIM trailing, and TCD: `cfg_eval_mode=dual_branch_reuse`,
+  `unet_calls=4`, `backend_graph_calls=8`
+- LCM, Res Multistep, and ER-SDE: `cfg_eval_mode=dual_branch_reuse`,
+  `unet_calls=4`, `backend_graph_calls=6`
+- Res 2S: `cfg_eval_mode=dual_branch_reuse`, `unet_calls=6`,
+  `backend_graph_calls=9`
+- DPM++ SDE: `cfg_eval_mode=dual_branch_reuse`, `unet_calls=6`,
+  `backend_graph_calls=10`
+- DPM++ 2M SDE: `cfg_eval_mode=dual_branch_reuse`, `unet_calls=4`,
+  `backend_graph_calls=6`
+- DPM++ 3M SDE: `cfg_eval_mode=dual_branch_reuse`, `unet_calls=4`,
+  `backend_graph_calls=6`
+- The `_gpu` aliases and DPM++ 2M SDE Heun variants also passed with
+  `cfg_eval_mode=dual_branch_reuse`.
+
+The generic escape hatch was verified with `SDCPP_DISABLE_GPU_SAMPLER_DUAL_BRANCH_CFG=1`
+on Euler A, producing `cfg_eval_mode=separate`.
 
 ## Required refactor
 

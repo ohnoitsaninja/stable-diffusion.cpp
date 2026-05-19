@@ -476,6 +476,13 @@ typedef struct sd_gpu_capabilities_t {
 
 typedef uint64_t sd_conditioning_handle_t;
 
+enum sd_conditioning_flags_t {
+    SD_CONDITIONING_FLAG_HOST_TENSOR = 1u << 0,
+    SD_CONDITIONING_FLAG_DEVICE_RESIDENT = 1u << 1,
+    SD_CONDITIONING_FLAG_UPLOADED_BACKEND_TENSOR = 1u << 2,
+    SD_CONDITIONING_FLAG_PER_STEP_UPLOAD_FALLBACK = 1u << 3,
+};
+
 typedef struct sd_conditioning_desc_t {
     uint32_t struct_size;
     uint32_t version;

@@ -1858,6 +1858,7 @@ protected:
     bool conv2d_direct_enabled = false;
     bool circular_x_enabled    = false;
     bool circular_y_enabled    = false;
+    bool reuse_compute_buffer_after_resource_output = false;
     sd_vae_memory_report_t last_graph_report = {};
 
     template <typename T>
@@ -2387,6 +2388,8 @@ public:
 
     void reset_compute_ctx() {
         free_compute_ctx();
+        backend_tensor_data_map.clear();
+        backend_tensor_source_map.clear();
         alloc_compute_ctx();
     }
 
@@ -2433,6 +2436,14 @@ public:
             compute_allocr = nullptr;
         }
         offload_params_to_params_backend();
+    }
+
+    void set_compute_buffer_reuse_enabled(bool enabled) {
+        reuse_compute_buffer_after_resource_output = enabled;
+    }
+
+    bool get_compute_buffer_reuse_enabled() const {
+        return reuse_compute_buffer_after_resource_output;
     }
 
     // do copy after alloc graph
@@ -2701,7 +2712,9 @@ public:
         }
         auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());
         auto output = copy_tensor_to_resource_handle(result, output_name);
-        free_compute_buffer();
+        if (!reuse_compute_buffer_after_resource_output) {
+            free_compute_buffer();
+        }
         return output;
     }
 

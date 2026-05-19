@@ -693,8 +693,11 @@ struct UNetModelRunner : public GGMLRunner {
     ggml_cgraph* build_graph(const GgmlBackendTensorResource& x_resource,
                              const sd::Tensor<float>& timesteps_tensor,
                              const sd::Tensor<float>& context_tensor               = {},
+                             const GgmlBackendTensorResource* context_resource      = nullptr,
                              const sd::Tensor<float>& c_concat_tensor              = {},
+                             const GgmlBackendTensorResource* c_concat_resource     = nullptr,
                              const sd::Tensor<float>& y_tensor                     = {},
+                             const GgmlBackendTensorResource* y_resource            = nullptr,
                              int num_video_frames                                  = -1,
                              const std::vector<sd::Tensor<float>>& controls_tensor = {},
                              const std::vector<ggml_tensor*>* backend_controls     = nullptr,
@@ -704,9 +707,9 @@ struct UNetModelRunner : public GGMLRunner {
 
         ggml_tensor* x         = make_backend_input(x_resource);
         ggml_tensor* timesteps = make_input(timesteps_tensor);
-        ggml_tensor* context   = make_optional_input(context_tensor);
-        ggml_tensor* c_concat  = make_optional_input(c_concat_tensor);
-        ggml_tensor* y         = make_optional_input(y_tensor);
+        ggml_tensor* context   = context_resource != nullptr ? make_backend_input(*context_resource) : make_optional_input(context_tensor);
+        ggml_tensor* c_concat  = c_concat_resource != nullptr ? make_backend_input(*c_concat_resource) : make_optional_input(c_concat_tensor);
+        ggml_tensor* y         = y_resource != nullptr ? make_backend_input(*y_resource) : make_optional_input(y_tensor);
         std::vector<ggml_tensor*> controls;
         if (backend_controls != nullptr && !backend_controls->empty()) {
             controls = *backend_controls;
@@ -772,17 +775,185 @@ struct UNetModelRunner : public GGMLRunner {
         const GgmlBackendTensorResource& x,
         const sd::Tensor<float>& timesteps,
         const sd::Tensor<float>& context                  = {},
+        const GgmlBackendTensorResource* context_resource = nullptr,
         const sd::Tensor<float>& c_concat                 = {},
+        const GgmlBackendTensorResource* c_concat_resource = nullptr,
         const sd::Tensor<float>& y                        = {},
+        const GgmlBackendTensorResource* y_resource       = nullptr,
         int num_video_frames                              = -1,
         const std::vector<sd::Tensor<float>>& controls    = {},
         const std::vector<ggml_tensor*>* backend_controls = nullptr,
         float control_strength                            = 0.f) {
         auto get_graph = [&]() -> ggml_cgraph* {
-            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, backend_controls, control_strength);
+            return build_graph(x,
+                               timesteps,
+                               context,
+                               context_resource,
+                               c_concat,
+                               c_concat_resource,
+                               y,
+                               y_resource,
+                               num_video_frames,
+                               controls,
+                               backend_controls,
+                               control_strength);
         };
 
         return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "unet_backend_output");
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_euler_dual_branch_update_to_backend_resource(
+        int n_threads,
+        const GgmlBackendTensorResource& x_resource,
+        float input_scale,
+        const sd::Tensor<float>& timesteps_tensor,
+        const sd::Tensor<float>& cond_context_tensor,
+        const GgmlBackendTensorResource* cond_context_resource,
+        const sd::Tensor<float>& uncond_context_tensor,
+        const GgmlBackendTensorResource* uncond_context_resource,
+        const sd::Tensor<float>& cond_y_tensor,
+        const GgmlBackendTensorResource* cond_y_resource,
+        const sd::Tensor<float>& uncond_y_tensor,
+        const GgmlBackendTensorResource* uncond_y_resource,
+        float cfg_scale,
+        float c_out,
+        float c_skip,
+        float sigma,
+        float sigma_next,
+        int num_video_frames = -1) {
+        if (sigma == 0.0f) {
+            return nullptr;
+        }
+        const float coeff = (sigma_next - sigma) / sigma;
+        auto get_graph = [&]() -> ggml_cgraph* {
+            ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE * 2 + 256);
+
+            ggml_tensor* x = make_backend_input(x_resource);
+            ggml_tensor* model_input = input_scale == 1.0f ? x : ggml_scale(compute_ctx, x, input_scale);
+            ggml_tensor* timesteps = make_input(timesteps_tensor);
+            ggml_tensor* cond_context = cond_context_resource != nullptr ? make_backend_input(*cond_context_resource) : make_optional_input(cond_context_tensor);
+            ggml_tensor* uncond_context = uncond_context_resource != nullptr ? make_backend_input(*uncond_context_resource) : make_optional_input(uncond_context_tensor);
+            ggml_tensor* cond_y = cond_y_resource != nullptr ? make_backend_input(*cond_y_resource) : make_optional_input(cond_y_tensor);
+            ggml_tensor* uncond_y = uncond_y_resource != nullptr ? make_backend_input(*uncond_y_resource) : make_optional_input(uncond_y_tensor);
+
+            if (num_video_frames == -1) {
+                num_video_frames = static_cast<int>(x->ne[3]);
+            }
+
+            auto cond_runner_ctx = get_context();
+            ggml_tensor* cond_out = unet.forward(&cond_runner_ctx,
+                                                 model_input,
+                                                 timesteps,
+                                                 cond_context,
+                                                 nullptr,
+                                                 cond_y,
+                                                 num_video_frames,
+                                                 {},
+                                                 0.0f,
+                                                 nullptr,
+                                                 nullptr);
+
+            auto uncond_runner_ctx = get_context();
+            ggml_tensor* uncond_out = unet.forward(&uncond_runner_ctx,
+                                                   model_input,
+                                                   timesteps,
+                                                   uncond_context,
+                                                   nullptr,
+                                                   uncond_y,
+                                                   num_video_frames,
+                                                   {},
+                                                   0.0f,
+                                                   nullptr,
+                                                   nullptr);
+
+            ggml_tensor* guided = ggml_add(compute_ctx,
+                                           uncond_out,
+                                           ggml_scale(compute_ctx,
+                                                      ggml_sub(compute_ctx, cond_out, uncond_out),
+                                                      cfg_scale));
+            ggml_tensor* denoised = ggml_add(compute_ctx,
+                                             ggml_scale(compute_ctx, guided, c_out),
+                                             ggml_scale(compute_ctx, x, c_skip));
+            ggml_tensor* out = ggml_add(compute_ctx,
+                                        x,
+                                        ggml_scale(compute_ctx,
+                                                   ggml_sub(compute_ctx, x, denoised),
+                                                   coeff));
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        };
+
+        return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "unet_dual_branch_euler_update");
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_dual_branch_cfg_model_output_to_backend_resource(
+        int n_threads,
+        const GgmlBackendTensorResource& x_resource,
+        const sd::Tensor<float>& timesteps_tensor,
+        const sd::Tensor<float>& cond_context_tensor,
+        const GgmlBackendTensorResource* cond_context_resource,
+        const sd::Tensor<float>& uncond_context_tensor,
+        const GgmlBackendTensorResource* uncond_context_resource,
+        const sd::Tensor<float>& cond_y_tensor,
+        const GgmlBackendTensorResource* cond_y_resource,
+        const sd::Tensor<float>& uncond_y_tensor,
+        const GgmlBackendTensorResource* uncond_y_resource,
+        float cfg_scale,
+        const char* output_name = "unet_dual_branch_cfg_model_output",
+        int num_video_frames = -1) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE * 2 + 128);
+
+            ggml_tensor* x = make_backend_input(x_resource);
+            ggml_tensor* timesteps = make_input(timesteps_tensor);
+            ggml_tensor* cond_context = cond_context_resource != nullptr ? make_backend_input(*cond_context_resource) : make_optional_input(cond_context_tensor);
+            ggml_tensor* uncond_context = uncond_context_resource != nullptr ? make_backend_input(*uncond_context_resource) : make_optional_input(uncond_context_tensor);
+            ggml_tensor* cond_y = cond_y_resource != nullptr ? make_backend_input(*cond_y_resource) : make_optional_input(cond_y_tensor);
+            ggml_tensor* uncond_y = uncond_y_resource != nullptr ? make_backend_input(*uncond_y_resource) : make_optional_input(uncond_y_tensor);
+
+            if (num_video_frames == -1) {
+                num_video_frames = static_cast<int>(x->ne[3]);
+            }
+
+            auto cond_runner_ctx = get_context();
+            ggml_tensor* cond_out = unet.forward(&cond_runner_ctx,
+                                                 x,
+                                                 timesteps,
+                                                 cond_context,
+                                                 nullptr,
+                                                 cond_y,
+                                                 num_video_frames,
+                                                 {},
+                                                 0.0f,
+                                                 nullptr,
+                                                 nullptr);
+
+            auto uncond_runner_ctx = get_context();
+            ggml_tensor* uncond_out = unet.forward(&uncond_runner_ctx,
+                                                   x,
+                                                   timesteps,
+                                                   uncond_context,
+                                                   nullptr,
+                                                   uncond_y,
+                                                   num_video_frames,
+                                                   {},
+                                                   0.0f,
+                                                   nullptr,
+                                                   nullptr);
+
+            ggml_tensor* guided = ggml_add(compute_ctx,
+                                           uncond_out,
+                                           ggml_scale(compute_ctx,
+                                                      ggml_sub(compute_ctx, cond_out, uncond_out),
+                                                      cfg_scale));
+            ggml_build_forward_expand(gf, guided);
+            return gf;
+        };
+
+        return GGMLRunner::compute_to_backend_resource_handle(
+            get_graph,
+            n_threads,
+            output_name != nullptr ? output_name : "unet_dual_branch_cfg_model_output");
     }
 
     std::unique_ptr<GgmlBackendTensorResource> compute_debug_boundary_to_backend_resource(
@@ -790,8 +961,11 @@ struct UNetModelRunner : public GGMLRunner {
         const GgmlBackendTensorResource& x,
         const sd::Tensor<float>& timesteps,
         const sd::Tensor<float>& context                  = {},
+        const GgmlBackendTensorResource* context_resource = nullptr,
         const sd::Tensor<float>& c_concat                 = {},
+        const GgmlBackendTensorResource* c_concat_resource = nullptr,
         const sd::Tensor<float>& y                        = {},
+        const GgmlBackendTensorResource* y_resource       = nullptr,
         int num_video_frames                              = -1,
         const std::vector<sd::Tensor<float>>& controls    = {},
         const std::vector<ggml_tensor*>* backend_controls = nullptr,
@@ -801,8 +975,11 @@ struct UNetModelRunner : public GGMLRunner {
             return build_graph(x,
                                timesteps,
                                context,
+                               context_resource,
                                c_concat,
+                               c_concat_resource,
                                y,
+                               y_resource,
                                num_video_frames,
                                controls,
                                backend_controls,

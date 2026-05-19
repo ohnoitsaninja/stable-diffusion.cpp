@@ -3266,7 +3266,11 @@ public:
         sample_method_t method,
         std::unique_ptr<GgmlBackendTensorResource> x,
         const SDCondition& cond,
+        const GgmlBackendTensorResource* cond_crossattn_backend,
+        const GgmlBackendTensorResource* cond_vector_backend,
         const SDCondition& uncond,
+        const GgmlBackendTensorResource* uncond_crossattn_backend,
+        const GgmlBackendTensorResource* uncond_vector_backend,
         const sd_guidance_params_t& guidance,
         int64_t noise_seed,
         float eta,
@@ -3355,6 +3359,33 @@ public:
             ~ScopedUnetConvDirect() {
                 if (active_ && model_ != nullptr) {
                     model_->unet.set_conv2d_direct_enabled(previous_);
+                }
+            }
+
+        private:
+            std::shared_ptr<UNetModel> model_;
+            bool active_ = false;
+            bool previous_ = false;
+        };
+
+        class ScopedUnetComputeBufferReuse {
+        public:
+            ScopedUnetComputeBufferReuse(const std::shared_ptr<UNetModel>& model, bool active)
+                : model_(model) {
+                if (!active || model_ == nullptr) {
+                    return;
+                }
+                previous_ = model_->get_compute_buffer_reuse_enabled();
+                model_->set_compute_buffer_reuse_enabled(true);
+                active_ = true;
+            }
+
+            ~ScopedUnetComputeBufferReuse() {
+                if (active_ && model_ != nullptr) {
+                    model_->set_compute_buffer_reuse_enabled(previous_);
+                    if (!previous_) {
+                        model_->free_compute_buffer();
+                    }
                 }
             }
 
@@ -3494,26 +3525,68 @@ public:
 
         SDCondition batched_cfg_condition;
         std::string batched_cfg_fallback_reason;
-        const bool cfg_batching_disabled = env_flag_enabled("SDCPP_DISABLE_GPU_EULER_BATCHED_CFG");
+        const std::vector<std::string> unet_debug_boundaries = trace_euler_unet_boundary_names();
+        const bool cfg_batching_disabled =
+            env_flag_enabled("SDCPP_DISABLE_GPU_SAMPLER_BATCHED_CFG") ||
+            env_flag_enabled("SDCPP_DISABLE_GPU_EULER_BATCHED_CFG");
+        const bool cfg_batching_forced =
+            env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_BATCHED_CFG") ||
+            env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG");
         const bool cfg_batching_requested =
-            !cfg_batching_disabled || env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG");
+            cfg_batching_forced && !cfg_batching_disabled;
         const bool use_batched_cfg =
             cfg_batching_requested &&
             !uncond.empty() &&
             make_batched_cfg_condition(&batched_cfg_condition, &batched_cfg_fallback_reason);
+        const bool dual_branch_disabled =
+            env_flag_enabled("SDCPP_DISABLE_GPU_SAMPLER_DUAL_BRANCH_CFG") ||
+            env_flag_enabled("SDCPP_DISABLE_GPU_EULER_DUAL_BRANCH_CFG");
+        const bool dual_branch_reuse_disabled =
+            env_flag_enabled("SDCPP_DISABLE_GPU_SAMPLER_UNET_REUSE") ||
+            env_flag_enabled("SDCPP_DISABLE_GPU_SAMPLER_DUAL_BRANCH_REUSE") ||
+            env_flag_enabled("SDCPP_DISABLE_GPU_EULER_UNET_REUSE") ||
+            env_flag_enabled("SDCPP_DISABLE_GPU_EULER_DUAL_BRANCH_REUSE");
+        const bool use_dual_branch_cfg =
+            unet_model != nullptr &&
+            !uncond.empty() &&
+            !use_batched_cfg &&
+            !dual_branch_disabled &&
+            unet_debug_boundaries.empty();
+        const bool euler_fused_dual_branch_disabled =
+            env_flag_enabled("SDCPP_DISABLE_GPU_EULER_FUSED_UPDATE") ||
+            env_flag_enabled("SDCPP_DISABLE_GPU_EULER_DUAL_BRANCH_FUSED_UPDATE");
+        const bool use_euler_fused_dual_branch_cfg =
+            use_dual_branch_cfg &&
+            method == EULER_SAMPLE_METHOD &&
+            !euler_fused_dual_branch_disabled;
+        const bool use_dual_branch_compute_reuse =
+            use_dual_branch_cfg && !dual_branch_reuse_disabled;
+        ScopedUnetComputeBufferReuse scoped_unet_compute_reuse(unet_model, use_dual_branch_compute_reuse);
         if (!uncond.empty()) {
-            if (use_batched_cfg) {
-                LOG_INFO("GPU %s sampler backend using batched CFG UNet evaluation; set SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1 to use separate cond/uncond calls",
+            if (use_dual_branch_cfg) {
+                LOG_INFO("GPU %s sampler backend using dual-branch CFG UNet evaluation%s%s; set SDCPP_DISABLE_GPU_SAMPLER_DUAL_BRANCH_CFG=1 to use separate cond/uncond calls%s",
+                         sampler_label,
+                         use_euler_fused_dual_branch_cfg ? " with Euler fused update" : "",
+                         use_dual_branch_compute_reuse ? " with compute-buffer reuse" : "",
+                         use_dual_branch_compute_reuse ? " or SDCPP_DISABLE_GPU_SAMPLER_UNET_REUSE=1 to keep dual-branch without reuse" : "");
+            } else if (use_batched_cfg) {
+                LOG_INFO("GPU %s sampler backend using explicit batched CFG UNet evaluation; unset SDCPP_EXPERIMENTAL_GPU_SAMPLER_BATCHED_CFG or set SDCPP_DISABLE_GPU_SAMPLER_BATCHED_CFG=1 to use non-batched CFG",
                          sampler_label);
             } else {
-                if (cfg_batching_disabled) {
-                    LOG_INFO("GPU %s sampler backend using separate CFG UNet evaluation because SDCPP_DISABLE_GPU_EULER_BATCHED_CFG=1",
+                if (dual_branch_disabled) {
+                    LOG_INFO("GPU %s sampler backend using separate CFG UNet evaluation because dual-branch CFG is disabled",
                              sampler_label);
-                } else {
+                } else if (!unet_debug_boundaries.empty()) {
+                    LOG_INFO("GPU %s sampler backend using separate CFG UNet evaluation because UNet boundary parity tracing is enabled",
+                             sampler_label);
+                } else if (cfg_batching_forced && !use_batched_cfg) {
                     LOG_WARN("GPU %s sampler backend using separate CFG UNet evaluation%s%s",
                              sampler_label,
                              batched_cfg_fallback_reason.empty() ? "" : ": ",
                              batched_cfg_fallback_reason.c_str());
+                } else {
+                    LOG_INFO("GPU %s sampler backend using separate CFG UNet evaluation",
+                             sampler_label);
                 }
             }
         }
@@ -3523,7 +3596,6 @@ public:
         const int64_t t0 = ggml_time_us();
         int unet_calls = 0;
         int backend_post_graphs = 0;
-        const std::vector<std::string> unet_debug_boundaries = trace_euler_unet_boundary_names();
         if (!unet_debug_boundaries.empty()) {
             std::string names;
             for (const auto& boundary : unet_debug_boundaries) {
@@ -3688,6 +3760,56 @@ public:
             sd::Tensor<float> timesteps_tensor({static_cast<int64_t>(timesteps_vec.size())}, timesteps_vec);
             sd::Tensor<float> guidance_tensor({1}, std::vector<float>{guidance.distilled_guidance});
 
+            if (use_euler_fused_dual_branch_cfg) {
+                if (trace_step) {
+                    LOG_INFO("[EulerParity] step=%d sigma=%.9g sigma_next=%.9g c_in=%.9g c_skip=%.9g c_out=%.9g",
+                             i,
+                             static_cast<double>(model_sigma),
+                             static_cast<double>(sigma_next),
+                             static_cast<double>(c_in),
+                             static_cast<double>(c_skip),
+                             static_cast<double>(c_out));
+                    char label[128];
+                    snprintf(label, sizeof(label), "step%d_x_before_model_call", i);
+                    log_backend_tensor_stats_for_parity(label, x.get());
+                }
+                std::unique_ptr<GgmlBackendTensorResource> next_x =
+                    unet_model->compute_euler_dual_branch_update_to_backend_resource(n_threads,
+                                                                                     *x,
+                                                                                     c_in,
+                                                                                     timesteps_tensor,
+                                                                                     cond.c_crossattn,
+                                                                                     cond_crossattn_backend,
+                                                                                     uncond.c_crossattn,
+                                                                                     uncond_crossattn_backend,
+                                                                                     cond.c_vector,
+                                                                                     cond_vector_backend,
+                                                                                     uncond.c_vector,
+                                                                                     uncond_vector_backend,
+                                                                                     guidance.txt_cfg,
+                                                                                     c_out,
+                                                                                     c_skip,
+                                                                                     sigma,
+                                                                                     sigma_next);
+                if (next_x == nullptr || next_x->empty()) {
+                    LOG_ERROR("GPU Euler dual-branch sampler backend path failed update at step %d", i + 1);
+                    return nullptr;
+                }
+                unet_calls += 2;
+                backend_post_graphs += 1;
+                x = std::move(next_x);
+                if (trace_step) {
+                    char label[128];
+                    snprintf(label, sizeof(label), "step%d_post_update_x", i);
+                    log_backend_tensor_stats_for_parity(label, x.get());
+                }
+
+                const float avg_step_seconds = (ggml_time_us() - t0) / 1000000.f / static_cast<float>(i + 1);
+                pretty_progress(i + 1, steps, avg_step_seconds);
+                report_sample_progress(i + 1, steps, t0);
+                continue;
+            }
+
             auto noised_input = latent_runner.scale(*x, c_in, n_threads, "gpu_euler_noised_input");
             if (noised_input == nullptr || noised_input->empty()) {
                 LOG_ERROR("GPU Euler sampler backend path failed to scale latent input at step %d", i + 1);
@@ -3754,12 +3876,15 @@ public:
             };
 
             auto run_condition = [&](const SDCondition& condition, const char* pass_name) -> std::unique_ptr<GgmlBackendTensorResource> {
+                const bool is_uncond_pass = pass_name != nullptr && std::strcmp(pass_name, "uncond") == 0;
                 DiffusionParams diffusion_params;
                 diffusion_params.x_backend = noised_input.get();
                 diffusion_params.timesteps = &timesteps_tensor;
                 diffusion_params.guidance  = &guidance_tensor;
                 diffusion_params.context   = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                diffusion_params.context_backend = is_uncond_pass ? uncond_crossattn_backend : cond_crossattn_backend;
                 diffusion_params.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                diffusion_params.y_backend = is_uncond_pass ? uncond_vector_backend : cond_vector_backend;
                 trace_unet_debug_boundaries(diffusion_params, pass_name, false);
                 auto output = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params);
                 if (output == nullptr || output->empty()) {
@@ -3775,7 +3900,31 @@ public:
             std::unique_ptr<GgmlBackendTensorResource> model_output;
             std::unique_ptr<GgmlBackendTensorResource> separate_uncond_output;
             bool model_output_is_batched_cfg = false;
-            if (use_batched_cfg) {
+            if (use_dual_branch_cfg) {
+                model_output = unet_model->compute_dual_branch_cfg_model_output_to_backend_resource(n_threads,
+                                                                                                    *noised_input,
+                                                                                                    timesteps_tensor,
+                                                                                                    cond.c_crossattn,
+                                                                                                    cond_crossattn_backend,
+                                                                                                    uncond.c_crossattn,
+                                                                                                    uncond_crossattn_backend,
+                                                                                                    cond.c_vector,
+                                                                                                    cond_vector_backend,
+                                                                                                    uncond.c_vector,
+                                                                                                    uncond_vector_backend,
+                                                                                                    guidance.txt_cfg,
+                                                                                                    "gpu_dual_branch_cfg_model_output");
+                if (model_output == nullptr || model_output->empty()) {
+                    LOG_ERROR("GPU %s sampler backend path dual-branch CFG diffusion model pass failed at step %d",
+                              sampler_label,
+                              i + 1);
+                    if (work_diffusion_model) {
+                        work_diffusion_model->free_compute_buffer();
+                    }
+                    return nullptr;
+                }
+                unet_calls += 2;
+            } else if (use_batched_cfg) {
                 auto batched_noised_input = latent_runner.concat_batch2(*noised_input,
                                                                          n_threads,
                                                                          "gpu_euler_batched_noised_input");
@@ -4043,7 +4192,21 @@ public:
                     std::unique_ptr<GgmlBackendTensorResource> model_output2;
                     std::unique_ptr<GgmlBackendTensorResource> separate_uncond_output2;
                     bool model_output2_is_batched_cfg = false;
-                    if (use_batched_cfg) {
+                    if (use_dual_branch_cfg) {
+                        model_output2 = unet_model->compute_dual_branch_cfg_model_output_to_backend_resource(n_threads,
+                                                                                                             *noised_input2,
+                                                                                                             timesteps_tensor2,
+                                                                                                             cond.c_crossattn,
+                                                                                                             cond_crossattn_backend,
+                                                                                                             uncond.c_crossattn,
+                                                                                                             uncond_crossattn_backend,
+                                                                                                             cond.c_vector,
+                                                                                                             cond_vector_backend,
+                                                                                                             uncond.c_vector,
+                                                                                                             uncond_vector_backend,
+                                                                                                             guidance.txt_cfg,
+                                                                                                             "gpu_dpmpp_2s_a_dual_branch_cfg_model_output2");
+                    } else if (use_batched_cfg) {
                         auto batched_noised_input2 = latent_runner.concat_batch2(*noised_input2,
                                                                                  n_threads,
                                                                                  "gpu_dpmpp_2s_a_batched_noised_input2");
@@ -4068,12 +4231,15 @@ public:
                         model_output2_is_batched_cfg = true;
                     } else {
                         auto run_second_condition = [&](const SDCondition& condition) -> std::unique_ptr<GgmlBackendTensorResource> {
+                            const bool is_uncond_pass = &condition == &uncond;
                             DiffusionParams diffusion_params2;
                             diffusion_params2.x_backend = noised_input2.get();
                             diffusion_params2.timesteps = &timesteps_tensor2;
                             diffusion_params2.guidance  = &guidance_tensor2;
                             diffusion_params2.context   = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                            diffusion_params2.context_backend = is_uncond_pass ? uncond_crossattn_backend : cond_crossattn_backend;
                             diffusion_params2.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                            diffusion_params2.y_backend = is_uncond_pass ? uncond_vector_backend : cond_vector_backend;
                             return work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         };
                         model_output2 = run_second_condition(cond);
@@ -4082,7 +4248,7 @@ public:
                         }
                     }
                     if (model_output2 == nullptr || model_output2->empty() ||
-                        (!uncond.empty() && !model_output2_is_batched_cfg &&
+                        (!uncond.empty() && !use_dual_branch_cfg && !model_output2_is_batched_cfg &&
                          (separate_uncond_output2 == nullptr || separate_uncond_output2->empty()))) {
                         LOG_ERROR("GPU DPM++ 2S A sampler backend path midpoint diffusion pass failed at step %d", i + 1);
                         if (work_diffusion_model) {
@@ -4207,7 +4373,21 @@ public:
                     std::unique_ptr<GgmlBackendTensorResource> model_output2;
                     std::unique_ptr<GgmlBackendTensorResource> separate_uncond_output2;
                     bool model_output2_is_batched_cfg = false;
-                    if (use_batched_cfg) {
+                    if (use_dual_branch_cfg) {
+                        model_output2 = unet_model->compute_dual_branch_cfg_model_output_to_backend_resource(n_threads,
+                                                                                                             *noised_input2,
+                                                                                                             timesteps_tensor2,
+                                                                                                             cond.c_crossattn,
+                                                                                                             cond_crossattn_backend,
+                                                                                                             uncond.c_crossattn,
+                                                                                                             uncond_crossattn_backend,
+                                                                                                             cond.c_vector,
+                                                                                                             cond_vector_backend,
+                                                                                                             uncond.c_vector,
+                                                                                                             uncond_vector_backend,
+                                                                                                             guidance.txt_cfg,
+                                                                                                             "gpu_dpmpp_sde_dual_branch_cfg_model_output2");
+                    } else if (use_batched_cfg) {
                         auto batched_noised_input2 = latent_runner.concat_batch2(*noised_input2,
                                                                                  n_threads,
                                                                                  "gpu_dpmpp_sde_batched_noised_input2");
@@ -4231,12 +4411,15 @@ public:
                         model_output2_is_batched_cfg = true;
                     } else {
                         auto run_second_condition = [&](const SDCondition& condition) -> std::unique_ptr<GgmlBackendTensorResource> {
+                            const bool is_uncond_pass = &condition == &uncond;
                             DiffusionParams diffusion_params2;
                             diffusion_params2.x_backend = noised_input2.get();
                             diffusion_params2.timesteps = &timesteps_tensor2;
                             diffusion_params2.guidance  = &guidance_tensor2;
                             diffusion_params2.context   = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                            diffusion_params2.context_backend = is_uncond_pass ? uncond_crossattn_backend : cond_crossattn_backend;
                             diffusion_params2.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                            diffusion_params2.y_backend = is_uncond_pass ? uncond_vector_backend : cond_vector_backend;
                             return work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         };
                         model_output2 = run_second_condition(cond);
@@ -4245,7 +4428,7 @@ public:
                         }
                     }
                     if (model_output2 == nullptr || model_output2->empty() ||
-                        (!uncond.empty() && !model_output2_is_batched_cfg &&
+                        (!uncond.empty() && !use_dual_branch_cfg && !model_output2_is_batched_cfg &&
                          (separate_uncond_output2 == nullptr || separate_uncond_output2->empty()))) {
                         LOG_ERROR("GPU DPM++ SDE sampler backend path intermediate diffusion pass failed at step %d", i + 1);
                         if (work_diffusion_model) {
@@ -4745,7 +4928,21 @@ public:
                     std::unique_ptr<GgmlBackendTensorResource> model_output2;
                     std::unique_ptr<GgmlBackendTensorResource> separate_uncond_output2;
                     bool model_output2_is_batched_cfg = false;
-                    if (use_batched_cfg) {
+                    if (use_dual_branch_cfg) {
+                        model_output2 = unet_model->compute_dual_branch_cfg_model_output_to_backend_resource(n_threads,
+                                                                                                             *noised_input2,
+                                                                                                             timesteps_tensor2,
+                                                                                                             cond.c_crossattn,
+                                                                                                             cond_crossattn_backend,
+                                                                                                             uncond.c_crossattn,
+                                                                                                             uncond_crossattn_backend,
+                                                                                                             cond.c_vector,
+                                                                                                             cond_vector_backend,
+                                                                                                             uncond.c_vector,
+                                                                                                             uncond_vector_backend,
+                                                                                                             guidance.txt_cfg,
+                                                                                                             "gpu_dpm2_dual_branch_cfg_model_output2");
+                    } else if (use_batched_cfg) {
                         auto batched_noised_input2 = latent_runner.concat_batch2(*noised_input2,
                                                                                  n_threads,
                                                                                  "gpu_dpm2_batched_noised_input2");
@@ -4770,12 +4967,15 @@ public:
                         model_output2_is_batched_cfg = true;
                     } else {
                         auto run_second_condition = [&](const SDCondition& condition) -> std::unique_ptr<GgmlBackendTensorResource> {
+                            const bool is_uncond_pass = &condition == &uncond;
                             DiffusionParams diffusion_params2;
                             diffusion_params2.x_backend = noised_input2.get();
                             diffusion_params2.timesteps = &timesteps_tensor2;
                             diffusion_params2.guidance  = &guidance_tensor2;
                             diffusion_params2.context   = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                            diffusion_params2.context_backend = is_uncond_pass ? uncond_crossattn_backend : cond_crossattn_backend;
                             diffusion_params2.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                            diffusion_params2.y_backend = is_uncond_pass ? uncond_vector_backend : cond_vector_backend;
                             return work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         };
                         model_output2 = run_second_condition(cond);
@@ -4784,7 +4984,7 @@ public:
                         }
                     }
                     if (model_output2 == nullptr || model_output2->empty() ||
-                        (!uncond.empty() && !model_output2_is_batched_cfg &&
+                        (!uncond.empty() && !use_dual_branch_cfg && !model_output2_is_batched_cfg &&
                          (separate_uncond_output2 == nullptr || separate_uncond_output2->empty()))) {
                         LOG_ERROR("GPU DPM2 sampler backend path midpoint diffusion pass failed at step %d", i + 1);
                         if (work_diffusion_model) {
@@ -4968,7 +5168,21 @@ public:
                     std::unique_ptr<GgmlBackendTensorResource> model_output2;
                     std::unique_ptr<GgmlBackendTensorResource> separate_uncond_output2;
                     bool model_output2_is_batched_cfg = false;
-                    if (use_batched_cfg) {
+                    if (use_dual_branch_cfg) {
+                        model_output2 = unet_model->compute_dual_branch_cfg_model_output_to_backend_resource(n_threads,
+                                                                                                             *noised_input2,
+                                                                                                             timesteps_tensor2,
+                                                                                                             cond.c_crossattn,
+                                                                                                             cond_crossattn_backend,
+                                                                                                             uncond.c_crossattn,
+                                                                                                             uncond_crossattn_backend,
+                                                                                                             cond.c_vector,
+                                                                                                             cond_vector_backend,
+                                                                                                             uncond.c_vector,
+                                                                                                             uncond_vector_backend,
+                                                                                                             guidance.txt_cfg,
+                                                                                                             "gpu_res_2s_dual_branch_cfg_model_output2");
+                    } else if (use_batched_cfg) {
                         auto batched_noised_input2 = latent_runner.concat_batch2(*noised_input2,
                                                                                  n_threads,
                                                                                  "gpu_res_2s_batched_noised_input2");
@@ -4993,12 +5207,15 @@ public:
                         model_output2_is_batched_cfg = true;
                     } else {
                         auto run_second_condition = [&](const SDCondition& condition) -> std::unique_ptr<GgmlBackendTensorResource> {
+                            const bool is_uncond_pass = &condition == &uncond;
                             DiffusionParams diffusion_params2;
                             diffusion_params2.x_backend = noised_input2.get();
                             diffusion_params2.timesteps = &timesteps_tensor2;
                             diffusion_params2.guidance  = &guidance_tensor2;
                             diffusion_params2.context   = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                            diffusion_params2.context_backend = is_uncond_pass ? uncond_crossattn_backend : cond_crossattn_backend;
                             diffusion_params2.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                            diffusion_params2.y_backend = is_uncond_pass ? uncond_vector_backend : cond_vector_backend;
                             return work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         };
                         model_output2 = run_second_condition(cond);
@@ -5007,7 +5224,7 @@ public:
                         }
                     }
                     if (model_output2 == nullptr || model_output2->empty() ||
-                        (!uncond.empty() && !model_output2_is_batched_cfg &&
+                        (!uncond.empty() && !use_dual_branch_cfg && !model_output2_is_batched_cfg &&
                          (separate_uncond_output2 == nullptr || separate_uncond_output2->empty()))) {
                         LOG_ERROR("GPU RES 2S sampler backend path intermediate diffusion pass failed at step %d", i + 1);
                         return nullptr;
@@ -5220,7 +5437,21 @@ public:
                     std::unique_ptr<GgmlBackendTensorResource> model_output2;
                     std::unique_ptr<GgmlBackendTensorResource> separate_uncond_output2;
                     bool model_output2_is_batched_cfg = false;
-                    if (use_batched_cfg) {
+                    if (use_dual_branch_cfg) {
+                        model_output2 = unet_model->compute_dual_branch_cfg_model_output_to_backend_resource(n_threads,
+                                                                                                             *noised_input2,
+                                                                                                             timesteps_tensor2,
+                                                                                                             cond.c_crossattn,
+                                                                                                             cond_crossattn_backend,
+                                                                                                             uncond.c_crossattn,
+                                                                                                             uncond_crossattn_backend,
+                                                                                                             cond.c_vector,
+                                                                                                             cond_vector_backend,
+                                                                                                             uncond.c_vector,
+                                                                                                             uncond_vector_backend,
+                                                                                                             guidance.txt_cfg,
+                                                                                                             "gpu_heun_dual_branch_cfg_model_output2");
+                    } else if (use_batched_cfg) {
                         auto batched_noised_input2 = latent_runner.concat_batch2(*noised_input2,
                                                                                  n_threads,
                                                                                  "gpu_heun_batched_noised_input2");
@@ -5245,12 +5476,15 @@ public:
                         model_output2_is_batched_cfg = true;
                     } else {
                         auto run_second_condition = [&](const SDCondition& condition) -> std::unique_ptr<GgmlBackendTensorResource> {
+                            const bool is_uncond_pass = &condition == &uncond;
                             DiffusionParams diffusion_params2;
                             diffusion_params2.x_backend = noised_input2.get();
                             diffusion_params2.timesteps = &timesteps_tensor2;
                             diffusion_params2.guidance  = &guidance_tensor2;
                             diffusion_params2.context   = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                            diffusion_params2.context_backend = is_uncond_pass ? uncond_crossattn_backend : cond_crossattn_backend;
                             diffusion_params2.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                            diffusion_params2.y_backend = is_uncond_pass ? uncond_vector_backend : cond_vector_backend;
                             return work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         };
                         model_output2 = run_second_condition(cond);
@@ -5259,7 +5493,7 @@ public:
                         }
                     }
                     if (model_output2 == nullptr || model_output2->empty() ||
-                        (!uncond.empty() && !model_output2_is_batched_cfg &&
+                        (!uncond.empty() && !use_dual_branch_cfg && !model_output2_is_batched_cfg &&
                          (separate_uncond_output2 == nullptr || separate_uncond_output2->empty()))) {
                         LOG_ERROR("GPU Heun sampler backend path second diffusion pass failed at step %d", i + 1);
                         if (work_diffusion_model) {
@@ -5319,10 +5553,20 @@ public:
         if (work_diffusion_model) {
             work_diffusion_model->free_compute_buffer();
         }
+        const char* cfg_eval_mode = "cond_only";
+        if (!uncond.empty()) {
+            if (use_dual_branch_cfg) {
+                cfg_eval_mode = use_dual_branch_compute_reuse ? "dual_branch_reuse" : "dual_branch";
+            } else if (use_batched_cfg) {
+                cfg_eval_mode = "batched";
+            } else {
+                cfg_eval_mode = "separate";
+            }
+        }
         LOG_INFO("[Timing] sample_kdiffusion_gpu_backend method=%s steps=%d cfg_eval_mode=%s unet_calls=%d backend_graph_calls=%d",
                  sampler_label,
                  steps,
-                 uncond.empty() ? "cond_only" : (use_batched_cfg ? "batched" : "separate"),
+                 cfg_eval_mode,
                  unet_calls,
                  backend_post_graphs);
         log_backend_tensor_stats_for_parity("gpu_euler_final_sampled_latent_before_vae_decode", x.get());
@@ -5936,6 +6180,10 @@ struct sd_conditioning_resource_private_t {
     uint32_t refcount = 1;
     uint32_t flags = 0;
     SDCondition condition;
+    std::unique_ptr<GgmlBackendTensorResource> crossattn_backend;
+    std::unique_ptr<GgmlBackendTensorResource> vector_backend;
+    std::unique_ptr<GgmlBackendTensorResource> concat_backend;
+    int64_t backend_upload_ms = 0;
     int clip_skip = -1;
     int width = -1;
     int height = -1;
@@ -5976,6 +6224,7 @@ struct sd_ctx_t {
 
 static std::shared_ptr<sd_conditioning_resource_private_t> sd_conditioning_lookup(sd_ctx_t* sd_ctx,
                                                                                   sd_conditioning_handle_t handle);
+static bool sd_conditioning_resource_has_backend_tensors(const sd_conditioning_resource_private_t& resource);
 
 static const char* snapshot_c_str(const std::string& value) {
     return value.empty() ? nullptr : value.c_str();
@@ -6953,9 +7202,17 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds_from
         }
     }
 
-    LOG_INFO("conditioning handles accepted positive=%" PRIu64 " negative=%" PRIu64 " storage=host_tensor device_resident=false",
+    const bool positive_device = sd_conditioning_resource_has_backend_tensors(*positive_resource);
+    const bool negative_device = embeds.uncond.empty() ||
+                                 (negative != 0 &&
+                                  sd_conditioning_lookup(sd_ctx, negative) != nullptr &&
+                                  sd_conditioning_resource_has_backend_tensors(*sd_conditioning_lookup(sd_ctx, negative)));
+    LOG_INFO("conditioning handles accepted positive=%" PRIu64 " negative=%" PRIu64 " storage=%s device_resident=%s conditioning_per_step_upload=%s",
              positive,
-             negative);
+             negative,
+             (positive_device && negative_device) ? "device_tensor" : "host_tensor",
+             (positive_device && negative_device) ? "true" : "false",
+             (positive_device && negative_device) ? "false" : "true");
     return embeds;
 }
 
@@ -7336,6 +7593,20 @@ static uint64_t sd_condition_estimated_bytes(const SDCondition& condition) {
     return bytes;
 }
 
+static bool sd_conditioning_resource_has_backend_tensors(const sd_conditioning_resource_private_t& resource) {
+    const SDCondition& condition = resource.condition;
+    if (!condition.c_crossattn.empty() && (resource.crossattn_backend == nullptr || resource.crossattn_backend->empty())) {
+        return false;
+    }
+    if (!condition.c_vector.empty() && (resource.vector_backend == nullptr || resource.vector_backend->empty())) {
+        return false;
+    }
+    if (!condition.c_concat.empty() && (resource.concat_backend == nullptr || resource.concat_backend->empty())) {
+        return false;
+    }
+    return !condition.empty();
+}
+
 static std::shared_ptr<sd_conditioning_resource_private_t> sd_conditioning_lookup(sd_ctx_t* sd_ctx,
                                                                                   sd_conditioning_handle_t handle) {
     if (sd_ctx == nullptr || handle == 0) {
@@ -7361,9 +7632,14 @@ static bool sd_conditioning_fill_desc(const sd_conditioning_resource_private_t& 
     desc->flags = resource.flags;
     desc->refcount = resource.refcount;
     desc->dtype = SD_DTYPE_F32;
-    desc->backend = SD_BACKEND_CPU;
+    const bool backend_resident = sd_conditioning_resource_has_backend_tensors(resource);
+    desc->backend = backend_resident ? SD_BACKEND_CUDA : SD_BACKEND_CPU;
     desc->estimated_bytes = sd_condition_estimated_bytes(condition);
-    desc->device_resident = false;
+    desc->device_resident = backend_resident;
+    desc->flags = resource.flags |
+                  (backend_resident ? (SD_CONDITIONING_FLAG_DEVICE_RESIDENT |
+                                       SD_CONDITIONING_FLAG_UPLOADED_BACKEND_TENSOR)
+                                    : SD_CONDITIONING_FLAG_HOST_TENSOR);
     desc->has_crossattn = !condition.c_crossattn.empty();
     desc->has_vector = !condition.c_vector.empty();
     desc->has_concat = !condition.c_concat.empty();
@@ -7444,7 +7720,8 @@ static sd_conditioning_handle_t sd_conditioning_register(sd_ctx_t* sd_ctx,
 
 static std::unique_ptr<GgmlBackendTensorResource> sd_upload_tensor_to_backend_resource(sd_ctx_t* sd_ctx,
                                                                                        const sd::Tensor<float>& tensor,
-                                                                                       const char* name) {
+                                                                                       const char* name,
+                                                                                       ggml_backend_t requested_backend = nullptr) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || tensor.empty() || tensor.dim() > 4) {
         return nullptr;
     }
@@ -7466,7 +7743,9 @@ static std::unique_ptr<GgmlBackendTensorResource> sd_upload_tensor_to_backend_re
     if (name != nullptr) {
         ggml_set_name(handle->tensor, name);
     }
-    ggml_backend_t resource_backend = sd_ctx->sd->vae_backend != nullptr ? sd_ctx->sd->vae_backend : sd_ctx->sd->backend;
+    ggml_backend_t resource_backend = requested_backend != nullptr
+                                          ? requested_backend
+                                          : (sd_ctx->sd->vae_backend != nullptr ? sd_ctx->sd->vae_backend : sd_ctx->sd->backend);
     handle->buffer = ggml_backend_alloc_ctx_tensors(handle->ctx, resource_backend);
     if (handle->buffer == nullptr) {
         return nullptr;
@@ -7474,6 +7753,67 @@ static std::unique_ptr<GgmlBackendTensorResource> sd_upload_tensor_to_backend_re
     ggml_backend_tensor_set(handle->tensor, tensor.data(), 0, ggml_nbytes(handle->tensor));
     ggml_backend_synchronize(resource_backend);
     return handle;
+}
+
+static bool sd_conditioning_upload_backend_tensors(sd_ctx_t* sd_ctx,
+                                                   sd_conditioning_resource_private_t* resource,
+                                                   int64_t* upload_ms) {
+    if (upload_ms != nullptr) {
+        *upload_ms = 0;
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || resource == nullptr || resource->condition.empty()) {
+        return false;
+    }
+    if (StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT")) {
+        return false;
+    }
+#ifdef SD_USE_CUDA
+    ggml_backend_t backend = sd_ctx->sd->backend;
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    const int64_t t0 = ggml_time_ms();
+    const SDCondition& condition = resource->condition;
+    if (!condition.c_crossattn.empty()) {
+        resource->crossattn_backend = sd_upload_tensor_to_backend_resource(sd_ctx,
+                                                                           condition.c_crossattn,
+                                                                           "conditioning_crossattn_f32",
+                                                                           backend);
+        if (resource->crossattn_backend == nullptr || resource->crossattn_backend->empty()) {
+            return false;
+        }
+    }
+    if (!condition.c_vector.empty()) {
+        resource->vector_backend = sd_upload_tensor_to_backend_resource(sd_ctx,
+                                                                        condition.c_vector,
+                                                                        "conditioning_vector_f32",
+                                                                        backend);
+        if (resource->vector_backend == nullptr || resource->vector_backend->empty()) {
+            return false;
+        }
+    }
+    if (!condition.c_concat.empty()) {
+        resource->concat_backend = sd_upload_tensor_to_backend_resource(sd_ctx,
+                                                                        condition.c_concat,
+                                                                        "conditioning_concat_f32",
+                                                                        backend);
+        if (resource->concat_backend == nullptr || resource->concat_backend->empty()) {
+            return false;
+        }
+    }
+    const int64_t t1 = ggml_time_ms();
+    resource->backend_upload_ms = t1 - t0;
+    resource->flags |= SD_CONDITIONING_FLAG_DEVICE_RESIDENT |
+                       SD_CONDITIONING_FLAG_UPLOADED_BACKEND_TENSOR;
+    if (upload_ms != nullptr) {
+        *upload_ms = resource->backend_upload_ms;
+    }
+    return sd_conditioning_resource_has_backend_tensors(*resource);
+#else
+    SD_UNUSED(sd_ctx);
+    SD_UNUSED(resource);
+    return false;
+#endif
 }
 
 static std::unique_ptr<GgmlBackendTensorResource> sd_create_backend_f32_resource(sd_ctx_t* sd_ctx,
@@ -9041,6 +9381,22 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     ImageGenerationEmbeds embeds = std::move(*embeds_opt);
     log_conditioning_tensors_for_parity("gpu_euler_after_conditioning", embeds.cond, embeds.uncond, request.clip_skip, sd_ctx->sd->version);
     int64_t condition_end = ggml_time_ms();
+    auto positive_condition_resource = use_conditioning_handles ? sd_conditioning_lookup(sd_ctx, positive) : nullptr;
+    auto negative_condition_resource = use_conditioning_handles && negative != 0 ? sd_conditioning_lookup(sd_ctx, negative) : nullptr;
+    const bool positive_condition_device = positive_condition_resource != nullptr &&
+                                           sd_conditioning_resource_has_backend_tensors(*positive_condition_resource);
+    const bool negative_condition_device = embeds.uncond.empty() ||
+                                           (negative_condition_resource != nullptr &&
+                                            sd_conditioning_resource_has_backend_tensors(*negative_condition_resource));
+    const bool conditioning_device_resident = !use_conditioning_handles ||
+                                             (positive_condition_device && negative_condition_device);
+    if (use_conditioning_handles && sd_strict_gpu_resident_enabled() && !conditioning_device_resident) {
+        LOG_ERROR("%s strict mode refused host-backed conditioning handle; positive_device=%s negative_device=%s",
+                  name,
+                  positive_condition_device ? "true" : "false",
+                  negative_condition_device ? "true" : "false");
+        return false;
+    }
 
     int64_t init_start = ggml_time_ms();
     LatentBackendGraphRunner latent_runner(sd_ctx->sd->backend);
@@ -9138,7 +9494,11 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
                                                               plan.sample_method,
                                                               std::move(x_resource),
                                                               embeds.cond,
+                                                              positive_condition_resource != nullptr ? positive_condition_resource->crossattn_backend.get() : nullptr,
+                                                              positive_condition_resource != nullptr ? positive_condition_resource->vector_backend.get() : nullptr,
                                                               embeds.uncond,
+                                                              negative_condition_resource != nullptr ? negative_condition_resource->crossattn_backend.get() : nullptr,
+                                                              negative_condition_resource != nullptr ? negative_condition_resource->vector_backend.get() : nullptr,
                                                               request.guidance,
                                                               request.seed,
                                                               plan.eta,
@@ -9173,7 +9533,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     }
     *out_gpu_latent = handle;
     int64_t t1 = ggml_time_ms();
-    LOG_INFO("[Timing] %s latent_prepare_ms=%" PRId64 " %s_ms=%" PRId64 " init_backend_ms=%" PRId64 " denoise_ms=%" PRId64 " total_ms=%" PRId64 " sampler_math_residency=gpu_backend_tensor init_latent=%s init_bridge_download=false output_bridge_upload=false condition_input=%s",
+    LOG_INFO("[Timing] %s latent_prepare_ms=%" PRId64 " %s_ms=%" PRId64 " init_backend_ms=%" PRId64 " denoise_ms=%" PRId64 " total_ms=%" PRId64 " sampler_math_residency=gpu_backend_tensor init_latent=%s init_bridge_download=false output_bridge_upload=false condition_input=%s conditioning_storage=%s conditioning_per_step_upload=%s",
              name,
              latent_prepare_end - latent_prepare_start,
              use_conditioning_handles ? "condition_bind" : "prompt_encode",
@@ -9182,7 +9542,9 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
              sampling_end - sampling_start,
              t1 - t0,
              has_gpu_init ? "gpu_handle" : "none",
-             use_conditioning_handles ? "handle" : "prompt");
+             use_conditioning_handles ? "handle" : "prompt",
+             use_conditioning_handles ? (conditioning_device_resident ? "device_tensor" : "host_tensor") : "prompt",
+             use_conditioning_handles ? (conditioning_device_resident ? "false" : "true") : "false");
     LOG_INFO("%s completed handle=%" PRIu64 " bridge_upload=false init_bridge_download=false strict_gpu_resident=%s flags=%u",
              name,
              handle,
@@ -9330,7 +9692,11 @@ static bool sd_sample_latent_gpu_euler_backend_bridge(sd_ctx_t* sd_ctx,
                                                               plan.sample_method,
                                                               std::move(x_resource),
                                                               embeds.cond,
+                                                              nullptr,
+                                                              nullptr,
                                                               embeds.uncond,
+                                                              nullptr,
+                                                              nullptr,
                                                               request.guidance,
                                                               request.seed,
                                                               plan.eta,
@@ -9991,10 +10357,21 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
     capabilities->version = SD_VAE_API_VERSION;
     capabilities->supports_text_conditioning_encode = true;
     capabilities->supports_conditioning_handles = true;
-    capabilities->supports_conditioning_gpu_resident = false;
     capabilities->supports_sampler_conditioning_handle_input =
         sd_ctx == nullptr || sd_ctx->sd == nullptr ||
         (sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version));
+#ifdef SD_USE_CUDA
+    capabilities->supports_conditioning_gpu_resident =
+        capabilities->supports_sampler_conditioning_handle_input &&
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        sd_ctx->sd->backend != nullptr &&
+        !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT") &&
+        !sd_ctx->sd->is_flow_denoiser() &&
+        ggml_backend_is_cuda(sd_ctx->sd->backend);
+#else
+    capabilities->supports_conditioning_gpu_resident = false;
+#endif
     capabilities->supports_conditioning_handle_reuse =
         sd_ctx == nullptr || sd_ctx->sd == nullptr || !sd_ctx->sd->free_params_immediately;
     capabilities->supports_conditioning_cpu_resident = true;
@@ -11430,6 +11807,22 @@ SD_API bool sd_conditioning_encode_text(sd_ctx_t* sd_ctx,
         return false;
     }
     *out_handle = handle;
+    int64_t backend_upload_ms = 0;
+    bool backend_resident = false;
+    {
+        auto resource = sd_conditioning_lookup(sd_ctx, handle);
+        if (resource != nullptr) {
+            backend_resident = sd_conditioning_upload_backend_tensors(sd_ctx,
+                                                                      resource.get(),
+                                                                      &backend_upload_ms);
+            if (!backend_resident && sd_strict_gpu_resident_enabled()) {
+                LOG_ERROR("sd_conditioning_encode_text strict GPU resident mode refused host-backed conditioning handle");
+                sd_ctx->conditioning_resources.erase(handle);
+                *out_handle = 0;
+                return false;
+            }
+        }
+    }
     if (out_desc != nullptr) {
         auto resource = sd_conditioning_lookup(sd_ctx, handle);
         if (resource != nullptr) {
@@ -11437,9 +11830,12 @@ SD_API bool sd_conditioning_encode_text(sd_ctx_t* sd_ctx,
         }
     }
 
-    LOG_INFO("[Timing] sd_conditioning_encode_text condition_encode_ms=%" PRId64 " handle=%" PRIu64 " storage=host_tensor device_resident=false zero_out_masked=%s",
+    LOG_INFO("[Timing] sd_conditioning_encode_text condition_encode_ms=%" PRId64 " conditioning_backend_upload_ms=%" PRId64 " handle=%" PRIu64 " storage=%s device_resident=%s zero_out_masked=%s",
              t1 - t0,
+             backend_upload_ms,
              handle,
+             backend_resident ? "device_tensor" : "host_tensor",
+             backend_resident ? "true" : "false",
              effective.force_zero_uncond ? "true" : "false");
     return true;
 }

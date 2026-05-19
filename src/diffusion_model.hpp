@@ -16,8 +16,11 @@ struct DiffusionParams {
     const GgmlBackendTensorResource* x_backend        = nullptr;
     const sd::Tensor<float>* timesteps                = nullptr;
     const sd::Tensor<float>* context                  = nullptr;
+    const GgmlBackendTensorResource* context_backend  = nullptr;
     const sd::Tensor<float>* c_concat                 = nullptr;
+    const GgmlBackendTensorResource* c_concat_backend = nullptr;
     const sd::Tensor<float>* y                        = nullptr;
+    const GgmlBackendTensorResource* y_backend        = nullptr;
     const sd::Tensor<int32_t>* t5_ids                 = nullptr;
     const sd::Tensor<float>* t5_weights               = nullptr;
     const sd::Tensor<float>* guidance                 = nullptr;
@@ -119,6 +122,84 @@ struct UNetModel : public DiffusionModel {
         unet.set_circular_axes(circular_x, circular_y);
     }
 
+    void set_compute_buffer_reuse_enabled(bool enabled) {
+        unet.set_compute_buffer_reuse_enabled(enabled);
+    }
+
+    bool get_compute_buffer_reuse_enabled() const {
+        return unet.get_compute_buffer_reuse_enabled();
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_euler_dual_branch_update_to_backend_resource(
+        int n_threads,
+        const GgmlBackendTensorResource& x,
+        float input_scale,
+        const sd::Tensor<float>& timesteps,
+        const sd::Tensor<float>& cond_context,
+        const GgmlBackendTensorResource* cond_context_backend,
+        const sd::Tensor<float>& uncond_context,
+        const GgmlBackendTensorResource* uncond_context_backend,
+        const sd::Tensor<float>& cond_y,
+        const GgmlBackendTensorResource* cond_y_backend,
+        const sd::Tensor<float>& uncond_y,
+        const GgmlBackendTensorResource* uncond_y_backend,
+        float cfg_scale,
+        float c_out,
+        float c_skip,
+        float sigma,
+        float sigma_next,
+        int num_video_frames = -1) {
+        return unet.compute_euler_dual_branch_update_to_backend_resource(n_threads,
+                                                                         x,
+                                                                         input_scale,
+                                                                         timesteps,
+                                                                         cond_context,
+                                                                         cond_context_backend,
+                                                                         uncond_context,
+                                                                         uncond_context_backend,
+                                                                         cond_y,
+                                                                         cond_y_backend,
+                                                                         uncond_y,
+                                                                         uncond_y_backend,
+                                                                         cfg_scale,
+                                                                         c_out,
+                                                                         c_skip,
+                                                                         sigma,
+                                                                         sigma_next,
+                                                                         num_video_frames);
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_dual_branch_cfg_model_output_to_backend_resource(
+        int n_threads,
+        const GgmlBackendTensorResource& x,
+        const sd::Tensor<float>& timesteps,
+        const sd::Tensor<float>& cond_context,
+        const GgmlBackendTensorResource* cond_context_backend,
+        const sd::Tensor<float>& uncond_context,
+        const GgmlBackendTensorResource* uncond_context_backend,
+        const sd::Tensor<float>& cond_y,
+        const GgmlBackendTensorResource* cond_y_backend,
+        const sd::Tensor<float>& uncond_y,
+        const GgmlBackendTensorResource* uncond_y_backend,
+        float cfg_scale,
+        const char* output_name = "unet_dual_branch_cfg_model_output",
+        int num_video_frames = -1) {
+        return unet.compute_dual_branch_cfg_model_output_to_backend_resource(n_threads,
+                                                                             x,
+                                                                             timesteps,
+                                                                             cond_context,
+                                                                             cond_context_backend,
+                                                                             uncond_context,
+                                                                             uncond_context_backend,
+                                                                             cond_y,
+                                                                             cond_y_backend,
+                                                                             uncond_y,
+                                                                             uncond_y_backend,
+                                                                             cfg_scale,
+                                                                             output_name,
+                                                                             num_video_frames);
+    }
+
     sd::Tensor<float> compute(int n_threads,
                               const DiffusionParams& diffusion_params) override {
         GGML_ASSERT(diffusion_params.x != nullptr);
@@ -146,8 +227,11 @@ struct UNetModel : public DiffusionModel {
                                                 *diffusion_params.x_backend,
                                                 *diffusion_params.timesteps,
                                                 tensor_or_empty(diffusion_params.context),
+                                                diffusion_params.context_backend,
                                                 tensor_or_empty(diffusion_params.c_concat),
+                                                diffusion_params.c_concat_backend,
                                                 tensor_or_empty(diffusion_params.y),
+                                                diffusion_params.y_backend,
                                                 diffusion_params.num_video_frames,
                                                 diffusion_params.controls ? *diffusion_params.controls : empty_controls,
                                                 diffusion_params.backend_controls,
@@ -165,8 +249,11 @@ struct UNetModel : public DiffusionModel {
                                                                *diffusion_params.x_backend,
                                                                *diffusion_params.timesteps,
                                                                tensor_or_empty(diffusion_params.context),
+                                                               diffusion_params.context_backend,
                                                                tensor_or_empty(diffusion_params.c_concat),
+                                                               diffusion_params.c_concat_backend,
                                                                tensor_or_empty(diffusion_params.y),
+                                                               diffusion_params.y_backend,
                                                                diffusion_params.num_video_frames,
                                                                diffusion_params.controls ? *diffusion_params.controls : empty_controls,
                                                                diffusion_params.backend_controls,
