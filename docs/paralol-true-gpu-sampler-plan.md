@@ -44,8 +44,9 @@ Strict mode refuses bridge fallbacks and allows only the true path.
 
 ## Implemented status
 
-The fork now has the first backend-resident sampler seam for SDXL/SD1 Euler and
-Heun. It remains env-gated and narrow, but it is no longer only a proof API.
+The fork now has the first backend-resident sampler seam for several SDXL/SD1
+deterministic k-diffusion samplers. It remains env-gated and narrow, but it is
+no longer only a proof API.
 
 Two env-gated paths exist:
 
@@ -82,9 +83,17 @@ Euler, 8 steps, CFG 1.2:
 - strict mode allows the experimental path when the descriptor has flags `4`
   (`SAMPLER_OUTPUT`) and no CPU bridge flags
 
-The second sampler port is Heun. A bounded SDXL 512, 2-step, strict
-GPU-resident smoke with conditioning handles completed through
-`sd_sample_latent_gpu_with_conditioning(...)` using `--sampling-method heun`:
+The next deterministic sampler ports are Heun, DPM2, DPM++ 2M, and modified
+DPM++ 2M. Bounded SDXL 512, 2-step, strict GPU-resident smokes with conditioning
+handles completed through `sd_sample_latent_gpu_with_conditioning(...)` using:
+
+- `--sampling-method euler`
+- `--sampling-method heun`
+- `--sampling-method dpm2`
+- `--sampling-method dpm++2m`
+- `--sampling-method dpm++2mv2`
+
+For each smoke:
 
 - sampler math stayed `gpu_backend_tensor`
 - output handle was a CUDA latent with `SAMPLER_OUTPUT` and no CPU bridge flags
@@ -93,8 +102,8 @@ GPU-resident smoke with conditioning handles completed through
 
 This proves the sampler-loop/backend-tensor refactor is feasible beyond Euler.
 It is not a global sampler implementation: the path is env-gated and currently
-limited to Euler and Heun, batch 1, no masks, no ControlNet, no reference/edit/
-image-CFG paths, and non-flow denoisers.
+limited to Euler, Heun, DPM2, DPM++ 2M, and modified DPM++ 2M, batch 1, no
+masks, no ControlNet, no reference/edit/image-CFG paths, and non-flow denoisers.
 
 ## CFG and UNet conv update
 
@@ -205,9 +214,9 @@ For SDXL 1024:
 
 Those conditions are now met for the env-gated SDXL/SD1 Euler T2I path, the
 env-gated SDXL/SD1 Euler I2I path where the init latent is already an
-`SD_GPU_RESOURCE_LATENT`. Paralol should continue treating unsupported
+`SD_GPU_RESOURCE_LATENT`, and first strict T2I backend smokes for Heun, DPM2,
+DPM++ 2M, and modified DPM++ 2M. Paralol should continue treating unsupported
 samplers, model families, masks, ControlNet, reference/edit/image-CFG paths,
 and requests without `SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1` as bridge paths
-only. The Heun path has passed a first strict T2I backend smoke and should be
-promoted to the same T2I/I2I parity matrix as Euler before Paralol exposes it as
-equally production-ready.
+only. The newly added samplers should be promoted through the same full T2I/I2I
+parity matrix as Euler before Paralol exposes them as equally production-ready.

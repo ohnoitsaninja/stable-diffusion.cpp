@@ -678,6 +678,49 @@ public:
         return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
     }
 
+    std::unique_ptr<GgmlBackendTensorResource> linear2(const GgmlBackendTensorResource& a_input,
+                                                       float a,
+                                                       const GgmlBackendTensorResource& b_input,
+                                                       float b,
+                                                       int n_threads,
+                                                       const char* output_name) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            ggml_cgraph* gf = new_graph_custom(32);
+            ggml_tensor* x = make_backend_input(a_input);
+            ggml_tensor* y = make_backend_input(b_input);
+            ggml_tensor* out = ggml_add(compute_ctx,
+                                        ggml_scale(compute_ctx, x, a),
+                                        ggml_scale(compute_ctx, y, b));
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        };
+        return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> linear3(const GgmlBackendTensorResource& a_input,
+                                                       float a,
+                                                       const GgmlBackendTensorResource& b_input,
+                                                       float b,
+                                                       const GgmlBackendTensorResource& c_input,
+                                                       float c,
+                                                       int n_threads,
+                                                       const char* output_name) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            ggml_cgraph* gf = new_graph_custom(48);
+            ggml_tensor* x = make_backend_input(a_input);
+            ggml_tensor* y = make_backend_input(b_input);
+            ggml_tensor* z = make_backend_input(c_input);
+            ggml_tensor* out = ggml_add(compute_ctx,
+                                        ggml_add(compute_ctx,
+                                                 ggml_scale(compute_ctx, x, a),
+                                                 ggml_scale(compute_ctx, y, b)),
+                                        ggml_scale(compute_ctx, z, c));
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        };
+        return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
+    }
+
     std::unique_ptr<GgmlBackendTensorResource> denoised_from_model_output(const GgmlBackendTensorResource& model_output,
                                                                           const GgmlBackendTensorResource& x,
                                                                           float c_out,
@@ -3161,8 +3204,12 @@ public:
             LOG_ERROR("GPU sampler backend path requires a diffusion model, initial backend latent, and sigmas");
             return nullptr;
         }
-        if (method != EULER_SAMPLE_METHOD && method != HEUN_SAMPLE_METHOD) {
-            LOG_ERROR("GPU sampler backend path only supports Euler and Heun in this pass");
+        if (method != EULER_SAMPLE_METHOD &&
+            method != HEUN_SAMPLE_METHOD &&
+            method != DPM2_SAMPLE_METHOD &&
+            method != DPMPP2M_SAMPLE_METHOD &&
+            method != DPMPP2Mv2_SAMPLE_METHOD) {
+            LOG_ERROR("GPU sampler backend path only supports Euler, Heun, DPM2, DPM++ 2M, and modified DPM++ 2M in this pass");
             return nullptr;
         }
         const char* sampler_label = sampling_methods_str[method];
@@ -3383,6 +3430,7 @@ public:
             log_timestep_schedule_for_parity("gpu_euler_after_denoise_slice", parity_timesteps);
         }
         log_backend_tensor_stats_for_parity("gpu_euler_starting_latent_before_denoise", x.get());
+        std::unique_ptr<GgmlBackendTensorResource> old_denoised;
         for (int i = 0; i < steps; ++i) {
             const float sigma = sigmas[i];
             const float sigma_next = sigmas[i + 1];
@@ -3655,6 +3703,203 @@ public:
                                                                           sigma_next,
                                                                           n_threads,
                                                                           "gpu_euler_fused_cfg_denoise_update");
+                }
+            } else if (method == DPMPP2M_SAMPLE_METHOD ||
+                       method == DPMPP2Mv2_SAMPLE_METHOD) {
+                auto denoised = make_cfg_denoised(*model_output,
+                                                  separate_uncond_output.get(),
+                                                  model_output_is_batched_cfg,
+                                                  *x,
+                                                  c_out,
+                                                  c_skip,
+                                                  method == DPMPP2M_SAMPLE_METHOD ? "gpu_dpmpp_2m_denoised" : "gpu_dpmpp_2m_v2_denoised");
+                if (denoised == nullptr || denoised->empty()) {
+                    LOG_ERROR("GPU %s sampler backend path failed denoised tensor at step %d", sampler_label, i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+
+                const float t = -std::log(sigma);
+                const float a = sigma_next / sigma;
+                if (i == 0 || sigma_next == 0.0f || old_denoised == nullptr || old_denoised->empty()) {
+                    const float b = sigma_next == 0.0f ? -1.0f : std::exp(-(-std::log(sigma_next) - t)) - 1.0f;
+                    next_x = latent_runner.linear2(*x,
+                                                   a,
+                                                   *denoised,
+                                                   -b,
+                                                   n_threads,
+                                                   method == DPMPP2M_SAMPLE_METHOD ? "gpu_dpmpp_2m_first_update" : "gpu_dpmpp_2m_v2_first_update");
+                } else {
+                    const float t_next = -std::log(sigma_next);
+                    const float h = t_next - t;
+                    const float h_last = t - (-std::log(sigmas[i - 1]));
+                    float b = 0.0f;
+                    float r = 1.0f;
+                    if (method == DPMPP2M_SAMPLE_METHOD) {
+                        b = std::exp(-h) - 1.0f;
+                        r = h_last / h;
+                    } else {
+                        const float h_min = std::min(h_last, h);
+                        const float h_max = std::max(h_last, h);
+                        const float h_d = (h_max + h_min) * 0.5f;
+                        b = std::exp(-h_d) - 1.0f;
+                        r = h_max / h_min;
+                    }
+                    const float denoised_coeff = 1.0f + 1.0f / (2.0f * r);
+                    const float old_coeff = -1.0f / (2.0f * r);
+                    next_x = latent_runner.linear3(*x,
+                                                   a,
+                                                   *denoised,
+                                                   -b * denoised_coeff,
+                                                   *old_denoised,
+                                                   -b * old_coeff,
+                                                   n_threads,
+                                                   method == DPMPP2M_SAMPLE_METHOD ? "gpu_dpmpp_2m_multistep_update" : "gpu_dpmpp_2m_v2_multistep_update");
+                }
+                old_denoised = std::move(denoised);
+            } else if (method == DPM2_SAMPLE_METHOD) {
+                const float dt = sigma_next - sigma;
+                auto denoised = make_cfg_denoised(*model_output,
+                                                  separate_uncond_output.get(),
+                                                  model_output_is_batched_cfg,
+                                                  *x,
+                                                  c_out,
+                                                  c_skip,
+                                                  "gpu_dpm2_denoised");
+                if (denoised == nullptr || denoised->empty()) {
+                    LOG_ERROR("GPU DPM2 sampler backend path failed first denoised tensor at step %d", i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+                auto d = latent_runner.euler_derivative_from_denoised(*x,
+                                                                      *denoised,
+                                                                      sigma,
+                                                                      n_threads,
+                                                                      "gpu_dpm2_derivative_d");
+                if (d == nullptr || d->empty()) {
+                    LOG_ERROR("GPU DPM2 sampler backend path failed first derivative at step %d", i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+                if (sigma_next == 0.0f) {
+                    next_x = latent_runner.add_scaled(*x,
+                                                      *d,
+                                                      dt,
+                                                      n_threads,
+                                                      "gpu_dpm2_terminal_euler_update");
+                } else {
+                    const float sigma_mid = std::exp(0.5f * (std::log(sigma) + std::log(sigma_next)));
+                    const float dt_1 = sigma_mid - sigma;
+                    auto x2 = latent_runner.add_scaled(*x,
+                                                       *d,
+                                                       dt_1,
+                                                       n_threads,
+                                                       "gpu_dpm2_midpoint_x2");
+                    if (x2 == nullptr || x2->empty()) {
+                        LOG_ERROR("GPU DPM2 sampler backend path failed midpoint latent at step %d", i + 1);
+                        return nullptr;
+                    }
+                    backend_post_graphs += 1;
+
+                    std::vector<float> scaling2 = denoiser->get_scalings(sigma_mid);
+                    GGML_ASSERT(scaling2.size() == 3);
+                    const float c_skip2 = scaling2[0];
+                    const float c_out2  = scaling2[1];
+                    const float c_in2   = scaling2[2];
+                    auto noised_input2 = latent_runner.scale(*x2,
+                                                             c_in2,
+                                                             n_threads,
+                                                             "gpu_dpm2_noised_input2");
+                    if (noised_input2 == nullptr || noised_input2->empty()) {
+                        LOG_ERROR("GPU DPM2 sampler backend path failed midpoint scaled input at step %d", i + 1);
+                        return nullptr;
+                    }
+                    backend_post_graphs += 1;
+
+                    std::vector<float> timesteps_vec2 = prepare_sample_timesteps(sigma_mid, shifted_timestep);
+                    sd::Tensor<float> timesteps_tensor2({static_cast<int64_t>(timesteps_vec2.size())}, timesteps_vec2);
+                    sd::Tensor<float> guidance_tensor2({1}, std::vector<float>{guidance.distilled_guidance});
+
+                    std::unique_ptr<GgmlBackendTensorResource> model_output2;
+                    std::unique_ptr<GgmlBackendTensorResource> separate_uncond_output2;
+                    bool model_output2_is_batched_cfg = false;
+                    if (use_batched_cfg) {
+                        auto batched_noised_input2 = latent_runner.concat_batch2(*noised_input2,
+                                                                                 n_threads,
+                                                                                 "gpu_dpm2_batched_noised_input2");
+                        if (batched_noised_input2 == nullptr || batched_noised_input2->empty()) {
+                            LOG_ERROR("GPU DPM2 sampler backend path failed midpoint batched input at step %d", i + 1);
+                            return nullptr;
+                        }
+                        backend_post_graphs += 1;
+                        std::vector<float> batched_timesteps_vec2;
+                        batched_timesteps_vec2.reserve(timesteps_vec2.size() * 2);
+                        batched_timesteps_vec2.insert(batched_timesteps_vec2.end(), timesteps_vec2.begin(), timesteps_vec2.end());
+                        batched_timesteps_vec2.insert(batched_timesteps_vec2.end(), timesteps_vec2.begin(), timesteps_vec2.end());
+                        sd::Tensor<float> batched_timesteps_tensor2({static_cast<int64_t>(batched_timesteps_vec2.size())},
+                                                                    batched_timesteps_vec2);
+                        DiffusionParams diffusion_params2;
+                        diffusion_params2.x_backend = batched_noised_input2.get();
+                        diffusion_params2.timesteps = &batched_timesteps_tensor2;
+                        diffusion_params2.guidance  = &guidance_tensor2;
+                        diffusion_params2.context   = batched_cfg_condition.c_crossattn.empty() ? nullptr : &batched_cfg_condition.c_crossattn;
+                        diffusion_params2.y         = batched_cfg_condition.c_vector.empty() ? nullptr : &batched_cfg_condition.c_vector;
+                        model_output2 = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
+                        model_output2_is_batched_cfg = true;
+                    } else {
+                        auto run_second_condition = [&](const SDCondition& condition) -> std::unique_ptr<GgmlBackendTensorResource> {
+                            DiffusionParams diffusion_params2;
+                            diffusion_params2.x_backend = noised_input2.get();
+                            diffusion_params2.timesteps = &timesteps_tensor2;
+                            diffusion_params2.guidance  = &guidance_tensor2;
+                            diffusion_params2.context   = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                            diffusion_params2.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                            return work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
+                        };
+                        model_output2 = run_second_condition(cond);
+                        if (model_output2 != nullptr && !model_output2->empty() && !uncond.empty()) {
+                            separate_uncond_output2 = run_second_condition(uncond);
+                        }
+                    }
+                    if (model_output2 == nullptr || model_output2->empty() ||
+                        (!uncond.empty() && !model_output2_is_batched_cfg &&
+                         (separate_uncond_output2 == nullptr || separate_uncond_output2->empty()))) {
+                        LOG_ERROR("GPU DPM2 sampler backend path midpoint diffusion pass failed at step %d", i + 1);
+                        if (work_diffusion_model) {
+                            work_diffusion_model->free_compute_buffer();
+                        }
+                        return nullptr;
+                    }
+                    unet_calls += model_output2_is_batched_cfg ? 1 : (uncond.empty() ? 1 : 2);
+
+                    auto denoised2 = make_cfg_denoised(*model_output2,
+                                                       separate_uncond_output2.get(),
+                                                       model_output2_is_batched_cfg,
+                                                       *x2,
+                                                       c_out2,
+                                                       c_skip2,
+                                                       "gpu_dpm2_denoised2");
+                    if (denoised2 == nullptr || denoised2->empty()) {
+                        LOG_ERROR("GPU DPM2 sampler backend path failed midpoint denoised tensor at step %d", i + 1);
+                        return nullptr;
+                    }
+                    backend_post_graphs += 1;
+                    auto d2 = latent_runner.euler_derivative_from_denoised(*x2,
+                                                                           *denoised2,
+                                                                           sigma_mid,
+                                                                           n_threads,
+                                                                           "gpu_dpm2_derivative_d2");
+                    if (d2 == nullptr || d2->empty()) {
+                        LOG_ERROR("GPU DPM2 sampler backend path failed midpoint derivative at step %d", i + 1);
+                        return nullptr;
+                    }
+                    backend_post_graphs += 1;
+                    const float dt_2 = sigma_next - sigma;
+                    next_x = latent_runner.add_scaled(*x,
+                                                      *d2,
+                                                      dt_2,
+                                                      n_threads,
+                                                      "gpu_dpm2_update");
                 }
             } else {
                 const float dt = sigma_next - sigma;
@@ -7445,7 +7690,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
         sd_img_gen_params->control_image.data != nullptr ||
         sd_img_gen_params->ref_images_count > 0 ||
         request.use_img_cond) {
-        LOG_ERROR("%s supports text-only SDXL/SD1 Euler sampling with an optional GPU init latent; init-image/mask/control/ref/image-CFG inputs are not supported", name);
+        LOG_ERROR("%s supports text-only SDXL/SD1 backend sampling with an optional GPU init latent; init-image/mask/control/ref/image-CFG inputs are not supported", name);
         return false;
     }
     if (use_conditioning_handles && !conditioning_handle_sampler_supports_request(sd_ctx, sd_img_gen_params, nullptr, request)) {
@@ -7460,8 +7705,12 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
     SamplePlan plan(sd_ctx, sd_img_gen_params, request);
-    if (plan.sample_method != EULER_SAMPLE_METHOD && plan.sample_method != HEUN_SAMPLE_METHOD) {
-        LOG_ERROR("%s only supports Euler and Heun sampling", name);
+    if (plan.sample_method != EULER_SAMPLE_METHOD &&
+        plan.sample_method != HEUN_SAMPLE_METHOD &&
+        plan.sample_method != DPM2_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP2M_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP2Mv2_SAMPLE_METHOD) {
+        LOG_ERROR("%s only supports Euler, Heun, DPM2, DPM++ 2M, and modified DPM++ 2M sampling", name);
         return false;
     }
     if (sd_ctx->sd->is_flow_denoiser()) {
