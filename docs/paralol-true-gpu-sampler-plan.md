@@ -83,9 +83,9 @@ Euler, 8 steps, CFG 1.2:
 - strict mode allows the experimental path when the descriptor has flags `4`
   (`SAMPLER_OUTPUT`) and no CPU bridge flags
 
-The next sampler ports are Heun, DPM2, DPM++ 2M, modified DPM++ 2M, Euler A,
-DPM++ 2S ancestral, and the DPM++ SDE family. Bounded SDXL 512, 2-step, strict
-GPU-resident smokes with conditioning handles completed through
+The env-gated backend sampler path now covers every public non-flow sampler in
+the SDXL/SD1 sampler enum. Bounded SDXL 512, 2-step, strict GPU-resident smokes
+with conditioning handles completed through
 `sd_sample_latent_gpu_with_conditioning(...)` using:
 
 - `--sampling-method euler`
@@ -95,10 +95,20 @@ GPU-resident smokes with conditioning handles completed through
 - `--sampling-method dpm++2s_a`
 - `--sampling-method dpm++2m`
 - `--sampling-method dpm++2mv2`
+- `--sampling-method ipndm`
+- `--sampling-method ipndm_v`
+- `--sampling-method lcm`
+- `--sampling-method ddim_trailing`
+- `--sampling-method tcd`
+- `--sampling-method res_multistep`
+- `--sampling-method res_2s`
+- `--sampling-method er_sde`
 - `--sampling-method dpmpp_sde`
 - `--sampling-method dpmpp_sde_gpu`
 - `--sampling-method dpmpp_2m_sde`
+- `--sampling-method dpmpp_2m_sde_gpu`
 - `--sampling-method dpmpp_2m_sde_heun`
+- `--sampling-method dpmpp_2m_sde_heun_gpu`
 - `--sampling-method dpmpp_3m_sde`
 - `--sampling-method dpmpp_3m_sde_gpu`
 
@@ -112,9 +122,8 @@ For each smoke:
 
 This proves the sampler-loop/backend-tensor refactor is feasible beyond Euler.
 It is not a global sampler implementation: the path is env-gated and currently
-limited to Euler, Euler A, Heun, DPM2, DPM++ 2S A, DPM++ 2M, modified
-DPM++ 2M, DPM++ SDE, DPM++ 2M SDE, and DPM++ 3M SDE, batch 1, no masks, no
-ControlNet, no reference/edit/image-CFG paths, and non-flow denoisers.
+limited to SDXL/SD1, batch 1, no masks, no ControlNet, no
+reference/edit/image-CFG paths, and non-flow denoisers.
 
 ## CFG and UNet conv update
 
@@ -179,8 +188,9 @@ because the batch-2 graph is currently a little slower on the reference SDXL
    - sampler step updates such as Euler, Euler ancestral, DPM++ SDE, and ER-SDE
    - latent noise add/mul/sub chains
 
-   The first production target should be the smallest sampler set needed by
-   Paralol acceptance: Euler for Flux/Z/Anima and Euler/DPM++ SDE for SDXL.
+   The first production target was the SDXL/SD1 public sampler set. Flow-model
+   Euler for Flux/Z/Anima is still separate because those denoisers use
+   different latent channels, guidance behavior, and flow timestep semantics.
 
 4. Add backend RNG/noise.
 
@@ -225,10 +235,12 @@ For SDXL 1024:
 
 Those conditions are now met for the env-gated SDXL/SD1 Euler T2I path, the
 env-gated SDXL/SD1 Euler I2I path where the init latent is already an
-`SD_GPU_RESOURCE_LATENT`, and first strict T2I backend smokes for Heun, DPM2,
-DPM++ 2M, modified DPM++ 2M, Euler A, DPM++ 2S A, and the DPM++ SDE family.
-Paralol should continue treating unsupported samplers, model families, masks,
-ControlNet, reference/edit/image-CFG paths, and requests without
+`SD_GPU_RESOURCE_LATENT`, and first strict T2I backend smokes for the remaining
+SDXL/SD1 public sampler methods: Euler A, Heun, DPM2, DPM++ 2S A, DPM++ 2M,
+modified DPM++ 2M, iPNDM, iPNDM_v, LCM, DDIM trailing, TCD, Res Multistep,
+Res 2S, ER-SDE, and the DPM++ SDE family. Paralol should continue treating
+unsupported model families, masks, ControlNet, reference/edit/image-CFG paths,
+and requests without
 `SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1` as bridge paths only. The newly added
 samplers should be promoted through the same full T2I/I2I parity matrix as
 Euler before Paralol exposes them as equally production-ready.

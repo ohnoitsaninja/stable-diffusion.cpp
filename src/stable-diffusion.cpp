@@ -756,6 +756,40 @@ public:
         return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
     }
 
+    std::unique_ptr<GgmlBackendTensorResource> linear5(const GgmlBackendTensorResource& a_input,
+                                                       float a,
+                                                       const GgmlBackendTensorResource& b_input,
+                                                       float b,
+                                                       const GgmlBackendTensorResource& c_input,
+                                                       float c,
+                                                       const GgmlBackendTensorResource& d_input,
+                                                       float d,
+                                                       const GgmlBackendTensorResource& e_input,
+                                                       float e,
+                                                       int n_threads,
+                                                       const char* output_name) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            ggml_cgraph* gf = new_graph_custom(80);
+            ggml_tensor* v = make_backend_input(a_input);
+            ggml_tensor* w = make_backend_input(b_input);
+            ggml_tensor* x = make_backend_input(c_input);
+            ggml_tensor* y = make_backend_input(d_input);
+            ggml_tensor* z = make_backend_input(e_input);
+            ggml_tensor* out = ggml_add(compute_ctx,
+                                        ggml_add(compute_ctx,
+                                                 ggml_scale(compute_ctx, v, a),
+                                                 ggml_scale(compute_ctx, w, b)),
+                                        ggml_add(compute_ctx,
+                                                 ggml_add(compute_ctx,
+                                                          ggml_scale(compute_ctx, x, c),
+                                                          ggml_scale(compute_ctx, y, d)),
+                                                 ggml_scale(compute_ctx, z, e)));
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        };
+        return compute_to_backend_resource_handle(get_graph, n_threads, output_name);
+    }
+
     std::unique_ptr<GgmlBackendTensorResource> denoised_from_model_output(const GgmlBackendTensorResource& model_output,
                                                                           const GgmlBackendTensorResource& x,
                                                                           float c_out,
@@ -3252,6 +3286,14 @@ public:
             method != DPMPP2S_A_SAMPLE_METHOD &&
             method != DPMPP2M_SAMPLE_METHOD &&
             method != DPMPP2Mv2_SAMPLE_METHOD &&
+            method != IPNDM_SAMPLE_METHOD &&
+            method != IPNDM_V_SAMPLE_METHOD &&
+            method != LCM_SAMPLE_METHOD &&
+            method != DDIM_TRAILING_SAMPLE_METHOD &&
+            method != TCD_SAMPLE_METHOD &&
+            method != RES_MULTISTEP_SAMPLE_METHOD &&
+            method != RES_2S_SAMPLE_METHOD &&
+            method != ER_SDE_SAMPLE_METHOD &&
             method != DPMPP_SDE_SAMPLE_METHOD &&
             method != DPMPP_SDE_GPU_SAMPLE_METHOD &&
             method != DPMPP2M_SDE_SAMPLE_METHOD &&
@@ -3260,7 +3302,7 @@ public:
             method != DPMPP2M_SDE_HEUN_GPU_SAMPLE_METHOD &&
             method != DPMPP3M_SDE_SAMPLE_METHOD &&
             method != DPMPP3M_SDE_GPU_SAMPLE_METHOD) {
-            LOG_ERROR("GPU sampler backend path only supports Euler, Euler A, Heun, DPM2, DPM++ 2S A, DPM++ 2M, modified DPM++ 2M, DPM++ SDE, DPM++ 2M SDE, and DPM++ 3M SDE in this pass");
+            LOG_ERROR("GPU sampler backend path only supports SDXL/SD1 k-diffusion sampler methods in this pass");
             return nullptr;
         }
         if (method == DPMPP_SDE_SAMPLE_METHOD || method == DPMPP_SDE_GPU_SAMPLE_METHOD) {
@@ -3277,7 +3319,8 @@ public:
             method == DPMPP2M_SDE_HEUN_SAMPLE_METHOD ||
             method == DPMPP2M_SDE_HEUN_GPU_SAMPLE_METHOD ||
             method == DPMPP3M_SDE_SAMPLE_METHOD ||
-            method == DPMPP3M_SDE_GPU_SAMPLE_METHOD;
+            method == DPMPP3M_SDE_GPU_SAMPLE_METHOD ||
+            method == ER_SDE_SAMPLE_METHOD;
         if (is_sde_method) {
             dpmpp_offset_first_sigma_for_snr(sigmas, false);
         }
@@ -3508,6 +3551,36 @@ public:
         bool have_sde_denoised_2 = false;
         float sde_h_1 = 0.0f;
         float sde_h_2 = 0.0f;
+        std::vector<std::unique_ptr<GgmlBackendTensorResource>> derivative_hist;
+        bool have_res_old_sigma = false;
+        float res_old_sigma_down = 0.0f;
+        std::unique_ptr<GgmlBackendTensorResource> er_old_denoised_d;
+        std::vector<float> er_lambdas;
+        if (method == ER_SDE_SAMPLE_METHOD) {
+            er_lambdas.resize(sigmas.size(), 0.0f);
+            for (size_t j = 0; j < sigmas.size(); ++j) {
+                er_lambdas[j] = std::exp(-dpmpp_sigma_to_half_log_snr(sigmas[j], false));
+            }
+        }
+        std::vector<double> ddim_alphas_cumprod;
+        std::vector<double> ddim_compvis_sigmas;
+        if (method == DDIM_TRAILING_SAMPLE_METHOD || method == TCD_SAMPLE_METHOD) {
+            constexpr float beta_start = 0.00085f;
+            constexpr float beta_end = 0.0120f;
+            ddim_alphas_cumprod.resize(TIMESTEPS);
+            ddim_compvis_sigmas.resize(TIMESTEPS);
+            for (int j = 0; j < TIMESTEPS; ++j) {
+                ddim_alphas_cumprod[j] =
+                    (j == 0 ? 1.0 : ddim_alphas_cumprod[j - 1]) *
+                    (1.0 -
+                     std::pow(std::sqrt(beta_start) +
+                                  (std::sqrt(beta_end) - std::sqrt(beta_start)) *
+                                      (static_cast<float>(j) / (TIMESTEPS - 1)),
+                              2));
+                ddim_compvis_sigmas[j] =
+                    std::sqrt((1.0 - ddim_alphas_cumprod[j]) / ddim_alphas_cumprod[j]);
+            }
+        }
         auto current_latent_shape = [&]() -> std::vector<int64_t> {
             ggml_tensor* tensor = x != nullptr ? x->tensor : nullptr;
             if (tensor == nullptr) {
@@ -3536,11 +3609,76 @@ public:
                                                            offset,
                                                            name);
         };
+        auto phi1_fn = [](float t) -> float {
+            if (std::fabs(t) < 1e-6f) {
+                return 1.0f + t * 0.5f + (t * t) / 6.0f;
+            }
+            return (std::exp(t) - 1.0f) / t;
+        };
+        auto phi2_fn = [&](float t) -> float {
+            if (std::fabs(t) < 1e-6f) {
+                return 0.5f + t / 6.0f + (t * t) / 24.0f;
+            }
+            return (phi1_fn(t) - 1.0f) / t;
+        };
+        auto push_derivative_hist = [&](std::unique_ptr<GgmlBackendTensorResource> d) {
+            if (derivative_hist.size() == 3) {
+                derivative_hist.erase(derivative_hist.begin());
+            }
+            derivative_hist.push_back(std::move(d));
+        };
+        auto er_noise_scaler = [](float value) -> float {
+            if (value <= 0.0f) {
+                return 0.0f;
+            }
+            return value * (std::exp(std::pow(value, 0.3f)) + 10.0f);
+        };
         for (int i = 0; i < steps; ++i) {
             const float sigma = sigmas[i];
             const float sigma_next = sigmas[i + 1];
+            float model_sigma = sigma;
+            int ddim_timestep = 0;
+            int ddim_prev_timestep = 0;
+            int tcd_timestep_s = 0;
+            if (method == DDIM_TRAILING_SAMPLE_METHOD) {
+                ddim_timestep = static_cast<int>(std::round(TIMESTEPS - i * (static_cast<float>(TIMESTEPS) / steps))) - 1;
+                ddim_timestep = std::max(0, std::min(TIMESTEPS - 1, ddim_timestep));
+                ddim_prev_timestep = ddim_timestep - TIMESTEPS / steps;
+                model_sigma = static_cast<float>(ddim_compvis_sigmas[ddim_timestep]);
+                const float scale = (i == 0)
+                                        ? std::sqrt(model_sigma * model_sigma + 1.0f) / model_sigma
+                                        : std::sqrt(model_sigma * model_sigma + 1.0f);
+                x = latent_runner.scale(*x, scale, n_threads, "gpu_ddim_trailing_pre_model_scale");
+                if (x == nullptr || x->empty()) {
+                    LOG_ERROR("GPU DDIM trailing sampler backend path failed pre-model scale at step %d", i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+            } else if (method == TCD_SAMPLE_METHOD) {
+                constexpr int original_steps = 50;
+                ddim_timestep = TIMESTEPS - 1 - (TIMESTEPS / original_steps) *
+                                                   static_cast<int>(std::floor(i * (static_cast<float>(original_steps) / steps)));
+                ddim_timestep = std::max(0, std::min(TIMESTEPS - 1, ddim_timestep));
+                ddim_prev_timestep = i >= steps - 1
+                                         ? 0
+                                         : TIMESTEPS - 1 - (TIMESTEPS / original_steps) *
+                                                               static_cast<int>(std::floor((i + 1) * (static_cast<float>(original_steps) / steps)));
+                ddim_prev_timestep = std::max(0, std::min(TIMESTEPS - 1, ddim_prev_timestep));
+                tcd_timestep_s = static_cast<int>(std::floor((1.0f - eta) * ddim_prev_timestep));
+                tcd_timestep_s = std::max(0, std::min(TIMESTEPS - 1, tcd_timestep_s));
+                model_sigma = static_cast<float>(ddim_compvis_sigmas[ddim_timestep]);
+                const float scale = (i == 0)
+                                        ? std::sqrt(model_sigma * model_sigma + 1.0f) / model_sigma
+                                        : std::sqrt(model_sigma * model_sigma + 1.0f);
+                x = latent_runner.scale(*x, scale, n_threads, "gpu_tcd_pre_model_scale");
+                if (x == nullptr || x->empty()) {
+                    LOG_ERROR("GPU TCD sampler backend path failed pre-model scale at step %d", i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+            }
             const bool trace_step = trace_euler_parity_step_enabled(i, steps);
-            std::vector<float> scaling = denoiser->get_scalings(sigma);
+            std::vector<float> scaling = denoiser->get_scalings(model_sigma);
             GGML_ASSERT(scaling.size() == 3);
             const float c_skip = scaling[0];
             const float c_out  = scaling[1];
@@ -3559,7 +3697,7 @@ public:
             if (trace_step) {
                 LOG_INFO("[EulerParity] step=%d sigma=%.9g sigma_next=%.9g c_in=%.9g c_skip=%.9g c_out=%.9g",
                          i,
-                         static_cast<double>(sigma),
+                         static_cast<double>(model_sigma),
                          static_cast<double>(sigma_next),
                          static_cast<double>(c_in),
                          static_cast<double>(c_skip),
@@ -4323,6 +4461,171 @@ public:
                 sde_denoised_1 = std::move(denoised);
                 have_sde_denoised_2 = have_sde_denoised_1;
                 have_sde_denoised_1 = true;
+            } else if (method == LCM_SAMPLE_METHOD) {
+                auto denoised = make_cfg_denoised(*model_output,
+                                                  separate_uncond_output.get(),
+                                                  model_output_is_batched_cfg,
+                                                  *x,
+                                                  c_out,
+                                                  c_skip,
+                                                  "gpu_lcm_denoised");
+                if (denoised == nullptr || denoised->empty()) {
+                    LOG_ERROR("GPU LCM sampler backend path failed denoised tensor at step %d", i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+                next_x = std::move(denoised);
+                if (sigma_next > 0.0f) {
+                    auto noise = make_step_noise(i, "gpu_lcm_step_noise");
+                    if (noise == nullptr || noise->empty()) {
+                        LOG_ERROR("GPU LCM sampler backend path failed CUDA noise at step %d", i + 1);
+                        return nullptr;
+                    }
+                    next_x = latent_runner.add_scaled(*next_x,
+                                                      *noise,
+                                                      sigma_next,
+                                                      n_threads,
+                                                      "gpu_lcm_add_noise");
+                }
+            } else if (method == IPNDM_SAMPLE_METHOD ||
+                       method == IPNDM_V_SAMPLE_METHOD) {
+                auto denoised = make_cfg_denoised(*model_output,
+                                                  separate_uncond_output.get(),
+                                                  model_output_is_batched_cfg,
+                                                  *x,
+                                                  c_out,
+                                                  c_skip,
+                                                  method == IPNDM_SAMPLE_METHOD ? "gpu_ipndm_denoised" : "gpu_ipndm_v_denoised");
+                if (denoised == nullptr || denoised->empty()) {
+                    LOG_ERROR("GPU %s sampler backend path failed denoised tensor at step %d", sampler_label, i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+                auto d_cur = latent_runner.euler_derivative_from_denoised(*x,
+                                                                          *denoised,
+                                                                          sigma,
+                                                                          n_threads,
+                                                                          method == IPNDM_SAMPLE_METHOD ? "gpu_ipndm_derivative" : "gpu_ipndm_v_derivative");
+                if (d_cur == nullptr || d_cur->empty()) {
+                    LOG_ERROR("GPU %s sampler backend path failed derivative at step %d", sampler_label, i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+                const int order = std::min(4, i + 1);
+                const float h_n = sigma_next - sigma;
+                if (order == 1) {
+                    next_x = latent_runner.add_scaled(*x,
+                                                      *d_cur,
+                                                      h_n,
+                                                      n_threads,
+                                                      method == IPNDM_SAMPLE_METHOD ? "gpu_ipndm_order1_update" : "gpu_ipndm_v_order1_update");
+                } else if (order == 2 && !derivative_hist.empty()) {
+                    const float h_n_1 = (method == IPNDM_V_SAMPLE_METHOD && i > 0) ? (sigma - sigmas[i - 1]) : h_n;
+                    const float ratio = (method == IPNDM_V_SAMPLE_METHOD && h_n_1 != 0.0f) ? (h_n / h_n_1) : 1.0f;
+                    const float d_coeff = method == IPNDM_V_SAMPLE_METHOD ? 0.5f * (2.0f + ratio) * h_n : 1.5f * h_n;
+                    const float h_coeff = method == IPNDM_V_SAMPLE_METHOD ? -0.5f * ratio * h_n : -0.5f * h_n;
+                    next_x = latent_runner.linear3(*x,
+                                                   1.0f,
+                                                   *d_cur,
+                                                   d_coeff,
+                                                   *derivative_hist.back(),
+                                                   h_coeff,
+                                                   n_threads,
+                                                   method == IPNDM_SAMPLE_METHOD ? "gpu_ipndm_order2_update" : "gpu_ipndm_v_order2_update");
+                } else if (order == 3 && derivative_hist.size() >= 2) {
+                    next_x = latent_runner.linear4(*x,
+                                                   1.0f,
+                                                   *d_cur,
+                                                   (23.0f / 12.0f) * h_n,
+                                                   *derivative_hist[derivative_hist.size() - 1],
+                                                   (-16.0f / 12.0f) * h_n,
+                                                   *derivative_hist[derivative_hist.size() - 2],
+                                                   (5.0f / 12.0f) * h_n,
+                                                   n_threads,
+                                                   method == IPNDM_SAMPLE_METHOD ? "gpu_ipndm_order3_update" : "gpu_ipndm_v_order3_update");
+                } else if (order == 4 && derivative_hist.size() >= 3) {
+                    next_x = latent_runner.linear5(*x,
+                                                   1.0f,
+                                                   *d_cur,
+                                                   (55.0f / 24.0f) * h_n,
+                                                   *derivative_hist[derivative_hist.size() - 1],
+                                                   (-59.0f / 24.0f) * h_n,
+                                                   *derivative_hist[derivative_hist.size() - 2],
+                                                   (37.0f / 24.0f) * h_n,
+                                                   *derivative_hist[derivative_hist.size() - 3],
+                                                   (-9.0f / 24.0f) * h_n,
+                                                   n_threads,
+                                                   method == IPNDM_SAMPLE_METHOD ? "gpu_ipndm_order4_update" : "gpu_ipndm_v_order4_update");
+                }
+                push_derivative_hist(std::move(d_cur));
+            } else if (method == RES_MULTISTEP_SAMPLE_METHOD) {
+                auto denoised = make_cfg_denoised(*model_output,
+                                                  separate_uncond_output.get(),
+                                                  model_output_is_batched_cfg,
+                                                  *x,
+                                                  c_out,
+                                                  c_skip,
+                                                  "gpu_res_multistep_denoised");
+                if (denoised == nullptr || denoised->empty()) {
+                    LOG_ERROR("GPU RES multistep sampler backend path failed denoised tensor at step %d", i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+                auto ancestral = get_ancestral_step(sigma, sigma_next, eta);
+                const float sigma_down = ancestral.first;
+                const float sigma_up = ancestral.second;
+                if (sigma_down == 0.0f || !have_res_old_sigma || old_denoised == nullptr || old_denoised->empty()) {
+                    next_x = latent_runner.euler_update(*x,
+                                                        *denoised,
+                                                        sigma,
+                                                        sigma_down,
+                                                        n_threads,
+                                                        "gpu_res_multistep_euler_update");
+                } else {
+                    const float t = -std::log(sigma);
+                    const float t_old = -std::log(res_old_sigma_down);
+                    const float t_next = -std::log(sigma_down);
+                    const float t_prev = -std::log(sigmas[i - 1]);
+                    const float h = t_next - t;
+                    const float c2_ratio = h != 0.0f ? (t_prev - t_old) / h : 0.0f;
+                    float b1 = 0.0f;
+                    float b2 = 0.0f;
+                    if (c2_ratio != 0.0f) {
+                        const float phi1_val = phi1_fn(-h);
+                        const float phi2_val = phi2_fn(-h);
+                        b1 = phi1_val - phi2_val / c2_ratio;
+                        b2 = phi2_val / c2_ratio;
+                    }
+                    if (!std::isfinite(b1)) {
+                        b1 = 0.0f;
+                    }
+                    if (!std::isfinite(b2)) {
+                        b2 = 0.0f;
+                    }
+                    next_x = latent_runner.linear3(*x,
+                                                   std::exp(-h),
+                                                   *denoised,
+                                                   h * b1,
+                                                   *old_denoised,
+                                                   h * b2,
+                                                   n_threads,
+                                                   "gpu_res_multistep_update");
+                }
+                if (next_x != nullptr && !next_x->empty() && sigma_next > 0.0f && sigma_up > 0.0f) {
+                    auto noise = make_step_noise(i, "gpu_res_multistep_step_noise");
+                    if (noise == nullptr || noise->empty()) {
+                        LOG_ERROR("GPU RES multistep sampler backend path failed CUDA noise at step %d", i + 1);
+                        return nullptr;
+                    }
+                    next_x = latent_runner.add_scaled(*next_x,
+                                                      *noise,
+                                                      sigma_up,
+                                                      n_threads,
+                                                      "gpu_res_multistep_add_noise");
+                }
+                old_denoised = std::move(denoised);
+                res_old_sigma_down = sigma_down;
+                have_res_old_sigma = true;
             } else if (method == DPMPP2M_SAMPLE_METHOD ||
                        method == DPMPP2Mv2_SAMPLE_METHOD) {
                 auto denoised = make_cfg_denoised(*model_output,
@@ -4520,6 +4823,339 @@ public:
                                                       n_threads,
                                                       "gpu_dpm2_update");
                 }
+            } else if (method == DDIM_TRAILING_SAMPLE_METHOD ||
+                       method == TCD_SAMPLE_METHOD) {
+                auto denoised = make_cfg_denoised(*model_output,
+                                                  separate_uncond_output.get(),
+                                                  model_output_is_batched_cfg,
+                                                  *x,
+                                                  c_out,
+                                                  c_skip,
+                                                  method == DDIM_TRAILING_SAMPLE_METHOD ? "gpu_ddim_trailing_denoised" : "gpu_tcd_denoised");
+                if (denoised == nullptr || denoised->empty()) {
+                    LOG_ERROR("GPU %s sampler backend path failed denoised tensor at step %d", sampler_label, i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+
+                const float alpha_prod_t = static_cast<float>(ddim_alphas_cumprod[ddim_timestep]);
+                const float beta_prod_t = 1.0f - alpha_prod_t;
+                const float sqrt_sigma2p1 = std::sqrt(model_sigma * model_sigma + 1.0f);
+                const float sqrt_alpha_t = std::sqrt(alpha_prod_t);
+                const float sqrt_beta_t = std::sqrt(beta_prod_t);
+                const float eps_x_coeff = 1.0f / model_sigma;
+                const float eps_den_coeff = -1.0f / model_sigma;
+                const float pred_x_coeff =
+                    (1.0f / sqrt_sigma2p1 - sqrt_beta_t / model_sigma) / sqrt_alpha_t;
+                const float pred_den_coeff = sqrt_beta_t / (model_sigma * sqrt_alpha_t);
+
+                if (method == DDIM_TRAILING_SAMPLE_METHOD) {
+                    const float alpha_prod_t_prev =
+                        static_cast<float>(ddim_prev_timestep >= 0 ? ddim_alphas_cumprod[ddim_prev_timestep] : ddim_alphas_cumprod[0]);
+                    const float beta_prod_t_prev = 1.0f - alpha_prod_t_prev;
+                    const float variance = (beta_prod_t_prev / beta_prod_t) *
+                                           (1.0f - alpha_prod_t / alpha_prod_t_prev);
+                    const float std_dev_t = eta * std::sqrt(std::max(variance, 0.0f));
+                    const float direction_scale =
+                        std::sqrt(std::max(1.0f - alpha_prod_t_prev - std_dev_t * std_dev_t, 0.0f));
+                    const float x_coeff = std::sqrt(alpha_prod_t_prev) * pred_x_coeff + direction_scale * eps_x_coeff;
+                    const float den_coeff = std::sqrt(alpha_prod_t_prev) * pred_den_coeff + direction_scale * eps_den_coeff;
+                    next_x = latent_runner.linear2(*x,
+                                                   x_coeff,
+                                                   *denoised,
+                                                   den_coeff,
+                                                   n_threads,
+                                                   "gpu_ddim_trailing_update");
+                    if (next_x != nullptr && !next_x->empty() && eta > 0.0f && std_dev_t > 0.0f) {
+                        auto noise = make_step_noise(i, "gpu_ddim_trailing_step_noise");
+                        if (noise == nullptr || noise->empty()) {
+                            LOG_ERROR("GPU DDIM trailing sampler backend path failed CUDA noise at step %d", i + 1);
+                            return nullptr;
+                        }
+                        next_x = latent_runner.add_scaled(*next_x,
+                                                          *noise,
+                                                          std_dev_t,
+                                                          n_threads,
+                                                          "gpu_ddim_trailing_add_noise");
+                    }
+                } else {
+                    const float alpha_prod_t_prev =
+                        static_cast<float>(ddim_prev_timestep >= 0 ? ddim_alphas_cumprod[ddim_prev_timestep] : ddim_alphas_cumprod[0]);
+                    const float alpha_prod_s = static_cast<float>(ddim_alphas_cumprod[tcd_timestep_s]);
+                    const float beta_prod_s = 1.0f - alpha_prod_s;
+                    const float x_coeff = std::sqrt(alpha_prod_s) * pred_x_coeff + std::sqrt(beta_prod_s) * eps_x_coeff;
+                    const float den_coeff = std::sqrt(alpha_prod_s) * pred_den_coeff + std::sqrt(beta_prod_s) * eps_den_coeff;
+                    next_x = latent_runner.linear2(*x,
+                                                   x_coeff,
+                                                   *denoised,
+                                                   den_coeff,
+                                                   n_threads,
+                                                   "gpu_tcd_update");
+                    if (next_x != nullptr && !next_x->empty() && eta > 0.0f && i != steps - 1) {
+                        const float ratio = alpha_prod_s != 0.0f ? alpha_prod_t_prev / alpha_prod_s : 1.0f;
+                        const float carry = std::sqrt(std::max(ratio, 0.0f));
+                        const float noise_scale = std::sqrt(std::max(1.0f - ratio, 0.0f));
+                        auto noise = make_step_noise(i, "gpu_tcd_step_noise");
+                        if (noise == nullptr || noise->empty()) {
+                            LOG_ERROR("GPU TCD sampler backend path failed CUDA noise at step %d", i + 1);
+                            return nullptr;
+                        }
+                        next_x = latent_runner.linear2(*next_x,
+                                                       carry,
+                                                       *noise,
+                                                       noise_scale,
+                                                       n_threads,
+                                                       "gpu_tcd_eta_noise_update");
+                    }
+                }
+            } else if (method == RES_2S_SAMPLE_METHOD) {
+                constexpr float c2 = 0.5f;
+                auto denoised = make_cfg_denoised(*model_output,
+                                                  separate_uncond_output.get(),
+                                                  model_output_is_batched_cfg,
+                                                  *x,
+                                                  c_out,
+                                                  c_skip,
+                                                  "gpu_res_2s_denoised");
+                if (denoised == nullptr || denoised->empty()) {
+                    LOG_ERROR("GPU RES 2S sampler backend path failed first denoised tensor at step %d", i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+                auto ancestral = get_ancestral_step(sigma, sigma_next, eta);
+                const float sigma_down = ancestral.first;
+                const float sigma_up = ancestral.second;
+                if (sigma_down == 0.0f || sigma == 0.0f) {
+                    next_x = std::move(denoised);
+                } else {
+                    const float t = -std::log(sigma);
+                    const float t_next = -std::log(sigma_down);
+                    const float h = t_next - t;
+                    const float a21 = c2 * phi1_fn(-h * c2);
+                    const float b2 = phi2_fn(-h) / c2;
+                    const float b1 = phi1_fn(-h) - b2;
+                    const float sigma_c2 = std::exp(-(t + h * c2));
+                    auto x2 = latent_runner.linear2(*x,
+                                                    1.0f - h * a21,
+                                                    *denoised,
+                                                    h * a21,
+                                                    n_threads,
+                                                    "gpu_res_2s_x2");
+                    if (x2 == nullptr || x2->empty()) {
+                        LOG_ERROR("GPU RES 2S sampler backend path failed intermediate latent at step %d", i + 1);
+                        return nullptr;
+                    }
+                    backend_post_graphs += 1;
+
+                    std::vector<float> scaling2 = denoiser->get_scalings(sigma_c2);
+                    GGML_ASSERT(scaling2.size() == 3);
+                    const float c_skip2 = scaling2[0];
+                    const float c_out2  = scaling2[1];
+                    const float c_in2   = scaling2[2];
+                    auto noised_input2 = latent_runner.scale(*x2,
+                                                             c_in2,
+                                                             n_threads,
+                                                             "gpu_res_2s_noised_input2");
+                    if (noised_input2 == nullptr || noised_input2->empty()) {
+                        LOG_ERROR("GPU RES 2S sampler backend path failed intermediate scaled input at step %d", i + 1);
+                        return nullptr;
+                    }
+                    backend_post_graphs += 1;
+
+                    std::vector<float> timesteps_vec2 = prepare_sample_timesteps(sigma_c2, shifted_timestep);
+                    sd::Tensor<float> timesteps_tensor2({static_cast<int64_t>(timesteps_vec2.size())}, timesteps_vec2);
+                    sd::Tensor<float> guidance_tensor2({1}, std::vector<float>{guidance.distilled_guidance});
+                    std::unique_ptr<GgmlBackendTensorResource> model_output2;
+                    std::unique_ptr<GgmlBackendTensorResource> separate_uncond_output2;
+                    bool model_output2_is_batched_cfg = false;
+                    if (use_batched_cfg) {
+                        auto batched_noised_input2 = latent_runner.concat_batch2(*noised_input2,
+                                                                                 n_threads,
+                                                                                 "gpu_res_2s_batched_noised_input2");
+                        if (batched_noised_input2 == nullptr || batched_noised_input2->empty()) {
+                            LOG_ERROR("GPU RES 2S sampler backend path failed intermediate batched input at step %d", i + 1);
+                            return nullptr;
+                        }
+                        backend_post_graphs += 1;
+                        std::vector<float> batched_timesteps_vec2;
+                        batched_timesteps_vec2.reserve(timesteps_vec2.size() * 2);
+                        batched_timesteps_vec2.insert(batched_timesteps_vec2.end(), timesteps_vec2.begin(), timesteps_vec2.end());
+                        batched_timesteps_vec2.insert(batched_timesteps_vec2.end(), timesteps_vec2.begin(), timesteps_vec2.end());
+                        sd::Tensor<float> batched_timesteps_tensor2({static_cast<int64_t>(batched_timesteps_vec2.size())},
+                                                                    batched_timesteps_vec2);
+                        DiffusionParams diffusion_params2;
+                        diffusion_params2.x_backend = batched_noised_input2.get();
+                        diffusion_params2.timesteps = &batched_timesteps_tensor2;
+                        diffusion_params2.guidance  = &guidance_tensor2;
+                        diffusion_params2.context   = batched_cfg_condition.c_crossattn.empty() ? nullptr : &batched_cfg_condition.c_crossattn;
+                        diffusion_params2.y         = batched_cfg_condition.c_vector.empty() ? nullptr : &batched_cfg_condition.c_vector;
+                        model_output2 = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
+                        model_output2_is_batched_cfg = true;
+                    } else {
+                        auto run_second_condition = [&](const SDCondition& condition) -> std::unique_ptr<GgmlBackendTensorResource> {
+                            DiffusionParams diffusion_params2;
+                            diffusion_params2.x_backend = noised_input2.get();
+                            diffusion_params2.timesteps = &timesteps_tensor2;
+                            diffusion_params2.guidance  = &guidance_tensor2;
+                            diffusion_params2.context   = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                            diffusion_params2.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                            return work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
+                        };
+                        model_output2 = run_second_condition(cond);
+                        if (model_output2 != nullptr && !model_output2->empty() && !uncond.empty()) {
+                            separate_uncond_output2 = run_second_condition(uncond);
+                        }
+                    }
+                    if (model_output2 == nullptr || model_output2->empty() ||
+                        (!uncond.empty() && !model_output2_is_batched_cfg &&
+                         (separate_uncond_output2 == nullptr || separate_uncond_output2->empty()))) {
+                        LOG_ERROR("GPU RES 2S sampler backend path intermediate diffusion pass failed at step %d", i + 1);
+                        return nullptr;
+                    }
+                    unet_calls += model_output2_is_batched_cfg ? 1 : (uncond.empty() ? 1 : 2);
+                    auto denoised2 = make_cfg_denoised(*model_output2,
+                                                       separate_uncond_output2.get(),
+                                                       model_output2_is_batched_cfg,
+                                                       *x2,
+                                                       c_out2,
+                                                       c_skip2,
+                                                       "gpu_res_2s_denoised2");
+                    if (denoised2 == nullptr || denoised2->empty()) {
+                        LOG_ERROR("GPU RES 2S sampler backend path failed second denoised tensor at step %d", i + 1);
+                        return nullptr;
+                    }
+                    backend_post_graphs += 1;
+                    next_x = latent_runner.linear3(*x,
+                                                   1.0f - h * (b1 + b2),
+                                                   *denoised,
+                                                   h * b1,
+                                                   *denoised2,
+                                                   h * b2,
+                                                   n_threads,
+                                                   "gpu_res_2s_update");
+                }
+                if (next_x != nullptr && !next_x->empty() && sigma_next > 0.0f && sigma_up > 0.0f) {
+                    auto noise = make_step_noise(i, "gpu_res_2s_step_noise");
+                    if (noise == nullptr || noise->empty()) {
+                        LOG_ERROR("GPU RES 2S sampler backend path failed CUDA noise at step %d", i + 1);
+                        return nullptr;
+                    }
+                    next_x = latent_runner.add_scaled(*next_x,
+                                                      *noise,
+                                                      sigma_up,
+                                                      n_threads,
+                                                      "gpu_res_2s_add_noise");
+                }
+            } else if (method == ER_SDE_SAMPLE_METHOD) {
+                auto denoised = make_cfg_denoised(*model_output,
+                                                  separate_uncond_output.get(),
+                                                  model_output_is_batched_cfg,
+                                                  *x,
+                                                  c_out,
+                                                  c_skip,
+                                                  "gpu_er_sde_denoised");
+                if (denoised == nullptr || denoised->empty()) {
+                    LOG_ERROR("GPU ER-SDE sampler backend path failed denoised tensor at step %d", i + 1);
+                    return nullptr;
+                }
+                backend_post_graphs += 1;
+                if (sigma_next == 0.0f) {
+                    next_x = std::move(denoised);
+                } else {
+                    constexpr float num_integration_points = 200.0f;
+                    const int stage_used = std::min(3, i + 1);
+                    const float er_lambda_s = er_lambdas[i];
+                    const float er_lambda_t = er_lambdas[i + 1];
+                    if (er_lambda_s <= 0.0f || er_lambda_t <= 0.0f) {
+                        next_x = std::move(denoised);
+                    } else {
+                        const float alpha_s = sigma / er_lambda_s;
+                        const float alpha_t = sigma_next / er_lambda_t;
+                        const float r_alpha = alpha_t / alpha_s;
+                        const float scaled_s = er_noise_scaler(er_lambda_s);
+                        const float scaled_t = er_noise_scaler(er_lambda_t);
+                        const float r = scaled_s != 0.0f ? scaled_t / scaled_s : 0.0f;
+                        next_x = latent_runner.linear2(*x,
+                                                       r_alpha * r,
+                                                       *denoised,
+                                                       alpha_t * (1.0f - r),
+                                                       n_threads,
+                                                       "gpu_er_sde_base_update");
+                        if (next_x != nullptr && !next_x->empty() && stage_used >= 2 &&
+                            old_denoised != nullptr && !old_denoised->empty()) {
+                            const float dt = er_lambda_t - er_lambda_s;
+                            const float lambda_step_size = -dt / num_integration_points;
+                            float sum_inv_scaled = 0.0f;
+                            float sum_u_scaled = 0.0f;
+                            for (int point = 0; point < static_cast<int>(num_integration_points); ++point) {
+                                const float lambda_pos = er_lambda_t + static_cast<float>(point) * lambda_step_size;
+                                const float scaled_pos = er_noise_scaler(lambda_pos);
+                                if (scaled_pos != 0.0f) {
+                                    sum_inv_scaled += 1.0f / scaled_pos;
+                                    sum_u_scaled += (lambda_pos - er_lambda_s) / scaled_pos;
+                                }
+                            }
+                            const float s = sum_inv_scaled * lambda_step_size;
+                            auto denoised_d = latent_runner.linear2(*denoised,
+                                                                    1.0f / (er_lambda_s - er_lambdas[i - 1]),
+                                                                    *old_denoised,
+                                                                    -1.0f / (er_lambda_s - er_lambdas[i - 1]),
+                                                                    n_threads,
+                                                                    "gpu_er_sde_denoised_d");
+                            if (denoised_d == nullptr || denoised_d->empty()) {
+                                LOG_ERROR("GPU ER-SDE sampler backend path failed denoised derivative at step %d", i + 1);
+                                return nullptr;
+                            }
+                            backend_post_graphs += 1;
+                            next_x = latent_runner.add_scaled(*next_x,
+                                                              *denoised_d,
+                                                              alpha_t * (dt + s * scaled_t),
+                                                              n_threads,
+                                                              "gpu_er_sde_second_stage_update");
+                            if (next_x != nullptr && !next_x->empty() && stage_used >= 3 &&
+                                er_old_denoised_d != nullptr && !er_old_denoised_d->empty()) {
+                                const float denom = (er_lambda_s - er_lambdas[i - 2]) * 0.5f;
+                                if (denom != 0.0f) {
+                                    const float s_u = sum_u_scaled * lambda_step_size;
+                                    auto denoised_u = latent_runner.linear2(*denoised_d,
+                                                                            1.0f / denom,
+                                                                            *er_old_denoised_d,
+                                                                            -1.0f / denom,
+                                                                            n_threads,
+                                                                            "gpu_er_sde_denoised_u");
+                                    if (denoised_u == nullptr || denoised_u->empty()) {
+                                        LOG_ERROR("GPU ER-SDE sampler backend path failed denoised second derivative at step %d", i + 1);
+                                        return nullptr;
+                                    }
+                                    backend_post_graphs += 1;
+                                    next_x = latent_runner.add_scaled(*next_x,
+                                                                      *denoised_u,
+                                                                      alpha_t * ((dt * dt) * 0.5f + s_u * scaled_t),
+                                                                      n_threads,
+                                                                      "gpu_er_sde_third_stage_update");
+                                }
+                            }
+                            er_old_denoised_d = std::move(denoised_d);
+                        }
+                        if (next_x != nullptr && !next_x->empty() && s_noise > 0.0f) {
+                            const float variance = er_lambda_t * er_lambda_t - er_lambda_s * er_lambda_s * r * r;
+                            const float noise_scale = alpha_t * s_noise * std::sqrt(std::max(variance, 0.0f));
+                            if (noise_scale > 0.0f) {
+                                auto noise = make_step_noise(i, "gpu_er_sde_step_noise");
+                                if (noise == nullptr || noise->empty()) {
+                                    LOG_ERROR("GPU ER-SDE sampler backend path failed CUDA noise at step %d", i + 1);
+                                    return nullptr;
+                                }
+                                next_x = latent_runner.add_scaled(*next_x,
+                                                                  *noise,
+                                                                  noise_scale,
+                                                                  n_threads,
+                                                                  "gpu_er_sde_add_noise");
+                            }
+                        }
+                    }
+                }
+                old_denoised = std::move(denoised);
             } else {
                 const float dt = sigma_next - sigma;
                 auto denoised = make_cfg_denoised(*model_output,
@@ -8331,6 +8967,14 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
         plan.sample_method != DPMPP2S_A_SAMPLE_METHOD &&
         plan.sample_method != DPMPP2M_SAMPLE_METHOD &&
         plan.sample_method != DPMPP2Mv2_SAMPLE_METHOD &&
+        plan.sample_method != IPNDM_SAMPLE_METHOD &&
+        plan.sample_method != IPNDM_V_SAMPLE_METHOD &&
+        plan.sample_method != LCM_SAMPLE_METHOD &&
+        plan.sample_method != DDIM_TRAILING_SAMPLE_METHOD &&
+        plan.sample_method != TCD_SAMPLE_METHOD &&
+        plan.sample_method != RES_MULTISTEP_SAMPLE_METHOD &&
+        plan.sample_method != RES_2S_SAMPLE_METHOD &&
+        plan.sample_method != ER_SDE_SAMPLE_METHOD &&
         plan.sample_method != DPMPP_SDE_SAMPLE_METHOD &&
         plan.sample_method != DPMPP_SDE_GPU_SAMPLE_METHOD &&
         plan.sample_method != DPMPP2M_SDE_SAMPLE_METHOD &&
@@ -8339,7 +8983,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
         plan.sample_method != DPMPP2M_SDE_HEUN_GPU_SAMPLE_METHOD &&
         plan.sample_method != DPMPP3M_SDE_SAMPLE_METHOD &&
         plan.sample_method != DPMPP3M_SDE_GPU_SAMPLE_METHOD) {
-        LOG_ERROR("%s only supports Euler, Euler A, Heun, DPM2, DPM++ 2S A, DPM++ 2M, modified DPM++ 2M, DPM++ SDE, DPM++ 2M SDE, and DPM++ 3M SDE sampling", name);
+        LOG_ERROR("%s only supports the SDXL/SD1 k-diffusion sampler subset in the GPU backend path", name);
         return false;
     }
     if (sd_ctx->sd->is_flow_denoiser()) {
@@ -8586,8 +9230,30 @@ static bool sd_sample_latent_gpu_euler_backend_bridge(sd_ctx_t* sd_ctx,
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
     SamplePlan plan(sd_ctx, sd_img_gen_params, request);
-    if (plan.sample_method != EULER_SAMPLE_METHOD && plan.sample_method != HEUN_SAMPLE_METHOD) {
-        LOG_ERROR("GPU sampler backend bridge only supports Euler and Heun sampling");
+    if (plan.sample_method != EULER_SAMPLE_METHOD &&
+        plan.sample_method != EULER_A_SAMPLE_METHOD &&
+        plan.sample_method != HEUN_SAMPLE_METHOD &&
+        plan.sample_method != DPM2_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP2S_A_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP2M_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP2Mv2_SAMPLE_METHOD &&
+        plan.sample_method != IPNDM_SAMPLE_METHOD &&
+        plan.sample_method != IPNDM_V_SAMPLE_METHOD &&
+        plan.sample_method != LCM_SAMPLE_METHOD &&
+        plan.sample_method != DDIM_TRAILING_SAMPLE_METHOD &&
+        plan.sample_method != TCD_SAMPLE_METHOD &&
+        plan.sample_method != RES_MULTISTEP_SAMPLE_METHOD &&
+        plan.sample_method != RES_2S_SAMPLE_METHOD &&
+        plan.sample_method != ER_SDE_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP_SDE_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP_SDE_GPU_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP2M_SDE_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP2M_SDE_GPU_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP2M_SDE_HEUN_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP2M_SDE_HEUN_GPU_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP3M_SDE_SAMPLE_METHOD &&
+        plan.sample_method != DPMPP3M_SDE_GPU_SAMPLE_METHOD) {
+        LOG_ERROR("GPU sampler backend bridge only supports the SDXL/SD1 k-diffusion sampler subset");
         return false;
     }
     if (sd_ctx->sd->is_flow_denoiser()) {
