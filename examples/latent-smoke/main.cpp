@@ -100,7 +100,8 @@ static void usage(const char* argv0) {
         << "  --sample-without-init    run sampler with no init latent and skip VAE encode\n"
         << "  --gpu-sample-output      run sd_sample_latent_gpu and keep sampled latent as a GPU handle\n"
         << "  --true-gpu-sampler-spike run experimental backend-resident Euler sampler spike\n"
-        << "  --gpu-sampler-backend-euler use experimental Euler backend sampler through sd_sample_latent_gpu\n"
+        << "  --gpu-sampler-backend use experimental backend sampler through sd_sample_latent_gpu (Euler/Heun currently)\n"
+        << "  --gpu-sampler-backend-euler legacy alias for --gpu-sampler-backend\n"
         << "  --compare-gpu-sampler-backend-euler compare CPU sampler latent vs experimental Euler backend latent\n"
         << "  --gpu-init-sample-input  pass a GPU latent handle into the sampler init-latent bridge API\n"
         << "  --gpu-encode-output      call sd_encode_image_normal_gpu and keep encoded latent as a GPU handle\n"
@@ -236,7 +237,7 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.gpu_sample_output = true;
             args.sample = true;
             args.sample_without_init = true;
-        } else if (arg == "--gpu-sampler-backend-euler") {
+        } else if (arg == "--gpu-sampler-backend" || arg == "--gpu-sampler-backend-euler") {
             args.gpu_sampler_backend_euler = true;
             args.gpu_sample_output = true;
             args.sample = true;
@@ -897,7 +898,7 @@ int main(int argc, char** argv) {
         set_env_value("SDCPP_EXPERIMENTAL_TRUE_GPU_SAMPLER", "1");
     }
     if (args.gpu_sampler_backend_euler) {
-        set_env_value("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER", "1");
+        set_env_value("SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND", "1");
     }
     sd_set_log_callback(sd_log_cb, nullptr);
 
