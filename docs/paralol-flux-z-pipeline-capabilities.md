@@ -157,6 +157,13 @@ parameters in RAM and temporarily executes the text encoder on the GPU during
 conditioning encode, while keeping the diffusion model, sampled latent, and VAE
 handoff on the GPU.
 
+When `sd_sample_latent_gpu_with_conditioning()` enters the Flux2 backend lane,
+the fork automatically releases text encoder params after resident conditioning
+handles are accepted and before the diffusion loop starts. Set
+`SDCPP_DISABLE_FLUX2_AUTO_RELEASE_TEXT_ENCODER=1` only for debugging. The timing
+line reports `text_encoder_released_before_diffusion` and
+`text_encoder_release_ms`.
+
 Flux2 uses a 128-channel diffusion latent and a separate Flux2 VAE mean/std
 transform. The fork represents that transform as a small backend graph before
 staged COMFY_NORMAL decode, so the VAE handoff remains device-resident.

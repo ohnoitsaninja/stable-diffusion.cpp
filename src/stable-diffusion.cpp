@@ -9474,6 +9474,20 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
                   negative_condition_device ? "true" : "false");
         return false;
     }
+    int64_t text_encoder_release_ms = 0;
+    bool text_encoder_released = false;
+    if (is_flux2_flow_backend &&
+        use_conditioning_handles &&
+        conditioning_device_resident &&
+        !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_FLUX2_AUTO_RELEASE_TEXT_ENCODER")) {
+        const int64_t release_start = ggml_time_ms();
+        text_encoder_released = sd_release_clip_model_params(sd_ctx);
+        text_encoder_release_ms = ggml_time_ms() - release_start;
+        LOG_INFO("%s Flux2 backend released text encoder params before diffusion: released=%s release_ms=%" PRId64,
+                 name,
+                 text_encoder_released ? "true" : "false",
+                 text_encoder_release_ms);
+    }
 
     int64_t init_start = ggml_time_ms();
     LatentBackendGraphRunner latent_runner(sd_ctx->sd->backend);
@@ -9611,11 +9625,13 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     }
     *out_gpu_latent = handle;
     int64_t t1 = ggml_time_ms();
-    LOG_INFO("[Timing] %s latent_prepare_ms=%" PRId64 " %s_ms=%" PRId64 " init_backend_ms=%" PRId64 " denoise_ms=%" PRId64 " total_ms=%" PRId64 " sampler_math_residency=gpu_backend_tensor init_latent=%s init_bridge_download=false output_bridge_upload=false condition_input=%s conditioning_storage=%s conditioning_per_step_upload=%s",
+    LOG_INFO("[Timing] %s latent_prepare_ms=%" PRId64 " %s_ms=%" PRId64 " text_encoder_release_ms=%" PRId64 " text_encoder_released_before_diffusion=%s init_backend_ms=%" PRId64 " denoise_ms=%" PRId64 " total_ms=%" PRId64 " sampler_math_residency=gpu_backend_tensor init_latent=%s init_bridge_download=false output_bridge_upload=false condition_input=%s conditioning_storage=%s conditioning_per_step_upload=%s",
              name,
              latent_prepare_end - latent_prepare_start,
              use_conditioning_handles ? "condition_bind" : "prompt_encode",
              condition_end - condition_start,
+             text_encoder_release_ms,
+             text_encoder_released ? "true" : "false",
              init_end - init_start,
              sampling_end - sampling_start,
              t1 - t0,
