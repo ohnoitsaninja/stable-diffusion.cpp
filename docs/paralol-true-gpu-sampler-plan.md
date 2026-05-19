@@ -45,8 +45,8 @@ Strict mode refuses bridge fallbacks and allows only the true path.
 ## Implemented status
 
 The fork now has the first backend-resident sampler seam for several SDXL/SD1
-deterministic k-diffusion samplers. It remains env-gated and narrow, but it is
-no longer only a proof API.
+k-diffusion samplers, including ancestral and DPM++ SDE variants. It remains
+env-gated and narrow, but it is no longer only a proof API.
 
 Two env-gated paths exist:
 
@@ -58,8 +58,8 @@ Two env-gated paths exist:
   Gaussian noise instead of production Philox, so it proves residency, not
   image parity.
 - `SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1` changes the SDXL/SD1 GPU sampler
-  APIs to use a backend tensor sampler loop for supported deterministic
-  k-diffusion methods. T2I creates Philox
+  APIs to use a backend tensor sampler loop for supported k-diffusion methods.
+  T2I creates Philox
   Gaussian noise on CUDA, scales it on the backend, and keeps per-step latent
   state and sampler math on the backend. I2I validates the CUDA init latent,
   copies it device-to-device into the sampler backend, creates matching CUDA
@@ -83,27 +83,38 @@ Euler, 8 steps, CFG 1.2:
 - strict mode allows the experimental path when the descriptor has flags `4`
   (`SAMPLER_OUTPUT`) and no CPU bridge flags
 
-The next deterministic sampler ports are Heun, DPM2, DPM++ 2M, and modified
-DPM++ 2M. Bounded SDXL 512, 2-step, strict GPU-resident smokes with conditioning
-handles completed through `sd_sample_latent_gpu_with_conditioning(...)` using:
+The next sampler ports are Heun, DPM2, DPM++ 2M, modified DPM++ 2M, Euler A,
+DPM++ 2S ancestral, and the DPM++ SDE family. Bounded SDXL 512, 2-step, strict
+GPU-resident smokes with conditioning handles completed through
+`sd_sample_latent_gpu_with_conditioning(...)` using:
 
 - `--sampling-method euler`
+- `--sampling-method euler_a`
 - `--sampling-method heun`
 - `--sampling-method dpm2`
+- `--sampling-method dpm++2s_a`
 - `--sampling-method dpm++2m`
 - `--sampling-method dpm++2mv2`
+- `--sampling-method dpmpp_sde`
+- `--sampling-method dpmpp_sde_gpu`
+- `--sampling-method dpmpp_2m_sde`
+- `--sampling-method dpmpp_2m_sde_heun`
+- `--sampling-method dpmpp_3m_sde`
+- `--sampling-method dpmpp_3m_sde_gpu`
 
 For each smoke:
 
 - sampler math stayed `gpu_backend_tensor`
 - output handle was a CUDA latent with `SAMPLER_OUTPUT` and no CPU bridge flags
 - CFG used the same batch-2 UNet path as Euler
+- stochastic/ancestral paths generated step noise as CUDA Philox tensors
 - no VAE decode was required for the smoke
 
 This proves the sampler-loop/backend-tensor refactor is feasible beyond Euler.
 It is not a global sampler implementation: the path is env-gated and currently
-limited to Euler, Heun, DPM2, DPM++ 2M, and modified DPM++ 2M, batch 1, no
-masks, no ControlNet, no reference/edit/image-CFG paths, and non-flow denoisers.
+limited to Euler, Euler A, Heun, DPM2, DPM++ 2S A, DPM++ 2M, modified
+DPM++ 2M, DPM++ SDE, DPM++ 2M SDE, and DPM++ 3M SDE, batch 1, no masks, no
+ControlNet, no reference/edit/image-CFG paths, and non-flow denoisers.
 
 ## CFG and UNet conv update
 
@@ -215,8 +226,9 @@ For SDXL 1024:
 Those conditions are now met for the env-gated SDXL/SD1 Euler T2I path, the
 env-gated SDXL/SD1 Euler I2I path where the init latent is already an
 `SD_GPU_RESOURCE_LATENT`, and first strict T2I backend smokes for Heun, DPM2,
-DPM++ 2M, and modified DPM++ 2M. Paralol should continue treating unsupported
-samplers, model families, masks, ControlNet, reference/edit/image-CFG paths,
-and requests without `SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1` as bridge paths
-only. The newly added samplers should be promoted through the same full T2I/I2I
-parity matrix as Euler before Paralol exposes them as equally production-ready.
+DPM++ 2M, modified DPM++ 2M, Euler A, DPM++ 2S A, and the DPM++ SDE family.
+Paralol should continue treating unsupported samplers, model families, masks,
+ControlNet, reference/edit/image-CFG paths, and requests without
+`SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1` as bridge paths only. The newly added
+samplers should be promoted through the same full T2I/I2I parity matrix as
+Euler before Paralol exposes them as equally production-ready.

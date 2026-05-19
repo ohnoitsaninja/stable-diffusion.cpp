@@ -100,7 +100,7 @@ static void usage(const char* argv0) {
         << "  --sample-without-init    run sampler with no init latent and skip VAE encode\n"
         << "  --gpu-sample-output      run sd_sample_latent_gpu and keep sampled latent as a GPU handle\n"
         << "  --true-gpu-sampler-spike run experimental backend-resident Euler sampler spike\n"
-        << "  --gpu-sampler-backend use experimental backend sampler through sd_sample_latent_gpu (Euler/Heun/DPM2/DPM++2M currently)\n"
+        << "  --gpu-sampler-backend use experimental backend sampler through sd_sample_latent_gpu (Euler/DPM++/SDE subset)\n"
         << "  --gpu-sampler-backend-euler legacy alias for --gpu-sampler-backend\n"
         << "  --compare-gpu-sampler-backend-euler compare CPU sampler latent vs experimental Euler backend latent\n"
         << "  --gpu-init-sample-input  pass a GPU latent handle into the sampler init-latent bridge API\n"
