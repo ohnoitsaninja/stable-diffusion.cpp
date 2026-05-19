@@ -149,6 +149,14 @@ batch 1, Euler, cfg `1.0`, Qwen conditioning handles, no ControlNet, no masks,
 no reference/edit/multibatch, and no image-CFG. Unsupported requests fail closed
 in `SDCPP_STRICT_GPU_RESIDENT=1`.
 
+For 16 GB CUDA cards, use `SDCPP_FLUX2_TEXT_ENCODER_CPU_PARAMS=1` for this
+lane. Flux2 Klein 4B plus Qwen 4B plus the Flux2 VAE can otherwise occupy about
+15 GB before compute buffers, which leaves too little room for the Qwen and
+Flux graphs and can trigger Windows GPU memory paging. This flag keeps Qwen
+parameters in RAM and temporarily executes the text encoder on the GPU during
+conditioning encode, while keeping the diffusion model, sampled latent, and VAE
+handoff on the GPU.
+
 Flux2 uses a 128-channel diffusion latent and a separate Flux2 VAE mean/std
 transform. The fork represents that transform as a small backend graph before
 staged COMFY_NORMAL decode, so the VAE handoff remains device-resident.
@@ -204,12 +212,14 @@ The strict backend smoke uses:
 ```powershell
 $env:SDCPP_EXPERIMENTAL_FLUX2_BACKEND=1
 $env:SDCPP_STRICT_GPU_RESIDENT=1
+$env:SDCPP_FLUX2_TEXT_ENCODER_CPU_PARAMS=1
 build\codex\bin\sd-latent-smoke.exe `
   --diffusion-model F:\automatic1111\Stability\Models\DiffusionModels\flux-2-klein-4b-fp8.safetensors `
   --vae F:\automatic1111\Stability\Models\VAE\flux2-vae.safetensors `
   --llm F:\automatic1111\Stability\Models\TextEncoders\Qwen3-4B-Q5_K_M.gguf `
   --image F:\Paralol\examples\orc.png `
   --sample-without-init --gpu-sample-output --gpu-flow-sampler `
+  --flux2-text-encoder-cpu-params `
   --condition-handles --strict-gpu-resident `
   --steps 4 --cfg-scale 1.0 --sampling-method euler --width 512 --height 512 `
   --skip-estimate --gpu-latent-decode-input --gpu-decode-output `

@@ -48,6 +48,7 @@ struct Args {
     bool true_gpu_sampler_spike = false;
     bool gpu_sampler_backend_euler = false;
     bool gpu_flow_sampler = false;
+    bool flux2_text_encoder_cpu_params = false;
     bool compare_gpu_sampler_backend_euler = false;
     bool gpu_init_sample_input = false;
     bool gpu_encode_output = false;
@@ -62,6 +63,7 @@ struct Args {
     bool download_gpu_output_buffer = false;
     bool condition_handles = false;
     bool condition_handles_reuse = false;
+    bool release_text_encoder_after_conditioning = false;
     bool strict_gpu_resident = false;
     bool dump_gpu_handle_desc = false;
     bool expect_gpu_encode_refusal = false;
@@ -105,6 +107,7 @@ static void usage(const char* argv0) {
         << "  --true-gpu-sampler-spike run experimental backend-resident Euler sampler spike\n"
         << "  --gpu-sampler-backend use experimental backend sampler through sd_sample_latent_gpu (SDXL/SD1 sampler subset)\n"
         << "  --gpu-flow-sampler   enable env-gated Flux2 backend flow sampler lane\n"
+        << "  --flux2-text-encoder-cpu-params keep Flux2 Qwen params in RAM and execute on GPU only during encode\n"
         << "  --gpu-sampler-backend-euler legacy alias for --gpu-sampler-backend\n"
         << "  --compare-gpu-sampler-backend-euler compare CPU sampler latent vs experimental Euler backend latent\n"
         << "  --gpu-init-sample-input  pass a GPU latent handle into the sampler init-latent bridge API\n"
@@ -123,6 +126,7 @@ static void usage(const char* argv0) {
         << "  --condition-handles      encode prompt/negative into resident conditioning handles and sample with them\n"
         << "                           combine with --gpu-init-sample-input to test I2I conditioning-handle sampler bridge\n"
         << "  --condition-handles-reuse sample twice with the same conditioning handles to prove CLIP encode is not rerun\n"
+        << "  --release-text-encoder-after-conditioning release text encoder params after conditioning handles are resident\n"
         << "  --import-noise-npy <path> import f32 NCHW noise .npy as a GPU latent for parity/debug sampling\n"
         << "  --strict-gpu-resident    set SDCPP_STRICT_GPU_RESIDENT=1 for GPU-output checks\n"
         << "  --dump-gpu-handle-desc   print GPU handle descriptor after decode\n"
@@ -255,6 +259,8 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.gpu_sample_output = true;
             args.sample = true;
             args.sample_without_init = true;
+        } else if (arg == "--flux2-text-encoder-cpu-params") {
+            args.flux2_text_encoder_cpu_params = true;
         } else if (arg == "--compare-gpu-sampler-backend-euler") {
             args.compare_gpu_sampler_backend_euler = true;
             args.gpu_sampler_backend_euler = true;
@@ -304,6 +310,8 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.gpu_sample_output = true;
             args.sample = true;
             args.sample_without_init = true;
+        } else if (arg == "--release-text-encoder-after-conditioning") {
+            args.release_text_encoder_after_conditioning = true;
         } else if (arg == "--import-noise-npy") {
             const char* value = need_value("--import-noise-npy");
             if (value == nullptr) return false;
@@ -931,6 +939,9 @@ int main(int argc, char** argv) {
     if (args.gpu_flow_sampler) {
         set_env_value("SDCPP_EXPERIMENTAL_FLUX2_BACKEND", "1");
     }
+    if (args.flux2_text_encoder_cpu_params) {
+        set_env_value("SDCPP_FLUX2_TEXT_ENCODER_CPU_PARAMS", "1");
+    }
     sd_set_log_callback(sd_log_cb, nullptr);
 
     PreviewCapture preview_capture;
@@ -1236,6 +1247,23 @@ int main(int argc, char** argv) {
                 return 1;
             }
             print_conditioning_desc(ctx, "negative_condition", negative_condition);
+
+            if (args.release_text_encoder_after_conditioning) {
+                const auto release_start = std::chrono::steady_clock::now();
+                if (!sd_release_clip_model_params(ctx)) {
+                    std::cerr << "sd_release_clip_model_params failed\n";
+                    sd_conditioning_release(ctx, positive_condition);
+                    sd_conditioning_release(ctx, negative_condition);
+                    if (ref_image.data != nullptr) free(ref_image.data);
+                    if (encoded != nullptr) free_sd_latent(encoded);
+                    free_sd_ctx(ctx);
+                    return 1;
+                }
+                const auto release_end = std::chrono::steady_clock::now();
+                std::cout << "released_text_encoder_after_conditioning=true release_ms="
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(release_end - release_start).count()
+                          << "\n";
+            }
 
             if (!args.import_noise_npy.empty()) {
                 imported_noise_gpu = upload_noise_npy_as_gpu_latent(ctx, args.import_noise_npy);

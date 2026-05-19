@@ -1509,8 +1509,14 @@ public:
                                                                   sd_ctx_params->chroma_use_dit_mask);
                 } else if (sd_version_is_flux2(version)) {
                     bool is_chroma   = false;
+                    const bool flux2_text_encoder_cpu_params =
+                        env_flag_enabled("SDCPP_FLUX2_TEXT_ENCODER_CPU_PARAMS") ||
+                        env_flag_enabled("SDCPP_FLUX2_QWEN_CPU_PARAMS");
+                    if (flux2_text_encoder_cpu_params && !ggml_backend_is_cpu(clip_backend)) {
+                        LOG_INFO("Flux2 text encoder: keeping Qwen/LLM params in RAM with GPU runtime execution; unset SDCPP_FLUX2_TEXT_ENCODER_CPU_PARAMS to keep them resident in VRAM");
+                    }
                     cond_stage_model = std::make_shared<LLMEmbedder>(clip_backend,
-                                                                     offload_params_to_cpu,
+                                                                     offload_params_to_cpu || flux2_text_encoder_cpu_params,
                                                                      tensor_storage_map,
                                                                      version);
                     diffusion_model  = std::make_shared<FluxModel>(backend,
