@@ -28,6 +28,7 @@ struct Args {
     std::string output = "latent_smoke.png";
     std::string prompt = "a detailed fantasy orc portrait, high quality";
     std::string negative_prompt = "blurry, low quality, noisy";
+    std::string model_family;
     std::string sampling_method;
     int image_channels = 4;
     int width          = 0;
@@ -46,6 +47,7 @@ struct Args {
     bool gpu_sample_output = false;
     bool true_gpu_sampler_spike = false;
     bool gpu_sampler_backend_euler = false;
+    bool gpu_flow_sampler = false;
     bool compare_gpu_sampler_backend_euler = false;
     bool gpu_init_sample_input = false;
     bool gpu_encode_output = false;
@@ -85,6 +87,7 @@ static void usage(const char* argv0) {
         << "  --output <path>          decoded output path (default: latent_smoke.png)\n"
         << "  --prompt <text>          prompt for sampler smoke\n"
         << "  --negative-prompt <text> negative prompt for sampler smoke\n"
+        << "  --model-family <name>   optional expected family label for capability checks, e.g. flux2\n"
         << "  --steps <int>            sampler steps override\n"
         << "  --cfg-scale <float>      text/image CFG override\n"
         << "  --sampling-method <name> sampler method override\n"
@@ -101,6 +104,7 @@ static void usage(const char* argv0) {
         << "  --gpu-sample-output      run sd_sample_latent_gpu and keep sampled latent as a GPU handle\n"
         << "  --true-gpu-sampler-spike run experimental backend-resident Euler sampler spike\n"
         << "  --gpu-sampler-backend use experimental backend sampler through sd_sample_latent_gpu (SDXL/SD1 sampler subset)\n"
+        << "  --gpu-flow-sampler   enable env-gated Flux2 backend flow sampler lane\n"
         << "  --gpu-sampler-backend-euler legacy alias for --gpu-sampler-backend\n"
         << "  --compare-gpu-sampler-backend-euler compare CPU sampler latent vs experimental Euler backend latent\n"
         << "  --gpu-init-sample-input  pass a GPU latent handle into the sampler init-latent bridge API\n"
@@ -192,6 +196,10 @@ static bool parse_args(int argc, char** argv, Args& args) {
             const char* value = need_value("--negative-prompt");
             if (value == nullptr) return false;
             args.negative_prompt = value;
+        } else if (arg == "--model-family") {
+            const char* value = need_value("--model-family");
+            if (value == nullptr) return false;
+            args.model_family = value;
         } else if (arg == "--steps") {
             const char* value = need_value("--steps");
             if (value == nullptr) return false;
@@ -239,6 +247,11 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.sample_without_init = true;
         } else if (arg == "--gpu-sampler-backend" || arg == "--gpu-sampler-backend-euler") {
             args.gpu_sampler_backend_euler = true;
+            args.gpu_sample_output = true;
+            args.sample = true;
+            args.sample_without_init = true;
+        } else if (arg == "--gpu-flow-sampler") {
+            args.gpu_flow_sampler = true;
             args.gpu_sample_output = true;
             args.sample = true;
             args.sample_without_init = true;
@@ -827,6 +840,17 @@ static void print_model_capabilities(sd_ctx_t* ctx) {
               << " edit_reference_conditioning=" << (caps.supports_edit_reference_conditioning ? "true" : "false")
               << " comfy_reference_vae_encode=" << (caps.supports_comfy_reference_vae_encode ? "true" : "false")
               << " strict_sampler_true_resident=" << (caps.strict_gpu_sample_is_true_resident ? "true" : "false")
+              << " flux2_model_load=" << (caps.supports_flux2_model_load ? "true" : "false")
+              << " flux2_qwen_conditioning=" << (caps.supports_flux2_qwen_conditioning ? "true" : "false")
+              << " flux2_qwen_conditioning_gpu=" << (caps.supports_flux2_qwen_conditioning_gpu_resident ? "true" : "false")
+              << " flux2_flow_backend_sampler=" << (caps.supports_flux2_flow_backend_sampler ? "true" : "false")
+              << " flux2_gpu_latent_output=" << (caps.supports_flux2_gpu_latent_output ? "true" : "false")
+              << " flux2_vae_decode_gpu=" << (caps.supports_flux2_vae_decode_gpu ? "true" : "false")
+              << " flux2_controlnet=" << (caps.supports_flux2_controlnet ? "true" : "false")
+              << " flux2_masks=" << (caps.supports_flux2_masks ? "true" : "false")
+              << " flux2_reference=" << (caps.supports_flux2_reference ? "true" : "false")
+              << " flux2_edit=" << (caps.supports_flux2_edit ? "true" : "false")
+              << " flux2_multibatch=" << (caps.supports_flux2_multibatch ? "true" : "false")
               << "\n";
 }
 
@@ -843,6 +867,10 @@ static void print_gpu_capabilities(sd_ctx_t* ctx) {
               << " sampler_gpu_init=" << (caps.supports_sampler_gpu_init_latent_input ? "true" : "false")
               << " sampler_gpu_init_bridge=" << (caps.supports_sampler_gpu_init_latent_bridge_input ? "true" : "false")
               << " vae_gpu_latent_input=" << (caps.supports_vae_gpu_latent_input ? "true" : "false")
+              << " flux2_gpu_output=" << (caps.supports_flux2_gpu_latent_output ? "true" : "false")
+              << " flux2_flow_sampler=" << (caps.supports_flux2_flow_backend_sampler ? "true" : "false")
+              << " flux2_vae_decode_gpu=" << (caps.supports_flux2_vae_decode_gpu ? "true" : "false")
+              << " flux2_qwen_conditioning_gpu=" << (caps.supports_flux2_qwen_conditioning_gpu_resident ? "true" : "false")
               << " gpu_download=" << (caps.supports_gpu_download ? "true" : "false")
               << "\n";
 }
@@ -900,6 +928,9 @@ int main(int argc, char** argv) {
     if (args.gpu_sampler_backend_euler) {
         set_env_value("SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND", "1");
     }
+    if (args.gpu_flow_sampler) {
+        set_env_value("SDCPP_EXPERIMENTAL_FLUX2_BACKEND", "1");
+    }
     sd_set_log_callback(sd_log_cb, nullptr);
 
     PreviewCapture preview_capture;
@@ -937,6 +968,18 @@ int main(int argc, char** argv) {
     }
     print_model_capabilities(ctx);
     print_gpu_capabilities(ctx);
+    if (!args.model_family.empty()) {
+        sd_model_pipeline_capabilities_t expected_caps{};
+        if (!sd_get_model_pipeline_capabilities(ctx, &expected_caps) ||
+            args.model_family != expected_caps.family_name) {
+            std::cerr << "--model-family expected " << args.model_family
+                      << " but context reported "
+                      << (expected_caps.family_name[0] != '\0' ? expected_caps.family_name : "<unknown>")
+                      << "\n";
+            free_sd_ctx(ctx);
+            return 1;
+        }
+    }
 
     sd_image_t image{};
     if (!load_sd_image_from_file(&image, args.image.c_str(), 0, 0, args.image_channels)) {

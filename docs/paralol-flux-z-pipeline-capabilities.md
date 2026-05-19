@@ -137,10 +137,21 @@ The Flux.1 non-strict init-latent bridge path was also validated at 512:
 Flux2 Klein 4B can render through the existing CLI path with split
 `--diffusion-model`, `--vae`, and `--llm` arguments.
 
-Flux2 is also exposed through the GPU latent -> GPU VAE decode path. It uses a
-128-channel diffusion latent and a separate Flux2 VAE mean/std transform. The
-fork represents that transform as a small backend graph before staged
-COMFY_NORMAL decode, so the handoff remains device-resident.
+Flux2 is exposed through two different lanes:
+
+- the existing broad compatibility lane, which may use older bridge/fallback
+  behavior depending on the API call;
+- the first strict GPU-resident T2I lane, gated by
+  `SDCPP_EXPERIMENTAL_FLUX2_BACKEND=1`.
+
+The strict lane is intentionally narrow: Flux2/Flux2 Klein, text-to-image only,
+batch 1, Euler, cfg `1.0`, Qwen conditioning handles, no ControlNet, no masks,
+no reference/edit/multibatch, and no image-CFG. Unsupported requests fail closed
+in `SDCPP_STRICT_GPU_RESIDENT=1`.
+
+Flux2 uses a 128-channel diffusion latent and a separate Flux2 VAE mean/std
+transform. The fork represents that transform as a small backend graph before
+staged COMFY_NORMAL decode, so the VAE handoff remains device-resident.
 
 Validated with:
 
@@ -155,32 +166,61 @@ Validated with:
 - CFG: `1.0`
 - Sampler/scheduler: `euler` / `discrete`
 
-Observed API handoff:
+Observed strict Flux2 backend handoff at 512x512:
 
 - `family_name=flux2`
 - `latent_channels=128`
 - `vae_scale_factor=16`
-- `supports_reference_images=true`
-- `supports_edit_mode=true`
-- `supports_edit_reference_conditioning=true`
-- `supports_comfy_reference_vae_encode=true`
-- `supports_gpu_sample_bridge_output=true`
+- `supports_flux2_model_load=true`
+- `supports_flux2_qwen_conditioning=true`
+- `supports_flux2_qwen_conditioning_gpu_resident=true`
+- `supports_flux2_flow_backend_sampler=true`
+- `supports_flux2_gpu_latent_output=true`
+- `supports_flux2_vae_decode_gpu=true`
+- `supports_flux2_controlnet=false`
+- `supports_flux2_masks=false`
+- `supports_flux2_reference=false`
+- `supports_flux2_edit=false`
+- `supports_flux2_multibatch=false`
 - `supports_gpu_latent_decode=true`
 - `supports_gpu_image_output=true`
-- sampled GPU latent: `1x128x64x64`, f32, CUDA, 2,097,152 bytes
-- VAE decode output: `1x3x1024x1024`, f32, CUDA
+- conditioning handles: CUDA device-resident Qwen cross-attention tensors
+- conditioning per-step upload: false
+- sampled GPU latent: `1x128x32x32`, f32, CUDA, 524,288 bytes
+- sampler math residency: `gpu_backend_tensor`
+- sampler bridge flags: none
+- VAE decode output: `1x3x512x512`, f32, CUDA
 - COMFY_NORMAL VAE decode: supported
 - implicit-GEMM conv: enabled
 - tiled VAE: false
 - TAESD: false
 - IM2COL: false
 - stage host copies: 0
-- planned workspace: 2816 MB
-- decode time: about 0.8 seconds on the local 4080 Super
+- planned workspace: 352 MB
+- explicit caller-owned image download: supported
 
-The output image was coherent in the API smoke:
+The strict backend smoke uses:
 
-`C:\tmp\stable-diffusion.cpp-paralol\build\flux-z-verification\flux2-gpu-handoff-1024.png`
+```powershell
+$env:SDCPP_EXPERIMENTAL_FLUX2_BACKEND=1
+$env:SDCPP_STRICT_GPU_RESIDENT=1
+build\codex\bin\sd-latent-smoke.exe `
+  --diffusion-model F:\automatic1111\Stability\Models\DiffusionModels\flux-2-klein-4b-fp8.safetensors `
+  --vae F:\automatic1111\Stability\Models\VAE\flux2-vae.safetensors `
+  --llm F:\automatic1111\Stability\Models\TextEncoders\Qwen3-4B-Q5_K_M.gguf `
+  --image F:\Paralol\examples\orc.png `
+  --sample-without-init --gpu-sample-output --gpu-flow-sampler `
+  --condition-handles --strict-gpu-resident `
+  --steps 4 --cfg-scale 1.0 --sampling-method euler --width 512 --height 512 `
+  --skip-estimate --gpu-latent-decode-input --gpu-decode-output `
+  --download-gpu-output-buffer --dump-gpu-handle-desc
+```
+
+Current limitation: on this local GGUF Qwen/fp8 Klein setup, a 512x512 4-step
+strict run is functionally correct but slow, roughly one minute per flow step.
+That is backend Flux2 throughput work, not a CPU bridge or VAE handoff issue.
+The structured timing logs identify `denoise_ms` separately from conditioning
+and VAE decode.
 
 ## Flux2 Edit / Reference Conditioning
 

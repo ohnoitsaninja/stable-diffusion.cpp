@@ -3283,6 +3283,7 @@ public:
             LOG_ERROR("GPU sampler backend path requires a diffusion model, initial backend latent, and sigmas");
             return nullptr;
         }
+        const bool is_flow = is_flow_denoiser();
         if (method != EULER_SAMPLE_METHOD &&
             method != EULER_A_SAMPLE_METHOD &&
             method != HEUN_SAMPLE_METHOD &&
@@ -3307,6 +3308,10 @@ public:
             method != DPMPP3M_SDE_SAMPLE_METHOD &&
             method != DPMPP3M_SDE_GPU_SAMPLE_METHOD) {
             LOG_ERROR("GPU sampler backend path only supports SDXL/SD1 k-diffusion sampler methods in this pass");
+            return nullptr;
+        }
+        if (is_flow && method != EULER_SAMPLE_METHOD) {
+            LOG_ERROR("GPU sampler backend flow path currently supports Euler only");
             return nullptr;
         }
         if (method == DPMPP_SDE_SAMPLE_METHOD || method == DPMPP_SDE_GPU_SAMPLE_METHOD) {
@@ -3339,9 +3344,15 @@ public:
             LOG_ERROR("GPU sampler backend path only supports plain SDXL/SD1-style text conditioning");
             return nullptr;
         }
-        if (is_flow_denoiser()) {
-            LOG_ERROR("GPU sampler backend path does not support flow denoisers yet");
-            return nullptr;
+        if (is_flow) {
+            if (!uncond.empty() || guidance.txt_cfg != 1.0f || guidance.img_cfg != guidance.txt_cfg) {
+                LOG_ERROR("GPU sampler backend Flux2 flow path currently supports distilled cfg=1 text conditioning only");
+                return nullptr;
+            }
+            if (eta != 0.0f) {
+                LOG_ERROR("GPU sampler backend Flux2 flow path currently supports eta=0 Euler only");
+                return nullptr;
+            }
         }
 
         class ScopedUnetConvDirect {
@@ -7086,6 +7097,8 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     return embeds;
 }
 
+static bool sd_experimental_flux2_backend_enabled();
+
 static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
                                                          const sd_img_gen_params_t* sd_img_gen_params,
                                                          const sd_latent_t* init_latent,
@@ -7093,12 +7106,17 @@ static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr) {
         return false;
     }
-    if (!sd_version_is_sd1(sd_ctx->sd->version) && !sd_version_is_sdxl(sd_ctx->sd->version)) {
-        LOG_ERROR("conditioning handle sampler currently supports SD1/SDXL text-only UNet models only");
+    const bool is_sd_text = sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version);
+    const bool is_flux2_backend_text =
+        sd_version_is_flux2(sd_ctx->sd->version) &&
+        sd_ctx->sd->is_flow_denoiser() &&
+        sd_experimental_flux2_backend_enabled();
+    if (!is_sd_text && !is_flux2_backend_text) {
+        LOG_ERROR("conditioning handle sampler currently supports SD1/SDXL text-only models or env-gated Flux2 text-only flow models");
         return false;
     }
-    if (sd_version_is_inpaint_or_unet_edit(sd_ctx->sd->version) || sd_ctx->sd->is_flow_denoiser()) {
-        LOG_ERROR("conditioning handle sampler does not support inpaint/edit/flow model conditioning yet");
+    if (sd_version_is_inpaint_or_unet_edit(sd_ctx->sd->version) || (sd_ctx->sd->is_flow_denoiser() && !is_flux2_backend_text)) {
+        LOG_ERROR("conditioning handle sampler does not support inpaint/edit/unsupported flow model conditioning yet");
         return false;
     }
     if (sd_img_gen_params->init_image.data != nullptr ||
@@ -7116,6 +7134,16 @@ static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
     if (request.batch_count != 1) {
         LOG_ERROR("conditioning handle sampler currently supports batch_count=1, got %d", request.batch_count);
         return false;
+    }
+    if (is_flux2_backend_text) {
+        if (init_latent != nullptr) {
+            LOG_ERROR("conditioning handle Flux2 backend sampler currently supports T2I only");
+            return false;
+        }
+        if (request.guidance.txt_cfg != 1.0f || request.guidance.img_cfg != request.guidance.txt_cfg) {
+            LOG_ERROR("conditioning handle Flux2 backend sampler currently supports distilled cfg=1 only");
+            return false;
+        }
     }
     return true;
 }
@@ -7946,6 +7974,17 @@ static bool sd_strict_gpu_resident_enabled() {
 static bool sd_experimental_gpu_sampler_backend_enabled() {
     return StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND") ||
            StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER");
+}
+
+static bool sd_experimental_flux2_backend_enabled() {
+    return StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_FLUX2_BACKEND");
+}
+
+static bool sd_experimental_sampler_backend_dispatch_enabled(sd_ctx_t* sd_ctx) {
+    if (sd_ctx != nullptr && sd_ctx->sd != nullptr && sd_version_is_flux2(sd_ctx->sd->version)) {
+        return sd_experimental_flux2_backend_enabled();
+    }
+    return sd_experimental_gpu_sampler_backend_enabled();
 }
 
 static bool sd_experimental_vae_same_context_decode_enabled() {
@@ -9066,7 +9105,7 @@ SD_API bool sd_sample_latent_gpu_with_conditioning(sd_ctx_t* sd_ctx,
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr || out_gpu_latent == nullptr) {
         return false;
     }
-    if (init_latent == nullptr && sd_experimental_gpu_sampler_backend_enabled()) {
+    if (init_latent == nullptr && sd_experimental_sampler_backend_dispatch_enabled(sd_ctx)) {
         if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
                                                     sd_img_gen_params,
                                                     0,
@@ -9254,8 +9293,14 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr || out_gpu_latent == nullptr) {
         return false;
     }
-    if (!StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER") &&
-        !StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND")) {
+    const bool is_flux2_backend = sd_version_is_flux2(sd_ctx->sd->version);
+    if (is_flux2_backend) {
+        if (!sd_experimental_flux2_backend_enabled()) {
+            LOG_ERROR("%s requires SDCPP_EXPERIMENTAL_FLUX2_BACKEND=1 for Flux2 backend flow sampling", name);
+            return false;
+        }
+    } else if (!StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER") &&
+               !StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND")) {
         LOG_ERROR("%s requires SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1 or SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1", name);
         return false;
     }
@@ -9276,8 +9321,13 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
         LOG_ERROR("%s currently supports batch_count=1, got %d", name, request.batch_count);
         return false;
     }
-    if (!sd_version_is_sdxl(sd_ctx->sd->version) && !sd_version_is_sd1(sd_ctx->sd->version)) {
-        LOG_ERROR("%s currently supports SDXL/SD1 UNet models only", name);
+    const bool is_sd_backend = sd_version_is_sdxl(sd_ctx->sd->version) || sd_version_is_sd1(sd_ctx->sd->version);
+    const bool is_flux2_flow_backend =
+        sd_version_is_flux2(sd_ctx->sd->version) &&
+        sd_ctx->sd->is_flow_denoiser() &&
+        sd_experimental_flux2_backend_enabled();
+    if (!is_sd_backend && !is_flux2_flow_backend) {
+        LOG_ERROR("%s currently supports SDXL/SD1 UNet models or env-gated Flux2 flow models only", name);
         return false;
     }
     if (sd_img_gen_params->init_image.data != nullptr ||
@@ -9300,7 +9350,28 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
     SamplePlan plan(sd_ctx, sd_img_gen_params, request);
-    if (plan.sample_method != EULER_SAMPLE_METHOD &&
+    if (is_flux2_flow_backend) {
+        if (has_gpu_init) {
+            LOG_ERROR("%s Flux2 backend path currently supports T2I only; GPU init latent/edit/reference support is not enabled", name);
+            return false;
+        }
+        if (!use_conditioning_handles) {
+            LOG_ERROR("%s Flux2 backend path requires pre-encoded conditioning handles", name);
+            return false;
+        }
+        if (plan.sample_method != EULER_SAMPLE_METHOD) {
+            LOG_ERROR("%s Flux2 backend path currently supports Euler only", name);
+            return false;
+        }
+        if (request.guidance.txt_cfg != 1.0f || request.guidance.img_cfg != request.guidance.txt_cfg) {
+            LOG_ERROR("%s Flux2 backend path currently supports distilled cfg=1 only", name);
+            return false;
+        }
+        if (plan.eta != 0.0f) {
+            LOG_ERROR("%s Flux2 backend path currently supports eta=0 Euler only", name);
+            return false;
+        }
+    } else if (plan.sample_method != EULER_SAMPLE_METHOD &&
         plan.sample_method != EULER_A_SAMPLE_METHOD &&
         plan.sample_method != HEUN_SAMPLE_METHOD &&
         plan.sample_method != DPM2_SAMPLE_METHOD &&
@@ -9326,7 +9397,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
         LOG_ERROR("%s only supports the SDXL/SD1 k-diffusion sampler subset in the GPU backend path", name);
         return false;
     }
-    if (sd_ctx->sd->is_flow_denoiser()) {
+    if (sd_ctx->sd->is_flow_denoiser() && !is_flux2_flow_backend) {
         LOG_ERROR("%s does not support flow denoisers yet", name);
         return false;
     }
@@ -9403,9 +9474,10 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     std::vector<int64_t> latent_shape;
     std::unique_ptr<GgmlBackendTensorResource> x_resource;
     const bool max_denoise = !has_gpu_init || request.strength >= 1.f;
-    const float initial_noise_scale = max_denoise
-                                          ? std::sqrt(1.0f + plan.sigmas[0] * plan.sigmas[0])
-                                          : plan.sigmas[0];
+    const float initial_noise_scale = is_flux2_flow_backend
+                                          ? plan.sigmas[0]
+                                          : (max_denoise ? std::sqrt(1.0f + plan.sigmas[0] * plan.sigmas[0])
+                                                         : plan.sigmas[0]);
     if (trace_euler_parity_stats_enabled()) {
         LOG_INFO("[SamplerParity] gpu_euler_initial_noise_scaling max_denoise=%s sigma=%.9g scale=%.9g noise_source=%s",
                  max_denoise ? "true" : "false",
@@ -9751,7 +9823,7 @@ SD_API bool sd_sample_latent_gpu(sd_ctx_t* sd_ctx,
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_img_gen_params == nullptr || out_gpu_latent == nullptr) {
         return false;
     }
-    if (init_latent == nullptr && sd_experimental_gpu_sampler_backend_enabled()) {
+    if (init_latent == nullptr && sd_experimental_sampler_backend_dispatch_enabled(sd_ctx)) {
         return sd_sample_latent_gpu_euler_backend_true(sd_ctx,
                                                        sd_img_gen_params,
                                                        0,
@@ -9901,7 +9973,7 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu(sd_ctx_t* sd_ctx,
     if (init_gpu_latent == 0) {
         return sd_sample_latent_gpu(sd_ctx, sd_img_gen_params, nullptr, out_gpu_latent);
     }
-    if (sd_experimental_gpu_sampler_backend_enabled()) {
+    if (sd_experimental_sampler_backend_dispatch_enabled(sd_ctx)) {
         if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
                                                     sd_img_gen_params,
                                                     init_gpu_latent,
@@ -9980,7 +10052,7 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning(sd_ctx_t* sd_ctx
                                                       negative,
                                                       out_gpu_latent);
     }
-    if (sd_experimental_gpu_sampler_backend_enabled()) {
+    if (sd_experimental_sampler_backend_dispatch_enabled(sd_ctx)) {
         if (sd_sample_latent_gpu_euler_backend_true(sd_ctx,
                                                     sd_img_gen_params,
                                                     init_gpu_latent,
@@ -10065,8 +10137,8 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu(sd
                                                                    negative,
                                                                    out_gpu_latent);
     }
-    if (!sd_experimental_gpu_sampler_backend_enabled()) {
-        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu requires SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1 or SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1");
+    if (!sd_experimental_sampler_backend_dispatch_enabled(sd_ctx)) {
+        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu requires SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1, SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1, or SDCPP_EXPERIMENTAL_FLUX2_BACKEND=1");
         return false;
     }
     const bool use_conditioning_handles = positive != 0 || negative != 0;
@@ -10323,7 +10395,15 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
         !sd_ctx->sd->is_flow_denoiser() &&
         sd_ctx->sd->backend != nullptr &&
         !ggml_backend_is_cpu(sd_ctx->sd->backend);
-    capabilities->supports_sampler_gpu_latent_output = supports_true_gpu_kdiffusion_sampler;
+    const bool supports_true_gpu_flux2_sampler =
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        sd_experimental_flux2_backend_enabled() &&
+        sd_version_is_flux2(sd_ctx->sd->version) &&
+        sd_ctx->sd->is_flow_denoiser() &&
+        sd_ctx->sd->backend != nullptr &&
+        !ggml_backend_is_cpu(sd_ctx->sd->backend);
+    capabilities->supports_sampler_gpu_latent_output = supports_true_gpu_kdiffusion_sampler || supports_true_gpu_flux2_sampler;
     capabilities->supports_sampler_gpu_latent_bridge_output = true;
     capabilities->supports_vae_gpu_latent_input = true;
     const bool true_vae_encode_gpu =
@@ -10345,6 +10425,15 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_external_memory_interop = false;
     capabilities->supports_sampler_gpu_init_latent_input = supports_true_gpu_kdiffusion_sampler;
     capabilities->supports_sampler_gpu_init_latent_bridge_input = true;
+    capabilities->supports_flux2_gpu_latent_output = supports_true_gpu_flux2_sampler;
+    capabilities->supports_flux2_flow_backend_sampler = supports_true_gpu_flux2_sampler;
+    capabilities->supports_flux2_vae_decode_gpu =
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        sd_model_supports_gpu_latent_decode(sd_ctx->sd->version);
+    capabilities->supports_flux2_qwen_conditioning_gpu_resident =
+        supports_true_gpu_flux2_sampler &&
+        !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT");
     return true;
 }
 
@@ -10357,9 +10446,15 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
     capabilities->version = SD_VAE_API_VERSION;
     capabilities->supports_text_conditioning_encode = true;
     capabilities->supports_conditioning_handles = true;
+    const bool flux2_conditioning_supported =
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        sd_version_is_flux2(sd_ctx->sd->version) &&
+        sd_experimental_flux2_backend_enabled();
     capabilities->supports_sampler_conditioning_handle_input =
         sd_ctx == nullptr || sd_ctx->sd == nullptr ||
-        (sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version));
+        (sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version)) ||
+        flux2_conditioning_supported;
 #ifdef SD_USE_CUDA
     capabilities->supports_conditioning_gpu_resident =
         capabilities->supports_sampler_conditioning_handle_input &&
@@ -10367,7 +10462,7 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
         sd_ctx->sd != nullptr &&
         sd_ctx->sd->backend != nullptr &&
         !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT") &&
-        !sd_ctx->sd->is_flow_denoiser() &&
+        (!sd_ctx->sd->is_flow_denoiser() || flux2_conditioning_supported) &&
         ggml_backend_is_cuda(sd_ctx->sd->backend);
 #else
     capabilities->supports_conditioning_gpu_resident = false;
@@ -10377,6 +10472,16 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
     capabilities->supports_conditioning_cpu_resident = true;
     capabilities->supports_sampler_conditioning_init_latent_input = capabilities->supports_sampler_conditioning_handle_input;
     capabilities->supports_sampler_conditioning_gpu_init_latent_bridge_input = capabilities->supports_sampler_conditioning_handle_input;
+    capabilities->supports_flux2_qwen_conditioning =
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        sd_ctx->sd->version == VERSION_FLUX2_KLEIN;
+    capabilities->supports_flux2_qwen_conditioning_gpu_resident =
+        capabilities->supports_flux2_qwen_conditioning &&
+        capabilities->supports_conditioning_gpu_resident;
+    capabilities->supports_conditioning_per_step_upload_fallback =
+        capabilities->supports_conditioning_handles &&
+        !capabilities->supports_conditioning_gpu_resident;
     return true;
 }
 
@@ -10511,9 +10616,12 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
         capabilities->supports_edit_reference_conditioning &&
         should_use_normal_vae_for_generation_encode(sd_ctx);
     capabilities->strict_gpu_sample_is_true_resident =
-        sd_experimental_gpu_sampler_backend_enabled() &&
-        (sd_version_is_sd1(version) || sd_version_is_sdxl(version)) &&
-        !sd_ctx->sd->is_flow_denoiser() &&
+        ((sd_experimental_gpu_sampler_backend_enabled() &&
+          (sd_version_is_sd1(version) || sd_version_is_sdxl(version)) &&
+          !sd_ctx->sd->is_flow_denoiser()) ||
+         (sd_experimental_flux2_backend_enabled() &&
+          sd_version_is_flux2(version) &&
+          sd_ctx->sd->is_flow_denoiser())) &&
         sd_ctx->sd->backend != nullptr &&
         !ggml_backend_is_cpu(sd_ctx->sd->backend);
 
@@ -10531,6 +10639,27 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
     }
     if (sd_version_is_flux2(version)) {
         capabilities->requires_llm = true;
+        capabilities->supports_flux2_model_load = true;
+        capabilities->supports_flux2_qwen_conditioning = version == VERSION_FLUX2_KLEIN;
+        capabilities->supports_flux2_qwen_conditioning_gpu_resident =
+            capabilities->supports_flux2_qwen_conditioning &&
+            sd_experimental_flux2_backend_enabled() &&
+            sd_ctx->sd->backend != nullptr &&
+            !ggml_backend_is_cpu(sd_ctx->sd->backend) &&
+            !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT");
+        capabilities->supports_flux2_flow_backend_sampler =
+            sd_experimental_flux2_backend_enabled() &&
+            sd_ctx->sd->is_flow_denoiser() &&
+            sd_ctx->sd->backend != nullptr &&
+            !ggml_backend_is_cpu(sd_ctx->sd->backend);
+        capabilities->supports_flux2_gpu_latent_output = capabilities->supports_flux2_flow_backend_sampler;
+        capabilities->supports_flux2_vae_decode_gpu = capabilities->supports_gpu_latent_decode;
+        capabilities->supports_flux2_vae_bf16_or_compact_storage = false;
+        capabilities->supports_flux2_controlnet = false;
+        capabilities->supports_flux2_masks = false;
+        capabilities->supports_flux2_reference = false;
+        capabilities->supports_flux2_edit = false;
+        capabilities->supports_flux2_multibatch = false;
     }
     if (sd_version_is_anima(version)) {
         capabilities->default_sample_method = ER_SDE_SAMPLE_METHOD;
@@ -11757,8 +11886,10 @@ SD_API bool sd_conditioning_encode_text(sd_ctx_t* sd_ctx,
         LOG_ERROR("sd_conditioning_encode_text requires a full SD context with CLIP and diffusion model loaded");
         return false;
     }
-    if (!sd_version_is_sd1(sd_ctx->sd->version) && !sd_version_is_sdxl(sd_ctx->sd->version)) {
-        LOG_ERROR("sd_conditioning_encode_text currently supports SD1/SDXL text-only conditioning only");
+    if (!sd_version_is_sd1(sd_ctx->sd->version) &&
+        !sd_version_is_sdxl(sd_ctx->sd->version) &&
+        !sd_version_is_flux2(sd_ctx->sd->version)) {
+        LOG_ERROR("sd_conditioning_encode_text currently supports SD1/SDXL/Flux2 text-only conditioning only");
         return false;
     }
 

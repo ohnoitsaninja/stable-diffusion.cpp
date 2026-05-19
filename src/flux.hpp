@@ -1362,12 +1362,16 @@ namespace Flux {
                                  const sd::Tensor<float>& guidance_tensor                 = {},
                                  const std::vector<sd::Tensor<float>>& ref_latents_tensor = {},
                                  bool increase_ref_index                                  = false,
-                                 std::vector<int> skip_layers                             = {}) {
-            ggml_tensor* x         = make_input(x_tensor);
+                                 std::vector<int> skip_layers                             = {},
+                                 const GgmlBackendTensorResource* x_resource              = nullptr,
+                                 const GgmlBackendTensorResource* context_resource        = nullptr,
+                                 const GgmlBackendTensorResource* c_concat_resource       = nullptr,
+                                 const GgmlBackendTensorResource* y_resource              = nullptr) {
+            ggml_tensor* x         = x_resource != nullptr ? make_backend_input(*x_resource) : make_input(x_tensor);
             ggml_tensor* timesteps = make_input(timesteps_tensor);
-            ggml_tensor* context   = make_optional_input(context_tensor);
-            ggml_tensor* c_concat  = make_optional_input(c_concat_tensor);
-            ggml_tensor* y         = make_optional_input(y_tensor);
+            ggml_tensor* context   = context_resource != nullptr ? make_backend_input(*context_resource) : make_optional_input(context_tensor);
+            ggml_tensor* c_concat  = c_concat_resource != nullptr ? make_backend_input(*c_concat_resource) : make_optional_input(c_concat_tensor);
+            ggml_tensor* y         = y_resource != nullptr ? make_backend_input(*y_resource) : make_optional_input(y_tensor);
             if (flux_params.guidance_embed || flux_params.is_chroma) {
                 if (!guidance_tensor.empty()) {
                     this->guidance_tensor = guidance_tensor;
@@ -1480,6 +1484,39 @@ namespace Flux {
 
             auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
             return result;
+        }
+
+        std::unique_ptr<GgmlBackendTensorResource> compute_to_backend_resource(
+            int n_threads,
+            const GgmlBackendTensorResource& x,
+            const sd::Tensor<float>& timesteps,
+            const sd::Tensor<float>& context                         = {},
+            const GgmlBackendTensorResource* context_resource         = nullptr,
+            const sd::Tensor<float>& c_concat                        = {},
+            const GgmlBackendTensorResource* c_concat_resource        = nullptr,
+            const sd::Tensor<float>& y                               = {},
+            const GgmlBackendTensorResource* y_resource               = nullptr,
+            const sd::Tensor<float>& guidance                        = {},
+            const std::vector<sd::Tensor<float>>& ref_latents         = {},
+            bool increase_ref_index                                  = false,
+            std::vector<int> skip_layers                             = std::vector<int>()) {
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_graph({},
+                                   timesteps,
+                                   context,
+                                   c_concat,
+                                   y,
+                                   guidance,
+                                   ref_latents,
+                                   increase_ref_index,
+                                   skip_layers,
+                                   &x,
+                                   context_resource,
+                                   c_concat_resource,
+                                   y_resource);
+            };
+
+            return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "flux_backend_output");
         }
 
         void test() {

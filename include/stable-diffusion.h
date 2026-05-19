@@ -471,7 +471,11 @@ typedef struct sd_gpu_capabilities_t {
     bool supports_sampler_gpu_init_latent_bridge_input;
     bool supports_sampler_gpu_latent_bridge_output;
     uint8_t reserved_capability_padding;
-    uint32_t reserved[8];
+    bool supports_flux2_gpu_latent_output;
+    bool supports_flux2_flow_backend_sampler;
+    bool supports_flux2_vae_decode_gpu;
+    bool supports_flux2_qwen_conditioning_gpu_resident;
+    uint32_t reserved[6];
 } sd_gpu_capabilities_t;
 
 typedef uint64_t sd_conditioning_handle_t;
@@ -536,7 +540,10 @@ typedef struct sd_conditioning_capabilities_t {
     bool supports_conditioning_cpu_resident;
     bool supports_sampler_conditioning_init_latent_input;
     bool supports_sampler_conditioning_gpu_init_latent_bridge_input;
-    uint32_t reserved[16];
+    bool supports_flux2_qwen_conditioning;
+    bool supports_flux2_qwen_conditioning_gpu_resident;
+    bool supports_conditioning_per_step_upload_fallback;
+    uint32_t reserved[14];
 } sd_conditioning_capabilities_t;
 
 enum sd_model_family_t {
@@ -584,7 +591,19 @@ typedef struct sd_model_pipeline_capabilities_t {
     bool strict_gpu_sample_is_true_resident;
     bool supports_intrinsic_image_decomposition;
     uint32_t intrinsic_target_count;
-    uint32_t reserved[10];
+    bool supports_flux2_model_load;
+    bool supports_flux2_qwen_conditioning;
+    bool supports_flux2_qwen_conditioning_gpu_resident;
+    bool supports_flux2_flow_backend_sampler;
+    bool supports_flux2_gpu_latent_output;
+    bool supports_flux2_vae_decode_gpu;
+    bool supports_flux2_vae_bf16_or_compact_storage;
+    bool supports_flux2_controlnet;
+    bool supports_flux2_masks;
+    bool supports_flux2_reference;
+    bool supports_flux2_edit;
+    bool supports_flux2_multibatch;
+    uint32_t reserved[6];
 } sd_model_pipeline_capabilities_t;
 
 typedef struct sd_marigold_iid_options_t {

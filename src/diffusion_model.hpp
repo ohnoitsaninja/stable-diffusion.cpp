@@ -393,6 +393,28 @@ struct FluxModel : public DiffusionModel {
                             diffusion_params.increase_ref_index,
                             diffusion_params.skip_layers ? *diffusion_params.skip_layers : empty_skip_layers);
     }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_to_backend_resource(
+        int n_threads,
+        const DiffusionParams& diffusion_params) override {
+        GGML_ASSERT(diffusion_params.x_backend != nullptr);
+        GGML_ASSERT(diffusion_params.timesteps != nullptr);
+        static const std::vector<sd::Tensor<float>> empty_ref_latents;
+        static const std::vector<int> empty_skip_layers;
+        return flux.compute_to_backend_resource(n_threads,
+                                                *diffusion_params.x_backend,
+                                                *diffusion_params.timesteps,
+                                                tensor_or_empty(diffusion_params.context),
+                                                diffusion_params.context_backend,
+                                                tensor_or_empty(diffusion_params.c_concat),
+                                                diffusion_params.c_concat_backend,
+                                                tensor_or_empty(diffusion_params.y),
+                                                diffusion_params.y_backend,
+                                                tensor_or_empty(diffusion_params.guidance),
+                                                diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
+                                                diffusion_params.increase_ref_index,
+                                                diffusion_params.skip_layers ? *diffusion_params.skip_layers : empty_skip_layers);
+    }
 };
 
 struct AnimaModel : public DiffusionModel {
