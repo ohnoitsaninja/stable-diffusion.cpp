@@ -601,6 +601,10 @@ For Qwen-Image and Anima:
    set `SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1` (or use
    `sd-latent-smoke --gpu-flow-sampler`) and keep the text encoder in RAM on
    16 GB cards with `SDCPP_QWEN_IMAGE_TEXT_ENCODER_CPU_PARAMS=1`.
+   The fork distinguishes plain Qwen-Image from Qwen-Image-Edit by the loaded
+   model/diffusion filename. Plain `qwen-image-*` reports
+   `reference_images=false`; `qwen-image-edit-*` reports
+   `reference_images=true` and `edit_mode=true`.
 3. Anima has the same narrow sampler contract behind
    `SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1` with
    `SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS=1`.
@@ -667,6 +671,17 @@ Validated Qwen-Image strict sampler smoke:
 - `sampler_math_residency=gpu_backend_tensor`
 - output:
   `F:\Paralol\local\stable-diffusion.cpp-speed\build\qwen-image-speed\qwen-image-t2i-512-1step.png`
+
+Capability split check:
+
+- Plain Qwen-Image:
+  `F:\automatic1111\Stability\Models\DiffusionModels\qwen-image-2512-Q4_K_M.gguf`
+  reports `reference_images=false`, `edit_mode=false`, and
+  `qwen_image_edit=false`.
+- Qwen-Image Edit 2511:
+  `F:\automatic1111\Stability\Models\DiffusionModels\qwen-image-edit-2511-Q3_K_S.gguf`
+  reports `reference_images=true`, `edit_mode=true`, and
+  `qwen_image_edit=true`.
 
 Validated Qwen-Image Edit 2511 strict single-reference smoke:
 

@@ -7583,8 +7583,30 @@ static bool sd_ctx_supports_true_gpu_flow_text_backend(sd_ctx_t* sd_ctx);
 static bool sd_flow_text_backend_auto_release_disabled(SDVersion version);
 
 static bool sd_version_supports_flow_backend_reference_edit(SDVersion version) {
-    return version == VERSION_FLUX2_KLEIN ||
-           sd_version_is_qwen_image(version);
+    return version == VERSION_FLUX2_KLEIN;
+}
+
+static bool sd_path_looks_qwen_image_edit(const std::string& path) {
+    const std::string lower = sd_lower_ascii(path);
+    return lower.find("qwen") != std::string::npos &&
+           lower.find("image") != std::string::npos &&
+           lower.find("edit") != std::string::npos;
+}
+
+static bool sd_ctx_is_qwen_image_edit_model(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || !sd_version_is_qwen_image(sd_ctx->sd->version)) {
+        return false;
+    }
+    return sd_path_looks_qwen_image_edit(sd_ctx->init_params.model_path) ||
+           sd_path_looks_qwen_image_edit(sd_ctx->init_params.diffusion_model_path);
+}
+
+static bool sd_ctx_supports_flow_backend_reference_edit(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_version_supports_flow_backend_reference_edit(sd_ctx->sd->version) ||
+           sd_ctx_is_qwen_image_edit_model(sd_ctx);
 }
 
 static bool sd_version_allows_flow_backend_cfg(SDVersion version) {
@@ -7603,7 +7625,7 @@ static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
     const bool is_supported_flow_backend_text = sd_ctx_is_env_gated_flow_text_backend(sd_ctx);
     const bool flow_reference_supported =
         is_supported_flow_backend_text &&
-        sd_version_supports_flow_backend_reference_edit(sd_ctx->sd->version);
+        sd_ctx_supports_flow_backend_reference_edit(sd_ctx);
     if (!is_sd_text && !is_supported_flow_backend_text) {
         LOG_ERROR("conditioning handle sampler currently supports SD1/SDXL text-only models or env-gated Qwen flow text models");
         return false;
@@ -10061,7 +10083,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     const bool is_supported_flow_backend = sd_ctx_is_env_gated_flow_text_backend(sd_ctx);
     const bool flow_reference_supported =
         is_supported_flow_backend &&
-        sd_version_supports_flow_backend_reference_edit(sd_ctx->sd->version);
+        sd_ctx_supports_flow_backend_reference_edit(sd_ctx);
     if (!is_sd_backend && !is_supported_flow_backend) {
         LOG_ERROR("%s currently supports SDXL/SD1 UNet models or env-gated text-only flow models only", name);
         return false;
@@ -11596,8 +11618,12 @@ static const char* sd_model_family_name(sd_model_family_t family) {
 
 static bool sd_model_supports_reference_images(SDVersion version) {
     return sd_version_is_unet_edit(version) ||
-           version == VERSION_FLUX2_KLEIN ||
-           sd_version_is_qwen_image(version);
+           version == VERSION_FLUX2_KLEIN;
+}
+
+static bool sd_ctx_supports_reference_images(sd_ctx_t* sd_ctx, SDVersion version) {
+    return sd_model_supports_reference_images(version) ||
+           sd_ctx_is_qwen_image_edit_model(sd_ctx);
 }
 
 SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeline_capabilities_t* capabilities) {
@@ -11653,9 +11679,10 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
     capabilities->supports_vae_encode_gpu_output =
         capabilities->supports_vae_encode &&
         should_use_normal_vae_for_generation_encode(sd_ctx);
-    capabilities->supports_reference_images = sd_model_supports_reference_images(version);
-    capabilities->supports_edit_mode = sd_model_supports_reference_images(version);
-    capabilities->supports_edit_reference_conditioning = sd_model_supports_reference_images(version);
+    const bool supports_reference_images = sd_ctx_supports_reference_images(sd_ctx, version);
+    capabilities->supports_reference_images = supports_reference_images;
+    capabilities->supports_edit_mode = supports_reference_images;
+    capabilities->supports_edit_reference_conditioning = supports_reference_images;
     capabilities->supports_comfy_reference_vae_encode =
         capabilities->supports_edit_reference_conditioning &&
         should_use_normal_vae_for_generation_encode(sd_ctx);
@@ -11755,7 +11782,8 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
         capabilities->supports_qwen_image_controlnet = false;
         capabilities->supports_qwen_image_masks = false;
         capabilities->supports_qwen_image_reference =
-            capabilities->supports_qwen_image_flow_backend_sampler;
+            capabilities->supports_qwen_image_flow_backend_sampler &&
+            sd_ctx_is_qwen_image_edit_model(sd_ctx);
         capabilities->supports_qwen_image_edit =
             capabilities->supports_qwen_image_reference;
         capabilities->supports_qwen_image_multibatch = false;
