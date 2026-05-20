@@ -715,33 +715,49 @@ Validated Qwen-Image Edit 2511 strict single-reference smoke:
 - logs:
   `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\qwen-image-edit\qwen_edit.stdout.log`
 
-The local Qwen2.5-VL GGUF did not have a separate `--llm-vision` companion file
-available in the model folders. The smoke still proves the fork-side strict
-reference/edit handoff contract: resident conditioning handles, one-time
-reference-latent upload, strict GPU sampler residency, GPU latent output, direct
-GPU VAE decode, and explicit caller-owned image download. Use a full-quality
-Qwen Image Edit asset pair and enough steps for visual acceptance; the local
-two-step Q3 smoke is not a text-edit quality benchmark.
+The earlier two-step smoke did not load a Qwen2.5-VL vision/mmproj companion,
+so it did not validate image-conditioned Qwen text encoding. In that mode the
+log says `no vision weights detected, vision disabled`; treat that as
+text-only conditioning plus the sampler reference-latent path, not as full
+Qwen Image Edit vision conditioning.
 
 Validated Qwen-Image Edit 2511 quality smoke using the documented edit
 settings:
 
+- LLM vision/mmproj:
+  `F:\automatic1111\Stability\Models\TextEncoders\Qwen2.5-VL-7B-Instruct.mmproj-Q8_0.gguf`
 - Steps: `20`
 - CFG: `2.5`
 - Sampler: `Euler`
 - Flow shift: `3`
 - Prompt: `change 'flux.cpp' to 'edit.cpp'`
 - `qwen_image_zero_cond_t=true`
-- result: the sign text changes to `edit.cpp`
+- vision conditioning: active; logs include `enable llm vision` and
+  `QwenImageEditPlusPipeline`
+- positive conditioning handle: `device_resident=true`, `ref_images=1`,
+  `crossattn_dim=346`, `conditioning_backend_upload_ms=3`
+- sampler reference latent: `ref_latents=1`, `ref_latents_backend=true`,
+  `ref_latents_per_step_upload=false`
+- sampler: `sampler_math_residency=gpu_backend_tensor`,
+  `conditioning_storage=device_tensor`, `conditioning_per_step_upload=false`,
+  `output_bridge_upload=false`
+- VAE decode: direct GPU Wan/Qwen path, `host_copies=0`,
+  `used_im2col=false`, graph about `97 ms`
+- result: the sign text changes to `editcpp`; the dot is not perfectly
+  preserved on the local Q3/20-step smoke, but the fork is now exercising the
+  actual Qwen2.5-VL image-conditioning branch
 - output:
-  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\qwen-image-edit-quality\qwen_edit_20step.png`
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\qwen-vision-validation\full-edit\qwen_vision_edit_20step.png`
 - logs:
-  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\qwen-image-edit-quality\qwen_edit_20step.stdout.log`
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\qwen-vision-validation\full-edit\qwen_vision_edit_20step.stdout.log`
 
 Paralol should not use the earlier two-step smoke settings as workflow
 defaults. The fork reports Qwen-Image defaults as cfg `2.5`, `20` steps,
 Euler, and flow shift `3` so generated workflows do not inherit a contract
-smoke step count.
+smoke step count. For full Qwen Image Edit workflows, pass both `llm_path` and
+`llm_vision_path`; if `llm_vision_path` is missing or incompatible, the fork
+will disable vision conditioning and the workflow is no longer full edit
+conditioning.
 
 Validated Anima strict sampler smoke:
 
