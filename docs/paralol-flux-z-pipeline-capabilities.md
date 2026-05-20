@@ -708,6 +708,26 @@ GPU VAE decode, and explicit caller-owned image download. Use a full-quality
 Qwen Image Edit asset pair and enough steps for visual acceptance; the local
 two-step Q3 smoke is not a text-edit quality benchmark.
 
+Validated Qwen-Image Edit 2511 quality smoke using the documented edit
+settings:
+
+- Steps: `20`
+- CFG: `2.5`
+- Sampler: `Euler`
+- Flow shift: `3`
+- Prompt: `change 'flux.cpp' to 'edit.cpp'`
+- `qwen_image_zero_cond_t=true`
+- result: the sign text changes to `edit.cpp`
+- output:
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\qwen-image-edit-quality\qwen_edit_20step.png`
+- logs:
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\qwen-image-edit-quality\qwen_edit_20step.stdout.log`
+
+Paralol should not use the earlier two-step smoke settings as workflow
+defaults. The fork reports Qwen-Image defaults as cfg `2.5`, `20` steps,
+Euler, and flow shift `3` so generated workflows do not inherit a contract
+smoke step count.
+
 Validated Anima strict sampler smoke:
 
 - Diffusion model:

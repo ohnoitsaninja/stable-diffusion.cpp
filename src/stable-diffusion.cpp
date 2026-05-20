@@ -11736,6 +11736,8 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
         capabilities->supports_vae_encode_gpu_output = false;
     }
     if (sd_version_is_qwen_image(version)) {
+        capabilities->default_cfg_scale = 2.5f;
+        capabilities->default_steps = 20;
         capabilities->requires_llm = true;
         capabilities->requires_clip_l = false;
         capabilities->requires_t5xxl = false;
