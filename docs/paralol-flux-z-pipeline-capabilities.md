@@ -403,7 +403,8 @@ Validated with:
 - CFG: `1.0`
 - Sampler/scheduler: `euler` / `discrete`
 
-Observed strict Flux2 backend handoff at 512x512:
+Observed strict Flux2 backend handoff at 512x512, refreshed against
+`build\flux-finish-smoke\flux2-t2i-strict-512-4step.stdout.log`:
 
 - `family_name=flux2`
 - `latent_channels=128`
@@ -433,18 +434,25 @@ Observed strict Flux2 backend handoff at 512x512:
 - TAESD: false
 - IM2COL: false
 - stage host copies: 0
-- planned workspace: 352 MB
+- planned workspace: 704 MB
 - explicit caller-owned image download: supported
+- sampler timing: `denoise_ms=735`, `total_ms=794`
+- decode graph: `152 ms`
 
-Observed strict Flux2 GPU-init I2I handoff at 1024x1024:
+Observed strict Flux2 GPU-init I2I handoff at 512x512, refreshed against
+`build\flux-finish-smoke\flux2-i2i-gpu-init-strict-512-4step.stdout.log`:
 
-- VAE Encode GPU latent: `1x128x64x64`, f32, CUDA, 2,097,152 bytes
-- sampled GPU latent: `1x128x64x64`, f32, CUDA, no CPU bridge flags
+- VAE Encode GPU latent: `1x128x32x32`, f32, CUDA, 524,288 bytes
+- sampled GPU latent: `1x128x32x32`, f32, CUDA, no CPU bridge flags
 - sampler timing reports `init_latent=gpu_handle`
 - `init_bridge_download=false`
 - `output_bridge_upload=false`
 - conditioning handles are CUDA device-resident
 - VAE Decode remains GPU-resident with explicit caller-owned image download
+- sampler timing: `denoise_ms=778`, `total_ms=834`
+- encode workspace: `384 MB`, `host_copies=0`, `im2col=false`,
+  `tiled=false`, `taesd=false`
+- decode graph: `156 ms`
 
 The strict backend smoke uses:
 
@@ -457,7 +465,7 @@ build\codex\bin\sd-latent-smoke.exe `
   --vae F:\automatic1111\Stability\Models\VAE\flux2-vae.safetensors `
   --llm F:\automatic1111\Stability\Models\TextEncoders\Qwen3-4B-Q5_K_M.gguf `
   --image F:\Paralol\examples\orc.png `
-  --sample-without-init --gpu-sample-output --gpu-flow-sampler `
+  --sample-without-init --gpu-flow-sampler `
   --flux2-text-encoder-cpu-params `
   --condition-handles --strict-gpu-resident `
   --steps 4 --cfg-scale 1.0 --sampling-method euler --width 512 --height 512 `
@@ -465,11 +473,12 @@ build\codex\bin\sd-latent-smoke.exe `
   --download-gpu-output-buffer --dump-gpu-handle-desc
 ```
 
-Current limitation: on this local GGUF Qwen/fp8 Klein setup, a 512x512 4-step
-strict run is functionally correct but slow, roughly one minute per flow step.
-That is backend Flux2 throughput work, not a CPU bridge or VAE handoff issue.
-The structured timing logs identify `denoise_ms` separately from conditioning
-and VAE decode.
+Current local 512px strict smokes are no longer in the "minute per flow step"
+failure mode. The validated 4-step T2I and GPU-init I2I lanes complete with
+sub-second denoise timing after Qwen conditioning has been encoded and the text
+encoder has been released. Larger resolutions and other Flux2 variants still
+need their own smokes, but the fork-side Paralol handoff contract is complete
+for the narrow Flux2 Klein 4B lane.
 
 ## Flux2 Edit / Reference Conditioning
 
@@ -531,23 +540,24 @@ Observed strict Flux2 Klein 512px single-reference edit smoke:
 The matching no-decode sampler smoke is:
 `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux2-reference-edit-smoke\flux2-ref-sampler-1step.stdout.log`.
 
-Observed 512px four-step edit smoke using the default Flux2 Klein step count
-after the shared Qwen-flow reference/edit backend changes:
+Observed 512px four-step edit smoke using the default Flux2 Klein step count,
+refreshed against
+`build\flux-finish-smoke\flux2-ref-edit-strict-512-4step.stdout.log`:
 
 - sampler: Euler, cfg `1.0`, condition handles, strict GPU resident
 - `sample_kdiffusion_gpu_backend`: `steps=4`, `unet_calls=4`,
   `backend_graph_calls=8`
-- sampler timing: `latent_prepare_ms=95`, `condition_bind_ms=4`,
-  `text_encoder_release_ms=0`, `denoise_ms=1160`, `total_ms=1314`
+- sampler timing: `latent_prepare_ms=98`, `condition_bind_ms=2`,
+  `text_encoder_release_ms=0`, `denoise_ms=1148`, `total_ms=1302`
 - reference latents: `1`, `ref_latents_backend=true`,
   `ref_latents_per_step_upload=false`
 - bridges: `init_bridge_download=false`, `output_bridge_upload=false`
-- decode graph: `159 ms`, planned workspace `704 MB`
+- decode graph: `146 ms`, planned workspace `704 MB`
 - caller-owned image download: `3 ms`
 - output:
-  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\flux2-klein-edit\flux2_edit.png`
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-finish-smoke\flux2-ref-edit-strict-512-4step.png`
 - logs:
-  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\flux2-klein-edit\flux2_edit.stdout.log`
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-finish-smoke\flux2-ref-edit-strict-512-4step.stdout.log`
 
 The 512px one-step smoke is a contract test, not a quality benchmark. It proves
 the fork-side handoff for the full Flux2 edit/reference path:
