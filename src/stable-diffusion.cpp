@@ -8532,11 +8532,21 @@ static bool sd_experimental_z_image_backend_enabled() {
     return StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_Z_IMAGE_BACKEND");
 }
 
+static bool sd_experimental_qwen_image_backend_enabled() {
+    return StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND") ||
+           StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_X_BACKEND");
+}
+
 static bool sd_version_is_flow_text_backend_candidate(SDVersion version) {
-    return sd_version_is_flux2(version) || sd_version_is_z_image(version);
+    return sd_version_is_flux2(version) ||
+           sd_version_is_z_image(version) ||
+           sd_version_is_qwen_image(version);
 }
 
 static const char* sd_flow_text_backend_name(SDVersion version) {
+    if (sd_version_is_qwen_image(version)) {
+        return "qwen_image";
+    }
     if (sd_version_is_z_image(version)) {
         return "z_image";
     }
@@ -8552,6 +8562,9 @@ static bool sd_experimental_flow_text_backend_enabled(SDVersion version) {
     }
     if (sd_version_is_z_image(version)) {
         return sd_experimental_z_image_backend_enabled();
+    }
+    if (sd_version_is_qwen_image(version)) {
+        return sd_experimental_qwen_image_backend_enabled();
     }
     return false;
 }
@@ -8589,6 +8602,9 @@ static bool sd_flow_text_backend_auto_release_disabled(SDVersion version) {
     }
     if (sd_version_is_z_image(version)) {
         return StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_Z_IMAGE_AUTO_RELEASE_TEXT_ENCODER");
+    }
+    if (sd_version_is_qwen_image(version)) {
+        return StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_QWEN_IMAGE_AUTO_RELEASE_TEXT_ENCODER");
     }
     return false;
 }
@@ -9949,7 +9965,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     const bool flow_reference_supported = is_supported_flow_backend &&
                                           sd_ctx->sd->version == VERSION_FLUX2_KLEIN;
     if (!is_sd_backend && !is_supported_flow_backend) {
-        LOG_ERROR("%s currently supports SDXL/SD1 UNet models or env-gated Qwen flow models only", name);
+        LOG_ERROR("%s currently supports SDXL/SD1 UNet models or env-gated Qwen-family flow models only", name);
         return false;
     }
     const bool has_reference_images = sd_img_gen_params->ref_images_count > 0;
@@ -9983,7 +9999,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
             return false;
         }
         if (request.guidance.txt_cfg != 1.0f || request.guidance.img_cfg != request.guidance.txt_cfg) {
-            LOG_ERROR("%s flow backend path currently supports distilled cfg=1 only", name);
+            LOG_ERROR("%s flow backend path currently supports cfg=1 only", name);
             return false;
         }
         if (plan.eta != 0.0f) {
@@ -10922,7 +10938,7 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_schedu
                                                                    out_gpu_latent);
     }
     if (!sd_experimental_sampler_backend_dispatch_enabled(sd_ctx)) {
-        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_schedule_gpu requires SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1, SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1, SDCPP_EXPERIMENTAL_FLUX2_BACKEND=1, or SDCPP_EXPERIMENTAL_Z_IMAGE_BACKEND=1");
+        LOG_ERROR("sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_schedule_gpu requires SDCPP_EXPERIMENTAL_GPU_SAMPLER_EULER=1, SDCPP_EXPERIMENTAL_GPU_SAMPLER_BACKEND=1, SDCPP_EXPERIMENTAL_FLUX2_BACKEND=1, SDCPP_EXPERIMENTAL_Z_IMAGE_BACKEND=1, or SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1");
         return false;
     }
     const bool use_conditioning_handles = positive != 0 || negative != 0;
@@ -11187,10 +11203,14 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     const bool supports_true_gpu_z_image_sampler =
         supports_true_gpu_flow_text_sampler &&
         sd_version_is_z_image(sd_ctx->sd->version);
+    const bool supports_true_gpu_qwen_image_sampler =
+        supports_true_gpu_flow_text_sampler &&
+        sd_version_is_qwen_image(sd_ctx->sd->version);
     capabilities->supports_sampler_gpu_latent_output =
         supports_true_gpu_kdiffusion_sampler ||
         supports_true_gpu_flux2_sampler ||
-        supports_true_gpu_z_image_sampler;
+        supports_true_gpu_z_image_sampler ||
+        supports_true_gpu_qwen_image_sampler;
     capabilities->supports_sampler_gpu_latent_bridge_output = true;
     capabilities->supports_vae_gpu_latent_input = true;
     const bool true_vae_encode_gpu =
@@ -11238,6 +11258,16 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
     capabilities->supports_z_image_qwen_conditioning_gpu_resident =
         supports_true_gpu_z_image_sampler &&
         !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT");
+    capabilities->supports_qwen_image_gpu_latent_output = supports_true_gpu_qwen_image_sampler;
+    capabilities->supports_qwen_image_flow_backend_sampler = supports_true_gpu_qwen_image_sampler;
+    capabilities->supports_qwen_image_vae_decode_gpu =
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        sd_version_is_qwen_image(sd_ctx->sd->version) &&
+        sd_model_supports_gpu_latent_decode(sd_ctx->sd->version);
+    capabilities->supports_qwen_image_qwen_conditioning_gpu_resident =
+        supports_true_gpu_qwen_image_sampler &&
+        !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT");
     return true;
 }
 
@@ -11257,11 +11287,15 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
     const bool z_image_conditioning_supported =
         flow_conditioning_supported &&
         sd_version_is_z_image(sd_ctx->sd->version);
+    const bool qwen_image_conditioning_supported =
+        flow_conditioning_supported &&
+        sd_version_is_qwen_image(sd_ctx->sd->version);
     capabilities->supports_sampler_conditioning_handle_input =
         sd_ctx == nullptr || sd_ctx->sd == nullptr ||
         (sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version)) ||
         flux2_conditioning_supported ||
-        z_image_conditioning_supported;
+        z_image_conditioning_supported ||
+        qwen_image_conditioning_supported;
 #ifdef SD_USE_CUDA
     capabilities->supports_conditioning_gpu_resident =
         capabilities->supports_sampler_conditioning_handle_input &&
@@ -11269,7 +11303,10 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
         sd_ctx->sd != nullptr &&
         sd_ctx->sd->backend != nullptr &&
         !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT") &&
-        (!sd_ctx->sd->is_flow_denoiser() || flux2_conditioning_supported || z_image_conditioning_supported) &&
+        (!sd_ctx->sd->is_flow_denoiser() ||
+         flux2_conditioning_supported ||
+         z_image_conditioning_supported ||
+         qwen_image_conditioning_supported) &&
         ggml_backend_is_cuda(sd_ctx->sd->backend);
 #else
     capabilities->supports_conditioning_gpu_resident = false;
@@ -11292,6 +11329,13 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
         sd_version_is_z_image(sd_ctx->sd->version);
     capabilities->supports_z_image_qwen_conditioning_gpu_resident =
         capabilities->supports_z_image_qwen_conditioning &&
+        capabilities->supports_conditioning_gpu_resident;
+    capabilities->supports_qwen_image_qwen_conditioning =
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        sd_version_is_qwen_image(sd_ctx->sd->version);
+    capabilities->supports_qwen_image_qwen_conditioning_gpu_resident =
+        capabilities->supports_qwen_image_qwen_conditioning &&
         capabilities->supports_conditioning_gpu_resident;
     capabilities->supports_conditioning_per_step_upload_fallback =
         capabilities->supports_conditioning_handles &&
@@ -11509,6 +11553,21 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
         capabilities->requires_llm = true;
         capabilities->requires_clip_l = false;
         capabilities->requires_t5xxl = false;
+        capabilities->supports_qwen_image_model_load = true;
+        capabilities->supports_qwen_image_qwen_conditioning = true;
+        capabilities->supports_qwen_image_qwen_conditioning_gpu_resident =
+            sd_ctx_supports_true_gpu_flow_text_backend(sd_ctx) &&
+            !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT");
+        capabilities->supports_qwen_image_flow_backend_sampler =
+            sd_ctx_supports_true_gpu_flow_text_backend(sd_ctx);
+        capabilities->supports_qwen_image_gpu_latent_output = capabilities->supports_qwen_image_flow_backend_sampler;
+        capabilities->supports_qwen_image_vae_decode_gpu = capabilities->supports_gpu_latent_decode;
+        capabilities->supports_qwen_image_vae_bf16_or_compact_storage = false;
+        capabilities->supports_qwen_image_controlnet = false;
+        capabilities->supports_qwen_image_masks = false;
+        capabilities->supports_qwen_image_reference = false;
+        capabilities->supports_qwen_image_edit = false;
+        capabilities->supports_qwen_image_multibatch = false;
     }
     if (sd_version_is_marigold_iid(version)) {
         capabilities->latent_channels = 8;

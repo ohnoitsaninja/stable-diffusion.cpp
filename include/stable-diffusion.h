@@ -482,7 +482,11 @@ typedef struct sd_gpu_capabilities_t {
     bool supports_z_image_flow_backend_sampler;
     bool supports_z_image_vae_decode_gpu;
     bool supports_z_image_qwen_conditioning_gpu_resident;
-    uint32_t reserved[5];
+    bool supports_qwen_image_gpu_latent_output;
+    bool supports_qwen_image_flow_backend_sampler;
+    bool supports_qwen_image_vae_decode_gpu;
+    bool supports_qwen_image_qwen_conditioning_gpu_resident;
+    uint32_t reserved[4];
 } sd_gpu_capabilities_t;
 
 typedef uint64_t sd_conditioning_handle_t;
@@ -551,8 +555,10 @@ typedef struct sd_conditioning_capabilities_t {
     bool supports_flux2_qwen_conditioning_gpu_resident;
     bool supports_z_image_qwen_conditioning;
     bool supports_z_image_qwen_conditioning_gpu_resident;
+    bool supports_qwen_image_qwen_conditioning;
+    bool supports_qwen_image_qwen_conditioning_gpu_resident;
     bool supports_conditioning_per_step_upload_fallback;
-    uint32_t reserved[13];
+    uint32_t reserved[12];
 } sd_conditioning_capabilities_t;
 
 enum sd_model_family_t {
@@ -624,7 +630,18 @@ typedef struct sd_model_pipeline_capabilities_t {
     bool supports_z_image_reference;
     bool supports_z_image_edit;
     bool supports_z_image_multibatch;
-    uint32_t reserved[3];
+    bool supports_qwen_image_model_load;
+    bool supports_qwen_image_qwen_conditioning;
+    bool supports_qwen_image_qwen_conditioning_gpu_resident;
+    bool supports_qwen_image_flow_backend_sampler;
+    bool supports_qwen_image_gpu_latent_output;
+    bool supports_qwen_image_vae_decode_gpu;
+    bool supports_qwen_image_vae_bf16_or_compact_storage;
+    bool supports_qwen_image_controlnet;
+    bool supports_qwen_image_masks;
+    bool supports_qwen_image_reference;
+    bool supports_qwen_image_edit;
+    bool supports_qwen_image_multibatch;
 } sd_model_pipeline_capabilities_t;
 
 typedef struct sd_marigold_iid_options_t {

@@ -950,6 +950,17 @@ static void print_model_capabilities(sd_ctx_t* ctx) {
               << " z_image_reference=" << (caps.supports_z_image_reference ? "true" : "false")
               << " z_image_edit=" << (caps.supports_z_image_edit ? "true" : "false")
               << " z_image_multibatch=" << (caps.supports_z_image_multibatch ? "true" : "false")
+              << " qwen_image_model_load=" << (caps.supports_qwen_image_model_load ? "true" : "false")
+              << " qwen_image_qwen_conditioning=" << (caps.supports_qwen_image_qwen_conditioning ? "true" : "false")
+              << " qwen_image_qwen_conditioning_gpu=" << (caps.supports_qwen_image_qwen_conditioning_gpu_resident ? "true" : "false")
+              << " qwen_image_flow_backend_sampler=" << (caps.supports_qwen_image_flow_backend_sampler ? "true" : "false")
+              << " qwen_image_gpu_latent_output=" << (caps.supports_qwen_image_gpu_latent_output ? "true" : "false")
+              << " qwen_image_vae_decode_gpu=" << (caps.supports_qwen_image_vae_decode_gpu ? "true" : "false")
+              << " qwen_image_controlnet=" << (caps.supports_qwen_image_controlnet ? "true" : "false")
+              << " qwen_image_masks=" << (caps.supports_qwen_image_masks ? "true" : "false")
+              << " qwen_image_reference=" << (caps.supports_qwen_image_reference ? "true" : "false")
+              << " qwen_image_edit=" << (caps.supports_qwen_image_edit ? "true" : "false")
+              << " qwen_image_multibatch=" << (caps.supports_qwen_image_multibatch ? "true" : "false")
               << "\n";
 }
 
@@ -1038,6 +1049,10 @@ static void print_gpu_capabilities(sd_ctx_t* ctx) {
               << " z_image_flow_sampler=" << (caps.supports_z_image_flow_backend_sampler ? "true" : "false")
               << " z_image_vae_decode_gpu=" << (caps.supports_z_image_vae_decode_gpu ? "true" : "false")
               << " z_image_qwen_conditioning_gpu=" << (caps.supports_z_image_qwen_conditioning_gpu_resident ? "true" : "false")
+              << " qwen_image_gpu_output=" << (caps.supports_qwen_image_gpu_latent_output ? "true" : "false")
+              << " qwen_image_flow_sampler=" << (caps.supports_qwen_image_flow_backend_sampler ? "true" : "false")
+              << " qwen_image_vae_decode_gpu=" << (caps.supports_qwen_image_vae_decode_gpu ? "true" : "false")
+              << " qwen_image_qwen_conditioning_gpu=" << (caps.supports_qwen_image_qwen_conditioning_gpu_resident ? "true" : "false")
               << " gpu_download=" << (caps.supports_gpu_download ? "true" : "false")
               << "\n";
 }
@@ -1098,6 +1113,7 @@ int main(int argc, char** argv) {
     if (args.gpu_flow_sampler) {
         set_env_value("SDCPP_EXPERIMENTAL_FLUX2_BACKEND", "1");
         set_env_value("SDCPP_EXPERIMENTAL_Z_IMAGE_BACKEND", "1");
+        set_env_value("SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND", "1");
     }
     if (args.flux2_text_encoder_cpu_params) {
         set_env_value("SDCPP_FLUX2_TEXT_ENCODER_CPU_PARAMS", "1");
@@ -1414,6 +1430,8 @@ int main(int argc, char** argv) {
                       << " sampler_init=" << (condition_caps.supports_sampler_conditioning_init_latent_input ? "true" : "false")
                       << " gpu_init_bridge=" << (condition_caps.supports_sampler_conditioning_gpu_init_latent_bridge_input ? "true" : "false")
                       << " reuse=" << (condition_caps.supports_conditioning_handle_reuse ? "true" : "false")
+                      << " qwen_image_qwen=" << (condition_caps.supports_qwen_image_qwen_conditioning ? "true" : "false")
+                      << " qwen_image_qwen_gpu=" << (condition_caps.supports_qwen_image_qwen_conditioning_gpu_resident ? "true" : "false")
                       << "\n";
 
             sd_conditioning_encode_options_t condition_options;

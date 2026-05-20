@@ -472,28 +472,36 @@ For Flux2:
 For Qwen-Image and Anima:
 
 1. Treat both as Qwen-family flow models, not SDXL variants.
-2. The fork now reports GPU latent decode support through the Wan/Qwen VAE
+2. Qwen-Image now has a narrow env-gated strict sampler lane for text-only T2I:
+   set `SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1` (or use
+   `sd-latent-smoke --gpu-flow-sampler`) and keep the text encoder in RAM on
+   16 GB cards with `SDCPP_QWEN_IMAGE_TEXT_ENCODER_CPU_PARAMS=1`.
+3. The supported Qwen-Image strict sampler lane is batch 1, Euler, `cfg=1`,
+   text conditioning handles, no ControlNet, no masks, no reference/edit, and
+   no image-CFG. The sampler consumes the Qwen conditioning tensor by reference
+   and returns a CUDA `SD_GPU_RESOURCE_LATENT` with no sampler bridge flags.
+4. The fork still reports GPU latent decode support through the Wan/Qwen VAE
    bridge for Qwen-Image and Anima. This bridge is intentionally not strict
    GPU-resident: it downloads the GPU latent for the legacy Wan/Qwen VAE decode
    path and re-uploads the decoded image as a GPU image handle.
-3. In `SDCPP_STRICT_GPU_RESIDENT=1`, this bridge is refused. Paralol should
+5. In `SDCPP_STRICT_GPU_RESIDENT=1`, this bridge is refused. Paralol should
    surface that as an honest unsupported strict path instead of retrying
    silently.
-4. Anima currently advertises conservative defaults (`er_sde`, cfg `4.5`,
+6. Anima currently advertises conservative defaults (`er_sde`, cfg `4.5`,
    `30` steps) and no GPU VAE encode output. Its decode path remains a
    compatibility bridge until the Wan/Qwen VAE is made backend-resident.
-5. Qwen-Image reference/edit conditioning is still broader than the text-only
+7. Qwen-Image reference/edit conditioning is still broader than the text-only
    flow backend contract. Do not claim strict GPU-resident Qwen-Image
    reference/edit until its conditioning and sampler path consume backend
    tensors by reference.
-6. On 16 GB CUDA cards, prefer keeping the Qwen-family text encoder params in
+8. On 16 GB CUDA cards, prefer keeping the Qwen-family text encoder params in
    RAM and running them on the GPU only during encode:
    `SDCPP_QWEN_IMAGE_TEXT_ENCODER_CPU_PARAMS=1` for Qwen-Image and
    `SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS=1` for Anima. The smoke tool exposes
    matching flags:
    `--qwen-image-text-encoder-cpu-params` and
    `--anima-text-encoder-cpu-params`.
-7. For capability and loader checks that should not launch a sampler, use
+9. For capability and loader checks that should not launch a sampler, use
    `sd-latent-smoke --capabilities-only`. It creates the context, prints
    model/GPU capability fields, validates `--model-family` if supplied, and
    exits before image loading or diffusion.
@@ -502,10 +510,36 @@ Implementation note: Qwen-Image now has the same diffusion-model
 `compute_to_backend_resource(...)` entry point shape as Flux and Z-Image, so the
 model graph can consume a backend latent, backend context tensor, and optional
 backend reference latents without forcing those tensors through host memory.
-That is a necessary building block for a future strict Qwen-Image edit lane, but
-it is not sufficient by itself: Qwen-Image still needs explicit CFG/vision
-conditioning support in the flow sampler before the fork should advertise a
-true GPU-resident Qwen-Image sampler.
+The current strict Qwen-Image lane uses that path for text-only `cfg=1` T2I.
+Qwen-Image CFG, reference/edit, and vision conditioning remain deliberately
+unclaimed until those tensor families are made backend-resident and smoked.
+
+Validated Qwen-Image strict sampler smoke:
+
+- Diffusion model:
+  `F:\automatic1111\Stability\Models\DiffusionModels\qwen-image-2512-Q4_K_M.gguf`
+- VAE:
+  `F:\automatic1111\Stability\Models\VAE\qwen_image_vae.safetensors`
+- LLM:
+  `F:\automatic1111\Stability\Models\TextEncoders\Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf`
+- Resolution: `512x512`
+- Steps: `1`
+- CFG: `1.0`
+- Sampler: `Euler`
+- `family_name=qwen_image`
+- `qwen_image_qwen_conditioning_gpu=true`
+- `qwen_image_flow_backend_sampler=true`
+- conditioning handle: `device_resident=true`
+- sampled latent: CUDA `1x16x64x64`, `262144` bytes
+- sampler bridge flags: `init_bridge_download=false`,
+  `output_bridge_upload=false`
+- `sampler_math_residency=gpu_backend_tensor`
+- output:
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\qwen-image-speed\qwen-image-t2i-512-1step.png`
+
+The matching non-strict decode smoke succeeds through the Wan/Qwen VAE bridge
+and reports `host_copies=1`, `device_copies=1`, and `im2col=true`. This is
+usable for compatibility but is not the SDXL/Flux2-class strict VAE path.
 
 Validated Anima compatibility smoke:
 
