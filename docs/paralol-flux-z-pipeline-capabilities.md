@@ -74,18 +74,24 @@ latent has no bridge flags in `SDCPP_STRICT_GPU_RESIDENT=1`.
 
 ## Anima Verification
 
-Anima has a first strict fork-side sampler lane, not a full end-to-end image
-lane yet. Enable it with:
+Anima has a strict fork-side sampler lane, but the Qwen-image VAE output path is
+still not advertised as a GPU image-output lane. Enable it with:
 
 ```powershell
 $env:SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1
 $env:SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS=1
 ```
 
-The supported lane is text-only T2I, batch 1, Euler, cfg `1.0`, Qwen/T5
-conditioning handles, no ControlNet, no masks, no reference/edit images, and no
-multibatch. The default Anima workflow settings (`er_sde`, cfg around `4.5`,
-30 steps) are not claimed by this strict lane yet.
+The supported sampler lane is text-only T2I, batch 1, Qwen/T5 conditioning
+handles, no ControlNet, no masks, no reference/edit images, and no multibatch.
+Validated sampler methods are `euler`, `euler_a`, `er_sde`, and
+`dpmpp_2m_sde_gpu`; CFG is allowed for Anima and the model capability defaults
+remain `er_sde`, cfg `4.5`, 30 steps.
+
+The fork applies ComfyUI's Wan21 latent mean/std transform for Anima and
+Qwen-Image latents. This fixes the obvious latent-format mismatch, but VAE
+image output is still routed through the CPU compatibility decode path and is
+not claimed as `sd_decode_gpu_latent_normal_gpu()` support.
 
 Validated smoke:
 
@@ -96,9 +102,9 @@ Validated smoke:
 - LLM:
   `F:\automatic1111\Stability\Models\TextEncoders\qwen_3_06b_base.safetensors`
 - Resolution: `512x512`
-- Steps: `1`
-- CFG: `1.0`
-- Sampler/scheduler: `euler` / `discrete`
+- Steps: `2` sampler-only strict smoke, `6` decoded image smoke
+- CFG: `4.5`
+- Sampler/scheduler: `er_sde` / `discrete`
 
 Observed strict handoff:
 
@@ -108,12 +114,15 @@ Observed strict handoff:
 - sampled GPU latent: `1x16x64x64`, f32, CUDA, 262,144 bytes
 - sampler math residency: `gpu_backend_tensor`
 - sampler bridge flags: none
-- VAE decode/image output: not claimed
+- VAE decode/image output: not claimed as GPU output; CPU compatibility decode
+  works for diagnostics and applies Wan21 latent scaling
 
 The Qwen-image VAE bridge is intentionally not advertised for Anima/Qwen image
-output because the local Qwen/X VAE decode test produced a blurry image. Keep
-Paralol on latent-only handoff for these families until that VAE path is fixed
-against a known-good Comfy reference.
+output because the local Qwen/X VAE decode test produced a blurry image. The
+Anima 6-step ER_SDE smoke now produces a non-blank decoded image after the
+Wan21 transform, but it is not a Comfy/reference-quality acceptance yet. Keep
+Paralol on latent-only handoff for these families until the Qwen-image VAE path
+is validated against a known-good Comfy reference.
 
 ## Z-Image Verification
 

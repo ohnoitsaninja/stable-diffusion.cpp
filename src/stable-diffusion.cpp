@@ -3354,6 +3354,7 @@ public:
             return nullptr;
         }
         const bool is_flow = is_flow_denoiser();
+        const bool is_anima_flow = is_flow && sd_version_is_anima(version);
         const bool has_imported_step_noise =
             imported_step_noise_backend != nullptr && !imported_step_noise_backend->empty();
         if (method != EULER_SAMPLE_METHOD &&
@@ -3382,8 +3383,8 @@ public:
             LOG_ERROR("GPU sampler backend path only supports SDXL/SD1 k-diffusion sampler methods in this pass");
             return nullptr;
         }
-        if (is_flow && method != EULER_SAMPLE_METHOD) {
-            LOG_ERROR("GPU sampler backend flow path currently supports Euler only");
+        if (is_flow && !is_anima_flow && method != EULER_SAMPLE_METHOD) {
+            LOG_ERROR("GPU sampler backend flow path currently supports Euler only for this model family");
             return nullptr;
         }
         if (method == DPMPP_SDE_SAMPLE_METHOD || method == DPMPP_SDE_GPU_SAMPLE_METHOD) {
@@ -3432,7 +3433,7 @@ public:
             LOG_ERROR("GPU sampler backend path does not support resident extra cross-attention yet");
             return nullptr;
         }
-        if (is_flow) {
+        if (is_flow && !is_anima_flow) {
             if (!uncond.empty() || guidance.txt_cfg != 1.0f || guidance.img_cfg != guidance.txt_cfg) {
                 LOG_ERROR("GPU sampler backend flow path currently supports distilled cfg=1 text conditioning only");
                 return nullptr;
@@ -7619,7 +7620,9 @@ static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
     if (is_supported_flow_backend_text) {
         // CPU init latents still route through compatibility bridges, but true
         // GPU init latents are validated by sd_sample_latent_gpu_euler_backend_true.
-        if (request.guidance.txt_cfg != 1.0f || request.guidance.img_cfg != request.guidance.txt_cfg) {
+        const bool is_anima_flow = sd_version_is_anima(sd_ctx->sd->version);
+        if (!is_anima_flow &&
+            (request.guidance.txt_cfg != 1.0f || request.guidance.img_cfg != request.guidance.txt_cfg)) {
             LOG_ERROR("conditioning handle flow backend sampler currently supports distilled cfg=1 only");
             return false;
         }
@@ -10056,19 +10059,29 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
 
     SamplePlan plan(sd_ctx, sd_img_gen_params, request);
     if (is_supported_flow_backend) {
+        const bool is_anima_flow = sd_version_is_anima(sd_ctx->sd->version);
         if (!use_conditioning_handles) {
             LOG_ERROR("%s flow backend path requires pre-encoded conditioning handles", name);
             return false;
         }
-        if (plan.sample_method != EULER_SAMPLE_METHOD) {
+        if (!is_anima_flow && plan.sample_method != EULER_SAMPLE_METHOD) {
             LOG_ERROR("%s flow backend path currently supports Euler only", name);
             return false;
         }
-        if (request.guidance.txt_cfg != 1.0f || request.guidance.img_cfg != request.guidance.txt_cfg) {
+        if (is_anima_flow &&
+            plan.sample_method != EULER_SAMPLE_METHOD &&
+            plan.sample_method != EULER_A_SAMPLE_METHOD &&
+            plan.sample_method != ER_SDE_SAMPLE_METHOD &&
+            plan.sample_method != DPMPP2M_SDE_GPU_SAMPLE_METHOD) {
+            LOG_ERROR("%s Anima flow backend path currently supports Euler, Euler A, ER_SDE, and DPM++ 2M SDE GPU only", name);
+            return false;
+        }
+        if (!is_anima_flow &&
+            (request.guidance.txt_cfg != 1.0f || request.guidance.img_cfg != request.guidance.txt_cfg)) {
             LOG_ERROR("%s flow backend path currently supports cfg=1 only", name);
             return false;
         }
-        if (plan.eta != 0.0f) {
+        if (!is_anima_flow && plan.eta != 0.0f) {
             LOG_ERROR("%s flow backend path currently supports eta=0 Euler only", name);
             return false;
         }
@@ -11117,6 +11130,56 @@ SD_API sd_image_t* sd_decode_latent_normal(sd_ctx_t* sd_ctx,
                                            const sd_latent_t* latent,
                                            const sd_vae_run_options_t* options,
                                            sd_vae_memory_report_t* report) {
+    if (report != nullptr) {
+        sd_vae_memory_report_init(report);
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return nullptr;
+    }
+    if (!sd_model_supports_gpu_latent_decode(sd_ctx->sd->version)) {
+        if (sd_ctx->sd->first_stage_model == nullptr) {
+            LOG_ERROR("sd_decode_latent_normal compatibility fallback requires a loaded VAE");
+            return nullptr;
+        }
+        const sd::Tensor<float>* tensor = sd_latent_tensor(latent);
+        if (tensor == nullptr) {
+            LOG_ERROR("sd_decode_latent_normal compatibility fallback received an invalid latent");
+            return nullptr;
+        }
+        int64_t t0 = ggml_time_ms();
+        sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(*tensor);
+        int64_t t1 = ggml_time_ms();
+        if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
+            sd_ctx->sd->first_stage_model->free_params_buffer();
+        }
+        if (image.empty()) {
+            LOG_ERROR("sd_decode_latent_normal compatibility fallback failed after %.2fs", (t1 - t0) * 1.0f / 1000);
+            return nullptr;
+        }
+        if (report != nullptr) {
+            sd_vae_run_options_t effective = effective_vae_options(options);
+            copy_vae_report(report,
+                            sd_ctx->sd->first_stage_model->get_last_graph_report(),
+                            effective,
+                            SD_VAE_EXEC_DIRECT_GRAPH,
+                            false,
+                            false);
+            report->decode_graph_ms = static_cast<uint32_t>(std::max<int64_t>(0, t1 - t0));
+            std::snprintf(report->fallback_reason,
+                          sizeof(report->fallback_reason),
+                          "%s",
+                          "CPU compatibility decode path for model family without validated GPU VAE image output");
+        }
+        sd_image_t output = tensor_to_sd_image(image);
+        sd_image_t* result = static_cast<sd_image_t*>(calloc(1, sizeof(sd_image_t)));
+        if (result == nullptr) {
+            free(output.data);
+            return nullptr;
+        }
+        *result = output;
+        LOG_INFO("sd_decode_latent_normal compatibility fallback completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+        return result;
+    }
     sd_gpu_handle_t gpu_image = 0;
     if (!sd_decode_latent_normal_gpu(sd_ctx, latent, options, &gpu_image, report)) {
         return nullptr;

@@ -812,6 +812,10 @@ struct AutoEncoderKL : public VAE {
     std::vector<float> diffusion_to_vae_flux2_std_scaled_input;
     std::vector<float> vae_to_diffusion_flux2_mean_input;
     std::vector<float> vae_to_diffusion_flux2_inv_std_scaled_input;
+    std::vector<float> diffusion_to_vae_wan21_mean_input;
+    std::vector<float> diffusion_to_vae_wan21_std_scaled_input;
+    std::vector<float> vae_to_diffusion_wan21_mean_input;
+    std::vector<float> vae_to_diffusion_wan21_inv_std_scaled_input;
     std::vector<float> vae_encode_noise_input;
     AutoEncoderKLModel ae;
 
@@ -1052,6 +1056,38 @@ struct AutoEncoderKL : public VAE {
         }
     }
 
+    bool uses_wan21_latent_format() const {
+        return sd_version_is_qwen_image(version) || sd_version_is_anima(version);
+    }
+
+    void prepare_wan21_diffusion_to_vae_inputs() {
+        if (diffusion_to_vae_wan21_mean_input.size() == 16 &&
+            diffusion_to_vae_wan21_std_scaled_input.size() == 16) {
+            return;
+        }
+        sd::Tensor<float> dummy({1, 1, 16, 1});
+        auto [mean_tensor, std_tensor] = get_latents_mean_std(dummy, 2);
+        diffusion_to_vae_wan21_mean_input.assign(mean_tensor.data(), mean_tensor.data() + mean_tensor.numel());
+        diffusion_to_vae_wan21_std_scaled_input.resize(static_cast<size_t>(std_tensor.numel()));
+        for (int64_t i = 0; i < std_tensor.numel(); ++i) {
+            diffusion_to_vae_wan21_std_scaled_input[static_cast<size_t>(i)] = std_tensor[i] / scale_factor;
+        }
+    }
+
+    void prepare_wan21_vae_to_diffusion_inputs() {
+        if (vae_to_diffusion_wan21_mean_input.size() == 16 &&
+            vae_to_diffusion_wan21_inv_std_scaled_input.size() == 16) {
+            return;
+        }
+        sd::Tensor<float> dummy({1, 1, 16, 1});
+        auto [mean_tensor, std_tensor] = get_latents_mean_std(dummy, 2);
+        vae_to_diffusion_wan21_mean_input.assign(mean_tensor.data(), mean_tensor.data() + mean_tensor.numel());
+        vae_to_diffusion_wan21_inv_std_scaled_input.resize(static_cast<size_t>(std_tensor.numel()));
+        for (int64_t i = 0; i < std_tensor.numel(); ++i) {
+            vae_to_diffusion_wan21_inv_std_scaled_input[static_cast<size_t>(i)] = scale_factor / std_tensor[i];
+        }
+    }
+
     ggml_cgraph* build_diffusion_to_vae_latent_graph(ggml_tensor* z) {
         ggml_cgraph* gf = ggml_new_graph(compute_ctx);
 
@@ -1065,6 +1101,17 @@ struct AutoEncoderKL : public VAE {
 
             ggml_tensor* mean_base = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 128, 1);
             set_backend_tensor_data(mean_base, diffusion_to_vae_flux2_mean_input.data());
+            ggml_tensor* mean = ggml_repeat(compute_ctx, mean_base, out);
+            out = ggml_add(compute_ctx, out, mean);
+        } else if (uses_wan21_latent_format()) {
+            prepare_wan21_diffusion_to_vae_inputs();
+
+            ggml_tensor* std_scaled = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 16, 1);
+            set_backend_tensor_data(std_scaled, diffusion_to_vae_wan21_std_scaled_input.data());
+            out = ggml_mul(compute_ctx, z, std_scaled);
+
+            ggml_tensor* mean_base = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 16, 1);
+            set_backend_tensor_data(mean_base, diffusion_to_vae_wan21_mean_input.data());
             ggml_tensor* mean = ggml_repeat(compute_ctx, mean_base, out);
             out = ggml_add(compute_ctx, out, mean);
         } else {
@@ -1114,6 +1161,18 @@ struct AutoEncoderKL : public VAE {
 
             ggml_tensor* inv_std_scaled_base = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 128, 1);
             set_backend_tensor_data(inv_std_scaled_base, vae_to_diffusion_flux2_inv_std_scaled_input.data());
+            ggml_tensor* inv_std_scaled = ggml_repeat(compute_ctx, inv_std_scaled_base, z);
+
+            out = ggml_mul(compute_ctx, ggml_sub(compute_ctx, z, mean), inv_std_scaled);
+        } else if (uses_wan21_latent_format()) {
+            prepare_wan21_vae_to_diffusion_inputs();
+
+            ggml_tensor* mean_base = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 16, 1);
+            set_backend_tensor_data(mean_base, vae_to_diffusion_wan21_mean_input.data());
+            ggml_tensor* mean = ggml_repeat(compute_ctx, mean_base, z);
+
+            ggml_tensor* inv_std_scaled_base = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 1, 1, 16, 1);
+            set_backend_tensor_data(inv_std_scaled_base, vae_to_diffusion_wan21_inv_std_scaled_input.data());
             ggml_tensor* inv_std_scaled = ggml_repeat(compute_ctx, inv_std_scaled_base, z);
 
             out = ggml_mul(compute_ctx, ggml_sub(compute_ctx, z, mean), inv_std_scaled);
@@ -1590,13 +1649,29 @@ struct AutoEncoderKL : public VAE {
                                                               1.7664f, 1.7624f, 1.7718f, 1.7664f, 1.7457f, 1.7441f, 1.7569f, 1.7530f});
             std_tensor.reshape_(stats_shape);
             return {std::move(mean_tensor), std::move(std_tensor)};
+        } else if (uses_wan21_latent_format()) {
+            GGML_ASSERT(latents.shape()[channel_dim] == 16);
+            std::vector<int64_t> stats_shape(static_cast<size_t>(latents.dim()), 1);
+            stats_shape[static_cast<size_t>(channel_dim)] = latents.shape()[channel_dim];
+
+            auto mean_tensor = sd::Tensor<float>::from_vector({-0.7571f, -0.7089f, -0.9113f, 0.1075f,
+                                                               -0.1745f, 0.9653f, -0.1517f, 1.5508f,
+                                                               0.4134f, -0.0715f, 0.5517f, -0.3632f,
+                                                               -0.1922f, -0.9497f, 0.2503f, -0.2921f});
+            mean_tensor.reshape_(stats_shape);
+            auto std_tensor = sd::Tensor<float>::from_vector({2.8184f, 1.4541f, 2.3275f, 2.6558f,
+                                                              1.2196f, 1.7708f, 2.6052f, 2.0743f,
+                                                              3.2687f, 2.1526f, 2.8652f, 1.5579f,
+                                                              1.6382f, 1.1253f, 2.8251f, 1.9160f});
+            std_tensor.reshape_(stats_shape);
+            return {std::move(mean_tensor), std::move(std_tensor)};
         } else {
             GGML_ABORT("unknown version %d", version);
         }
     }
 
     sd::Tensor<float> diffusion_to_vae_latents(const sd::Tensor<float>& latents) override {
-        if (sd_version_is_flux2(version)) {
+        if (sd_version_is_flux2(version) || uses_wan21_latent_format()) {
             int channel_dim                = 2;
             auto [mean_tensor, std_tensor] = get_latents_mean_std(latents, channel_dim);
             return (latents * std_tensor) / scale_factor + mean_tensor;
@@ -1605,7 +1680,7 @@ struct AutoEncoderKL : public VAE {
     }
 
     sd::Tensor<float> vae_to_diffusion_latents(const sd::Tensor<float>& latents) override {
-        if (sd_version_is_flux2(version)) {
+        if (sd_version_is_flux2(version) || uses_wan21_latent_format()) {
             int channel_dim                = 2;
             auto [mean_tensor, std_tensor] = get_latents_mean_std(latents, channel_dim);
             return ((latents - mean_tensor) * scale_factor) / std_tensor;
