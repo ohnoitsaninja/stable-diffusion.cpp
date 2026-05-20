@@ -150,6 +150,35 @@ Observed strict handoff with `SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1`:
 - largest tensor: about 290.3 MiB, `PAD`
 - decode graph: about 129 ms on the local RTX 4080 SUPER
 
+Optional compact Wan/Qwen VAE activation storage is available behind a second
+experimental gate:
+
+```powershell
+$env:SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_BF16=1
+```
+
+This mirrors ComfyUI's practical Wan/Qwen VAE dtype choice on Ada-class CUDA
+devices: Comfy's Wan VAE loader allows `torch.bfloat16`, `torch.float16`, and
+`torch.float32`, and its model-management dtype resolver prefers bf16 on CUDA
+devices with compute capability 8.x or newer. There is no separate Comfy
+Wan/Qwen "small quant VAE" runtime path to mirror; the relevant memory lever is
+activation dtype. The fork therefore does not introduce a quantized VAE format
+here.
+
+The BF16 path keeps public outputs f32 and keeps RMSNorm as an explicit f32
+island because ggml CUDA RMS_NORM currently requires f32 input. On the local
+RTX 4080 SUPER, the 512x512 30-step Anima decoded-image smoke measured:
+
+- workspace: `676.2 MiB -> 338.3 MiB`
+- largest tensor: `290.3 MiB f32 PAD -> 145.1 MiB bf16 PAD`
+- decode graph: `129 ms -> 77 ms`
+- BF16 vs F32 direct-conv output: mean abs `0.3879`, p99 `3`, PSNR
+  `50.03 dB`
+
+Keep this opt-in until more Qwen-Image/Wan-family VAE encode/decode cases are
+validated. Capability fields continue to avoid promising BF16 as a default
+production contract.
+
 The 30-step ER-SDE Anima smoke is the meaningful image-quality acceptance here;
 short 2-4 step samples are only API/residency smokes and can look misleadingly
 bad. The direct-conv GPU VAE output matches the older bridge output closely

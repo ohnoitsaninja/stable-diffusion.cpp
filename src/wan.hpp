@@ -25,6 +25,11 @@ namespace WAN {
         return disabled == nullptr || disabled[0] == '\0' || disabled[0] == '0';
     }
 
+    static bool wan_qwen_vae_bf16_activations_enabled() {
+        const char* enabled = std::getenv("SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_BF16");
+        return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
+    }
+
     class CausalConv3d : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -144,12 +149,14 @@ namespace WAN {
                                                     true,
                                                     false,
                                                     false);
-                return ggml_reshape_4d(ctx->ggml_ctx, out, out->ne[0], out->ne[1], 1, out->ne[2] * out->ne[3]);
+                out = ggml_reshape_4d(ctx->ggml_ctx, out, out->ne[0], out->ne[1], 1, out->ne[2] * out->ne[3]);
+                return ggml_vae_maybe_bf16_activation(ctx, out);
             }
-            return ggml_ext_conv_3d(ctx->ggml_ctx, x, w, b, in_channels,
-                                    std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
-                                    0, 0, 0,
-                                    std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation));
+            x = ggml_ext_conv_3d(ctx->ggml_ctx, x, w, b, in_channels,
+                                 std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
+                                 0, 0, 0,
+                                 std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation));
+            return ggml_vae_maybe_bf16_activation(ctx, x);
         }
     };
 
@@ -178,11 +185,17 @@ namespace WAN {
             ggml_tensor* w = params["gamma"];
             w              = ggml_reshape_1d(ctx->ggml_ctx, w, ggml_nelements(w));
             auto h         = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 3, 0, 1, 2));  // [ID, IH, IW, N*IC]
+            if (h->type == GGML_TYPE_BF16) {
+                // CUDA RMS_NORM currently requires f32 input. Keep Wan/Qwen
+                // compact VAE activations as storage, but use an explicit f32
+                // island for the numerically sensitive norm.
+                h = ggml_cast(ctx->ggml_ctx, h, GGML_TYPE_F32);
+            }
             h              = ggml_rms_norm(ctx->ggml_ctx, h, 1e-12f);
             h              = ggml_mul(ctx->ggml_ctx, h, w);
             h              = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, h, 1, 2, 3, 0));
 
-            return h;
+            return ggml_vae_maybe_bf16_activation(ctx, h);
         }
     };
 
@@ -471,7 +484,7 @@ namespace WAN {
             }
 
             x = ggml_add(ctx->ggml_ctx, x, h);
-            return x;
+            return ggml_vae_maybe_bf16_activation(ctx, x);
         }
     };
 
@@ -531,7 +544,7 @@ namespace WAN {
 
             x = ggml_add(ctx->ggml_ctx, x, shortcut);
 
-            return x;
+            return ggml_vae_maybe_bf16_activation(ctx, x);
         }
     };
 
@@ -592,7 +605,7 @@ namespace WAN {
                 x = ggml_add(ctx->ggml_ctx, x, shortcut);
             }
 
-            return x;
+            return ggml_vae_maybe_bf16_activation(ctx, x);
         }
     };
 
@@ -653,7 +666,7 @@ namespace WAN {
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (c, t, h, w)
 
             x = ggml_add(ctx->ggml_ctx, x, identity);
-            return x;
+            return ggml_vae_maybe_bf16_activation(ctx, x);
         }
     };
 
@@ -1316,6 +1329,7 @@ namespace WAN {
             z = ggml_reshape_4d(compute_ctx, z, z->ne[0], z->ne[1], 1, z->ne[2] * z->ne[3]);
 
             auto runner_ctx = get_context();
+            runner_ctx.vae_bf16_activations_enabled = wan_qwen_vae_bf16_activations_enabled();
             ggml_tensor* out = ae.decode(&runner_ctx, z);
 
             // Single-image Wan/Qwen decode returns [w,h,t,c]. Convert it back
@@ -1325,6 +1339,9 @@ namespace WAN {
             }
 
             if (scale_input) {
+                if (out->type == GGML_TYPE_BF16) {
+                    out = ggml_cast(compute_ctx, out, GGML_TYPE_F32);
+                }
                 out = ggml_scale(compute_ctx, out, 0.5f);
                 decode_output_shift_input = 0.5f;
                 ggml_tensor* shift = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_F32, 1);

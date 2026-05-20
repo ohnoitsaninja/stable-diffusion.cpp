@@ -12849,6 +12849,15 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
     sd_vae_memory_report_t full_report;
     sd_vae_memory_report_init(&full_report);
     copy_vae_report(&full_report, graph_report, effective, resolved_mode, false, used_taesd);
+    if (wan_qwen_gpu_vae && StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_BF16")) {
+        full_report.resolved_storage_dtype = SD_VAE_DTYPE_BF16;
+        std::snprintf(full_report.math_dtype_policy,
+                      sizeof(full_report.math_dtype_policy),
+                      "storage=bf16 math=f32 reductions=f32");
+        std::snprintf(full_report.fallback_reason,
+                      sizeof(full_report.fallback_reason),
+                      "experimental Wan/Qwen VAE bf16 activation storage enabled; RMSNorm remains f32 and final public image tensor remains f32");
+    }
     full_report.decode_setup_ms = static_cast<uint32_t>(std::max<int64_t>(0, t_setup1 - t_setup0));
     full_report.decode_context_ms = 0;
     full_report.decode_latent_d2d_ms = 0;
