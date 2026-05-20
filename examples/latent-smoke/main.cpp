@@ -25,6 +25,7 @@ struct Args {
     std::string clip_l;
     std::string t5xxl;
     std::string llm;
+    std::string llm_vision;
     std::string image;
     std::string ref_image;
     std::string conditioning_ref_image;
@@ -60,6 +61,7 @@ struct Args {
     bool flux2_text_encoder_cpu_params = false;
     bool z_image_text_encoder_cpu_params = false;
     bool qwen_image_text_encoder_cpu_params = false;
+    bool qwen_image_zero_cond_t = false;
     bool anima_text_encoder_cpu_params = false;
     bool capabilities_only = false;
     bool compare_gpu_sampler_backend_euler = false;
@@ -100,6 +102,7 @@ static void usage(const char* argv0) {
         << "  --clip-l <path>          CLIP-L text encoder path\n"
         << "  --t5xxl <path>           T5XXL text encoder path\n"
         << "  --llm <path>             LLM text encoder path\n"
+        << "  --llm-vision <path>      LLM vision/mmproj path for Qwen Image edit/reference models\n"
         << "  --output <path>          decoded output path (default: latent_smoke.png)\n"
         << "  --prompt <text>          prompt for sampler smoke\n"
         << "  --negative-prompt <text> negative prompt for sampler smoke\n"
@@ -128,6 +131,7 @@ static void usage(const char* argv0) {
         << "  --flux2-text-encoder-cpu-params keep Flux2 Qwen params in RAM and execute on GPU only during encode\n"
         << "  --z-image-text-encoder-cpu-params keep Z-Image Qwen params in RAM and execute on GPU only during encode\n"
         << "  --qwen-image-text-encoder-cpu-params keep Qwen-Image LLM params in RAM and execute on GPU only during encode\n"
+        << "  --qwen-image-zero-cond-t enable Qwen Image Edit 2511 zero cond-t compatibility flag\n"
         << "  --anima-text-encoder-cpu-params keep Anima Qwen params in RAM and execute on GPU only during encode\n"
         << "  --capabilities-only  create the context, print capabilities, then exit before image load/sample/decode\n"
         << "  --gpu-sampler-backend-euler legacy alias for --gpu-sampler-backend\n"
@@ -205,6 +209,10 @@ static bool parse_args(int argc, char** argv, Args& args) {
             const char* value = need_value("--llm");
             if (value == nullptr) return false;
             args.llm = value;
+        } else if (arg == "--llm-vision" || arg == "--llm_vision" || arg == "--qwen2vl-vision" || arg == "--qwen2vl_vision") {
+            const char* value = need_value(arg.c_str());
+            if (value == nullptr) return false;
+            args.llm_vision = value;
         } else if (arg == "--image") {
             const char* value = need_value("--image");
             if (value == nullptr) return false;
@@ -313,6 +321,8 @@ static bool parse_args(int argc, char** argv, Args& args) {
             args.z_image_text_encoder_cpu_params = true;
         } else if (arg == "--qwen-image-text-encoder-cpu-params") {
             args.qwen_image_text_encoder_cpu_params = true;
+        } else if (arg == "--qwen-image-zero-cond-t") {
+            args.qwen_image_zero_cond_t = true;
         } else if (arg == "--anima-text-encoder-cpu-params") {
             args.anima_text_encoder_cpu_params = true;
         } else if (arg == "--capabilities-only") {
@@ -582,6 +592,7 @@ static sd_ctx_t* create_context(const Args& args, bool vae_decode_only) {
     ctx_params.clip_l_path           = args.clip_l.empty() ? nullptr : args.clip_l.c_str();
     ctx_params.t5xxl_path            = args.t5xxl.empty() ? nullptr : args.t5xxl.c_str();
     ctx_params.llm_path              = args.llm.empty() ? nullptr : args.llm.c_str();
+    ctx_params.llm_vision_path       = args.llm_vision.empty() ? nullptr : args.llm_vision.c_str();
     ctx_params.vae_decode_only       = vae_decode_only;
     ctx_params.diffusion_flash_attn  = true;
     ctx_params.diffusion_conv_direct = args.diffusion_conv_direct;
@@ -596,6 +607,7 @@ static sd_ctx_t* create_context(const Args& args, bool vae_decode_only) {
     }
     ctx_params.offload_params_to_cpu = false;
     ctx_params.keep_clip_on_cpu      = false;
+    ctx_params.qwen_image_zero_cond_t = args.qwen_image_zero_cond_t;
     ctx_params.keep_vae_on_cpu       = false;
     if (args.condition_handles_reuse) {
         ctx_params.free_params_immediately = false;

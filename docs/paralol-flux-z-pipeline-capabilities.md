@@ -62,8 +62,12 @@ contract instead of one-off code paths:
 - the sampler returns an `SD_GPU_RESOURCE_LATENT` handle with no CPU bridge
   flags;
 - text-only GPU init latents are accepted by the same backend path for I2I
-  smoke coverage; masks, reference/edit images, ControlNet, and image-CFG stay
-  unsupported;
+  smoke coverage;
+- Flux2 Klein and Qwen-Image edit models also accept one or more reference
+  images through the sampler `ref_images` path; those images are encoded to
+  reference latents, uploaded once to backend tensors, and then consumed by
+  reference during denoising;
+- masks, ControlNet, multibatch, and image-CFG stay unsupported;
 - `sd_decode_gpu_latent_normal_gpu()` consumes that handle and returns an
   `SD_GPU_RESOURCE_IMAGE` handle only for families whose VAE path is validated;
 - CPU pixels are only materialized by explicit caller-owned download.
@@ -527,22 +531,23 @@ Observed strict Flux2 Klein 512px single-reference edit smoke:
 The matching no-decode sampler smoke is:
 `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux2-reference-edit-smoke\flux2-ref-sampler-1step.stdout.log`.
 
-Observed 512px four-step edit smoke using the default Flux2 Klein step count:
+Observed 512px four-step edit smoke using the default Flux2 Klein step count
+after the shared Qwen-flow reference/edit backend changes:
 
 - sampler: Euler, cfg `1.0`, condition handles, strict GPU resident
 - `sample_kdiffusion_gpu_backend`: `steps=4`, `unet_calls=4`,
   `backend_graph_calls=8`
-- sampler timing: `latent_prepare_ms=94`, `condition_bind_ms=3`,
-  `text_encoder_release_ms=239`, `denoise_ms=1080`, `total_ms=1468`
+- sampler timing: `latent_prepare_ms=95`, `condition_bind_ms=4`,
+  `text_encoder_release_ms=0`, `denoise_ms=1160`, `total_ms=1314`
 - reference latents: `1`, `ref_latents_backend=true`,
   `ref_latents_per_step_upload=false`
 - bridges: `init_bridge_download=false`, `output_bridge_upload=false`
-- decode graph: `143 ms`, planned workspace `704 MB`
+- decode graph: `159 ms`, planned workspace `704 MB`
 - caller-owned image download: `3 ms`
 - output:
-  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux2-reference-edit-smoke\flux2-ref-edit-512-4step.png`
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\flux2-klein-edit\flux2_edit.png`
 - logs:
-  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux2-reference-edit-smoke\flux2-ref-edit-512-4step.stdout.log`
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\flux2-klein-edit\flux2_edit.stdout.log`
 
 The 512px one-step smoke is a contract test, not a quality benchmark. It proves
 the fork-side handoff for the full Flux2 edit/reference path:
@@ -591,34 +596,34 @@ For Flux2:
 For Qwen-Image and Anima:
 
 1. Treat both as Qwen-family flow models, not SDXL variants.
-2. Qwen-Image has a narrow env-gated strict sampler lane for text-only T2I:
+2. Qwen-Image has a narrow env-gated strict sampler lane for T2I and
+   single-reference edit:
    set `SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1` (or use
    `sd-latent-smoke --gpu-flow-sampler`) and keep the text encoder in RAM on
    16 GB cards with `SDCPP_QWEN_IMAGE_TEXT_ENCODER_CPU_PARAMS=1`.
 3. Anima has the same narrow sampler contract behind
    `SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1` with
    `SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS=1`.
-4. The supported strict sampler lane is batch 1, text conditioning handles, no
-   ControlNet, no masks, no reference/edit, and no image-CFG. Qwen-Image
-   remains text-only `euler`/cfg `1` until separately validated. Anima has
-   strict sampler smokes for `euler`, `euler_a`, `er_sde`, and
+4. The supported strict sampler lane is batch 1, resident conditioning handles,
+   no ControlNet, no masks, no multibatch, and no image-CFG. Qwen-Image
+   supports Euler T2I and single-reference edit, including CFG/uncond for edit
+   models. Anima has strict sampler smokes for `euler`, `euler_a`, `er_sde`, and
    `dpmpp_2m_sde_gpu` with cfg `4.5`. The sampler consumes resident
    conditioning tensors by reference and returns a CUDA `SD_GPU_RESOURCE_LATENT`
    with no sampler bridge flags.
-5. Qwen-Image and Anima true GPU VAE/image output is deliberately not claimed:
-   `supports_gpu_latent_decode=false` and `supports_gpu_image_output=false`.
-   They now expose a separate non-strict bridge capability:
-   `supports_gpu_latent_decode_bridge=true` and
-   `supports_gpu_image_output_bridge=true`. The bridge accepts a GPU latent
-   handle and returns a GPU image handle, but logs/flags the internal latent
-   download and decoded-image upload. `SDCPP_STRICT_GPU_RESIDENT=1` refuses it.
+5. Qwen-Image and Anima can use the experimental Wan/Qwen direct GPU VAE decode
+   lane when `SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1` is set. In that mode
+   `sd_decode_gpu_latent_normal_gpu()` consumes the CUDA latent handle and
+   returns a CUDA image handle without bridge flags. Without that gate, older
+   bridge-capable compatibility paths may still be available and must be
+   reported as bridges.
 6. Anima advertises workflow defaults (`er_sde`, cfg `4.5`, `30` steps). Use
    those settings for image-quality checks; short Euler/cfg=1 smokes are API
    validation only and produce misleading low-quality images.
-7. Qwen-Image reference/edit conditioning is still broader than the text-only
-   flow backend contract. Do not claim strict GPU-resident Qwen-Image
-   reference/edit until its conditioning and sampler path consume backend
-   tensors by reference.
+7. Qwen-Image Edit 2511 requires `qwen_image_zero_cond_t`; use
+   `--qwen-image-zero-cond-t` in smoke tooling and set
+   `sd_ctx_params_t::qwen_image_zero_cond_t=true` from Paralol workflows that
+   target the 2511 edit model.
 8. On 16 GB CUDA cards, prefer keeping the Qwen-family text encoder params in
    RAM and running them on the GPU only during encode:
    `SDCPP_QWEN_IMAGE_TEXT_ENCODER_CPU_PARAMS=1` for Qwen-Image and
@@ -635,9 +640,10 @@ Implementation note: Qwen-Image now has the same diffusion-model
 `compute_to_backend_resource(...)` entry point shape as Flux and Z-Image, so the
 model graph can consume a backend latent, backend context tensor, and optional
 backend reference latents without forcing those tensors through host memory.
-The current strict Qwen-Image lane uses that path for text-only `cfg=1` T2I.
-Qwen-Image CFG, reference/edit, and vision conditioning remain deliberately
-unclaimed until those tensor families are made backend-resident and smoked.
+The strict Qwen-Image lane uses that path for both text T2I and single-reference
+edit. Edit reference images are encoded to reference latents and uploaded once
+before denoising; the timing line must report `ref_latents_backend=true` and
+`ref_latents_per_step_upload=false`.
 
 Validated Qwen-Image strict sampler smoke:
 
@@ -662,10 +668,45 @@ Validated Qwen-Image strict sampler smoke:
 - output:
   `F:\Paralol\local\stable-diffusion.cpp-speed\build\qwen-image-speed\qwen-image-t2i-512-1step.png`
 
-The matching non-strict decode smoke is not accepted as an image-quality pass:
-the local Qwen/X VAE output was visibly blurry. Keep Qwen-Image advertised as
-sampler-latent validated plus VAE bridge-capable, not true GPU image validated,
-until the Qwen-image VAE is corrected against Comfy.
+Validated Qwen-Image Edit 2511 strict single-reference smoke:
+
+- Diffusion model:
+  `F:\automatic1111\Stability\Models\DiffusionModels\qwen-image-edit-2511-Q3_K_S.gguf`
+- VAE:
+  `F:\automatic1111\Stability\Models\VAE\qwen_image_vae.safetensors`
+- LLM:
+  `F:\automatic1111\Stability\Models\TextEncoders\Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf`
+- Resolution: `512x512`
+- Steps: `2`
+- CFG: `2.5`
+- Sampler: `Euler`
+- `qwen_image_zero_cond_t=true`
+- `qwen_image_reference=true`
+- `qwen_image_edit=true`
+- positive and negative conditioning handles: `device_resident=true`
+- CFG mode: `separate`, `unet_calls=4`, `backend_graph_calls=4`
+- reference latents: `1`, `ref_latents_backend=true`,
+  `ref_latents_per_step_upload=false`
+- sampler residency: `gpu_backend_tensor`
+- bridge flags: `init_bridge_download=false`, `output_bridge_upload=false`
+- text encoder released before diffusion: `true`
+- sampler timing: `latent_prepare_ms=6498`, `denoise_ms=2897`,
+  `total_ms=9459`
+- VAE decode: direct GPU Wan/Qwen path with `host_copies=0`,
+  `direct_conv=true`, `used_im2col=false`, planned workspace about
+  `676.2 MiB`, graph `96 ms`
+- output:
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\qwen-image-edit\qwen_edit.png`
+- logs:
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\flux-qwen-ref-edit\qwen-image-edit\qwen_edit.stdout.log`
+
+The local Qwen2.5-VL GGUF did not have a separate `--llm-vision` companion file
+available in the model folders. The smoke still proves the fork-side strict
+reference/edit handoff contract: resident conditioning handles, one-time
+reference-latent upload, strict GPU sampler residency, GPU latent output, direct
+GPU VAE decode, and explicit caller-owned image download. Use a full-quality
+Qwen Image Edit asset pair and enough steps for visual acceptance; the local
+two-step Q3 smoke is not a text-edit quality benchmark.
 
 Validated Anima strict sampler smoke:
 

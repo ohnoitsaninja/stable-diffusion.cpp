@@ -3434,8 +3434,9 @@ public:
             return nullptr;
         }
         if (is_flow && !is_anima_flow) {
-            if (!uncond.empty() || guidance.txt_cfg != 1.0f || guidance.img_cfg != guidance.txt_cfg) {
-                LOG_ERROR("GPU sampler backend flow path currently supports distilled cfg=1 text conditioning only");
+            if (!sd_version_is_qwen_image(version) &&
+                (!uncond.empty() || guidance.txt_cfg != 1.0f || guidance.img_cfg != guidance.txt_cfg)) {
+                LOG_ERROR("GPU sampler backend flow path currently supports distilled cfg=1 text conditioning only for this model family");
                 return nullptr;
             }
             if (eta != 0.0f) {
@@ -7581,6 +7582,16 @@ static bool sd_ctx_backend_is_cuda(sd_ctx_t* sd_ctx);
 static bool sd_ctx_supports_true_gpu_flow_text_backend(sd_ctx_t* sd_ctx);
 static bool sd_flow_text_backend_auto_release_disabled(SDVersion version);
 
+static bool sd_version_supports_flow_backend_reference_edit(SDVersion version) {
+    return version == VERSION_FLUX2_KLEIN ||
+           sd_version_is_qwen_image(version);
+}
+
+static bool sd_version_allows_flow_backend_cfg(SDVersion version) {
+    return sd_version_is_anima(version) ||
+           sd_version_is_qwen_image(version);
+}
+
 static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
                                                          const sd_img_gen_params_t* sd_img_gen_params,
                                                          const sd_latent_t* init_latent,
@@ -7590,8 +7601,9 @@ static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
     }
     const bool is_sd_text = sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version);
     const bool is_supported_flow_backend_text = sd_ctx_is_env_gated_flow_text_backend(sd_ctx);
-    const bool flow_reference_supported = is_supported_flow_backend_text &&
-                                          sd_ctx->sd->version == VERSION_FLUX2_KLEIN;
+    const bool flow_reference_supported =
+        is_supported_flow_backend_text &&
+        sd_version_supports_flow_backend_reference_edit(sd_ctx->sd->version);
     if (!is_sd_text && !is_supported_flow_backend_text) {
         LOG_ERROR("conditioning handle sampler currently supports SD1/SDXL text-only models or env-gated Qwen flow text models");
         return false;
@@ -7620,8 +7632,8 @@ static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
     if (is_supported_flow_backend_text) {
         // CPU init latents still route through compatibility bridges, but true
         // GPU init latents are validated by sd_sample_latent_gpu_euler_backend_true.
-        const bool is_anima_flow = sd_version_is_anima(sd_ctx->sd->version);
-        if (!is_anima_flow &&
+        const bool cfg_allowed = sd_version_allows_flow_backend_cfg(sd_ctx->sd->version);
+        if (!cfg_allowed &&
             (request.guidance.txt_cfg != 1.0f || request.guidance.img_cfg != request.guidance.txt_cfg)) {
             LOG_ERROR("conditioning handle flow backend sampler currently supports distilled cfg=1 only");
             return false;
@@ -10047,8 +10059,9 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     }
     const bool is_sd_backend = sd_version_is_sdxl(sd_ctx->sd->version) || sd_version_is_sd1(sd_ctx->sd->version);
     const bool is_supported_flow_backend = sd_ctx_is_env_gated_flow_text_backend(sd_ctx);
-    const bool flow_reference_supported = is_supported_flow_backend &&
-                                          sd_ctx->sd->version == VERSION_FLUX2_KLEIN;
+    const bool flow_reference_supported =
+        is_supported_flow_backend &&
+        sd_version_supports_flow_backend_reference_edit(sd_ctx->sd->version);
     if (!is_sd_backend && !is_supported_flow_backend) {
         LOG_ERROR("%s currently supports SDXL/SD1 UNet models or env-gated text-only flow models only", name);
         return false;
@@ -10092,7 +10105,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
             LOG_ERROR("%s Anima flow backend path currently supports Euler, Euler A, ER_SDE, and DPM++ 2M SDE GPU only", name);
             return false;
         }
-        if (!is_anima_flow &&
+        if (!sd_version_allows_flow_backend_cfg(sd_ctx->sd->version) &&
             (request.guidance.txt_cfg != 1.0f || request.guidance.img_cfg != request.guidance.txt_cfg)) {
             LOG_ERROR("%s flow backend path currently supports cfg=1 only", name);
             return false;
@@ -11739,8 +11752,10 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
         capabilities->supports_qwen_image_vae_bf16_or_compact_storage = false;
         capabilities->supports_qwen_image_controlnet = false;
         capabilities->supports_qwen_image_masks = false;
-        capabilities->supports_qwen_image_reference = false;
-        capabilities->supports_qwen_image_edit = false;
+        capabilities->supports_qwen_image_reference =
+            capabilities->supports_qwen_image_flow_backend_sampler;
+        capabilities->supports_qwen_image_edit =
+            capabilities->supports_qwen_image_reference;
         capabilities->supports_qwen_image_multibatch = false;
     }
     if (sd_version_is_anima(version)) {
