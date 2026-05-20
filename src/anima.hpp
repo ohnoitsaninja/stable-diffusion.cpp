@@ -606,12 +606,16 @@ namespace Anima {
                                  const sd::Tensor<float>& timesteps_tensor,
                                  const sd::Tensor<float>& context_tensor    = {},
                                  const sd::Tensor<int32_t>& t5_ids_tensor   = {},
-                                 const sd::Tensor<float>& t5_weights_tensor = {}) {
-            ggml_tensor* x          = make_input(x_tensor);
+                                 const sd::Tensor<float>& t5_weights_tensor = {},
+                                 const GgmlBackendTensorResource* x_resource = nullptr,
+                                 const GgmlBackendTensorResource* context_resource = nullptr,
+                                 const GgmlBackendTensorResource* t5_ids_resource = nullptr,
+                                 const GgmlBackendTensorResource* t5_weights_resource = nullptr) {
+            ggml_tensor* x          = x_resource != nullptr ? make_backend_input(*x_resource) : make_input(x_tensor);
             ggml_tensor* timesteps  = make_input(timesteps_tensor);
-            ggml_tensor* context    = make_optional_input(context_tensor);
-            ggml_tensor* t5_ids     = make_optional_input(t5_ids_tensor);
-            ggml_tensor* t5_weights = make_optional_input(t5_weights_tensor);
+            ggml_tensor* context    = context_resource != nullptr ? make_backend_input(*context_resource) : make_optional_input(context_tensor);
+            ggml_tensor* t5_ids     = t5_ids_resource != nullptr ? make_backend_input(*t5_ids_resource) : make_optional_input(t5_ids_tensor);
+            ggml_tensor* t5_weights = t5_weights_resource != nullptr ? make_backend_input(*t5_weights_resource) : make_optional_input(t5_weights_tensor);
             GGML_ASSERT(x->ne[3] == 1);
             ggml_cgraph* gf = new_graph_custom(ANIMA_GRAPH_SIZE);
 
@@ -676,6 +680,30 @@ namespace Anima {
                 return build_graph(x, timesteps, context, t5_ids, t5_weights);
             };
             return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
+        }
+
+        std::unique_ptr<GgmlBackendTensorResource> compute_to_backend_resource(
+            int n_threads,
+            const GgmlBackendTensorResource& x,
+            const sd::Tensor<float>& timesteps,
+            const sd::Tensor<float>& context = {},
+            const GgmlBackendTensorResource* context_resource = nullptr,
+            const sd::Tensor<int32_t>& t5_ids = {},
+            const GgmlBackendTensorResource* t5_ids_resource = nullptr,
+            const sd::Tensor<float>& t5_weights = {},
+            const GgmlBackendTensorResource* t5_weights_resource = nullptr) {
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_graph(sd::Tensor<float>(),
+                                   timesteps,
+                                   context,
+                                   t5_ids,
+                                   t5_weights,
+                                   &x,
+                                   context_resource,
+                                   t5_ids_resource,
+                                   t5_weights_resource);
+            };
+            return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "anima_backend_output");
         }
     };
 }  // namespace Anima

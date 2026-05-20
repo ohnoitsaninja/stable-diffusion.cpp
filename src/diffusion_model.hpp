@@ -22,7 +22,9 @@ struct DiffusionParams {
     const sd::Tensor<float>* y                        = nullptr;
     const GgmlBackendTensorResource* y_backend        = nullptr;
     const sd::Tensor<int32_t>* t5_ids                 = nullptr;
+    const GgmlBackendTensorResource* t5_ids_backend   = nullptr;
     const sd::Tensor<float>* t5_weights               = nullptr;
+    const GgmlBackendTensorResource* t5_weights_backend = nullptr;
     const sd::Tensor<float>* guidance                 = nullptr;
     const std::vector<sd::Tensor<float>>* ref_latents = nullptr;
     const std::vector<const GgmlBackendTensorResource*>* ref_latents_backend = nullptr;
@@ -480,6 +482,22 @@ struct AnimaModel : public DiffusionModel {
                              tensor_or_empty(diffusion_params.context),
                              tensor_or_empty(diffusion_params.t5_ids),
                              tensor_or_empty(diffusion_params.t5_weights));
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_to_backend_resource(
+        int n_threads,
+        const DiffusionParams& diffusion_params) override {
+        GGML_ASSERT(diffusion_params.x_backend != nullptr);
+        GGML_ASSERT(diffusion_params.timesteps != nullptr);
+        return anima.compute_to_backend_resource(n_threads,
+                                                 *diffusion_params.x_backend,
+                                                 *diffusion_params.timesteps,
+                                                 tensor_or_empty(diffusion_params.context),
+                                                 diffusion_params.context_backend,
+                                                 tensor_or_empty(diffusion_params.t5_ids),
+                                                 diffusion_params.t5_ids_backend,
+                                                 tensor_or_empty(diffusion_params.t5_weights),
+                                                 diffusion_params.t5_weights_backend);
     }
 };
 

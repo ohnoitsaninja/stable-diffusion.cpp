@@ -1114,6 +1114,7 @@ int main(int argc, char** argv) {
         set_env_value("SDCPP_EXPERIMENTAL_FLUX2_BACKEND", "1");
         set_env_value("SDCPP_EXPERIMENTAL_Z_IMAGE_BACKEND", "1");
         set_env_value("SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND", "1");
+        set_env_value("SDCPP_EXPERIMENTAL_ANIMA_BACKEND", "1");
     }
     if (args.flux2_text_encoder_cpu_params) {
         set_env_value("SDCPP_FLUX2_TEXT_ENCODER_CPU_PARAMS", "1");

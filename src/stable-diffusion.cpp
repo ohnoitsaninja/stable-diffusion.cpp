@@ -3330,9 +3330,13 @@ public:
         const SDCondition& cond,
         const GgmlBackendTensorResource* cond_crossattn_backend,
         const GgmlBackendTensorResource* cond_vector_backend,
+        const GgmlBackendTensorResource* cond_t5_ids_backend,
+        const GgmlBackendTensorResource* cond_t5_weights_backend,
         const SDCondition& uncond,
         const GgmlBackendTensorResource* uncond_crossattn_backend,
         const GgmlBackendTensorResource* uncond_vector_backend,
+        const GgmlBackendTensorResource* uncond_t5_ids_backend,
+        const GgmlBackendTensorResource* uncond_t5_weights_backend,
         const sd_guidance_params_t& guidance,
         int64_t noise_seed,
         float eta,
@@ -3406,10 +3410,22 @@ public:
             LOG_ERROR("GPU sampler backend path does not support img_cfg != txt_cfg yet");
             return nullptr;
         }
-        if (!cond.c_concat.empty() || !uncond.c_concat.empty() ||
-            !cond.c_t5_ids.empty() || !uncond.c_t5_ids.empty() ||
-            !cond.c_t5_weights.empty() || !uncond.c_t5_weights.empty()) {
-            LOG_ERROR("GPU sampler backend path only supports plain SDXL/SD1-style text conditioning");
+        const bool cond_has_t5 = !cond.c_t5_ids.empty() || !cond.c_t5_weights.empty();
+        const bool uncond_has_t5 = !uncond.c_t5_ids.empty() || !uncond.c_t5_weights.empty();
+        if (!cond.c_concat.empty() || !uncond.c_concat.empty()) {
+            LOG_ERROR("GPU sampler backend path does not support concat conditioning in this pass");
+            return nullptr;
+        }
+        if ((cond_has_t5 || uncond_has_t5) && !sd_version_is_anima(version)) {
+            LOG_ERROR("GPU sampler backend path only supports T5 id/weight conditioning for the env-gated Anima lane");
+            return nullptr;
+        }
+        if (cond_has_t5 && (cond_t5_ids_backend == nullptr || cond_t5_weights_backend == nullptr)) {
+            LOG_ERROR("GPU sampler backend Anima path requires backend-resident T5 ids and weights");
+            return nullptr;
+        }
+        if (uncond_has_t5 && (uncond_t5_ids_backend == nullptr || uncond_t5_weights_backend == nullptr)) {
+            LOG_ERROR("GPU sampler backend Anima uncond path requires backend-resident T5 ids and weights");
             return nullptr;
         }
         if (!cond.extra_c_crossattns.empty() || !uncond.extra_c_crossattns.empty()) {
@@ -3418,11 +3434,11 @@ public:
         }
         if (is_flow) {
             if (!uncond.empty() || guidance.txt_cfg != 1.0f || guidance.img_cfg != guidance.txt_cfg) {
-                LOG_ERROR("GPU sampler backend Flux2 flow path currently supports distilled cfg=1 text conditioning only");
+                LOG_ERROR("GPU sampler backend flow path currently supports distilled cfg=1 text conditioning only");
                 return nullptr;
             }
             if (eta != 0.0f) {
-                LOG_ERROR("GPU sampler backend Flux2 flow path currently supports eta=0 Euler only");
+                LOG_ERROR("GPU sampler backend flow path currently supports eta=0 Euler only");
                 return nullptr;
             }
         }
@@ -4124,6 +4140,10 @@ public:
                 diffusion_params.context_backend = is_uncond_pass ? uncond_crossattn_backend : cond_crossattn_backend;
                 diffusion_params.y         = condition.c_vector.empty() ? nullptr : &condition.c_vector;
                 diffusion_params.y_backend = is_uncond_pass ? uncond_vector_backend : cond_vector_backend;
+                diffusion_params.t5_ids = condition.c_t5_ids.empty() ? nullptr : &condition.c_t5_ids;
+                diffusion_params.t5_ids_backend = is_uncond_pass ? uncond_t5_ids_backend : cond_t5_ids_backend;
+                diffusion_params.t5_weights = condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights;
+                diffusion_params.t5_weights_backend = is_uncond_pass ? uncond_t5_weights_backend : cond_t5_weights_backend;
                 diffusion_params.ref_latents = ref_latents;
                 diffusion_params.ref_latents_backend = ref_latents_backend;
                 diffusion_params.increase_ref_index = increase_ref_index;
@@ -6529,6 +6549,8 @@ struct sd_conditioning_resource_private_t {
     std::unique_ptr<GgmlBackendTensorResource> crossattn_backend;
     std::unique_ptr<GgmlBackendTensorResource> vector_backend;
     std::unique_ptr<GgmlBackendTensorResource> concat_backend;
+    std::unique_ptr<GgmlBackendTensorResource> t5_ids_backend;
+    std::unique_ptr<GgmlBackendTensorResource> t5_weights_backend;
     int64_t backend_upload_ms = 0;
     int clip_skip = -1;
     int width = -1;
@@ -8089,7 +8111,13 @@ static bool sd_conditioning_resource_has_backend_tensors(const sd_conditioning_r
     if (!condition.c_concat.empty() && (resource.concat_backend == nullptr || resource.concat_backend->empty())) {
         return false;
     }
-    if (!condition.c_t5_ids.empty() || !condition.c_t5_weights.empty() || !condition.extra_c_crossattns.empty()) {
+    if (!condition.c_t5_ids.empty() && (resource.t5_ids_backend == nullptr || resource.t5_ids_backend->empty())) {
+        return false;
+    }
+    if (!condition.c_t5_weights.empty() && (resource.t5_weights_backend == nullptr || resource.t5_weights_backend->empty())) {
+        return false;
+    }
+    if (!condition.extra_c_crossattns.empty()) {
         return false;
     }
     return !condition.empty();
@@ -8206,10 +8234,11 @@ static sd_conditioning_handle_t sd_conditioning_register(sd_ctx_t* sd_ctx,
     return resource->handle;
 }
 
-static std::unique_ptr<GgmlBackendTensorResource> sd_upload_tensor_to_backend_resource(sd_ctx_t* sd_ctx,
-                                                                                       const sd::Tensor<float>& tensor,
-                                                                                       const char* name,
-                                                                                       ggml_backend_t requested_backend = nullptr) {
+template <typename T>
+static std::unique_ptr<GgmlBackendTensorResource> sd_upload_tensor_to_backend_resource_typed(sd_ctx_t* sd_ctx,
+                                                                                             const sd::Tensor<T>& tensor,
+                                                                                             const char* name,
+                                                                                             ggml_backend_t requested_backend = nullptr) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || tensor.empty() || tensor.dim() > 4) {
         return nullptr;
     }
@@ -8227,7 +8256,7 @@ static std::unique_ptr<GgmlBackendTensorResource> sd_upload_tensor_to_backend_re
     int64_t ne1 = shape.size() > 1 ? shape[1] : 1;
     int64_t ne2 = shape.size() > 2 ? shape[2] : 1;
     int64_t ne3 = shape.size() > 3 ? shape[3] : 1;
-    handle->tensor = ggml_new_tensor_4d(handle->ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
+    handle->tensor = ggml_new_tensor_4d(handle->ctx, sd::GGMLTypeTraits<T>::type, ne0, ne1, ne2, ne3);
     if (name != nullptr) {
         ggml_set_name(handle->tensor, name);
     }
@@ -8241,6 +8270,13 @@ static std::unique_ptr<GgmlBackendTensorResource> sd_upload_tensor_to_backend_re
     ggml_backend_tensor_set(handle->tensor, tensor.data(), 0, ggml_nbytes(handle->tensor));
     ggml_backend_synchronize(resource_backend);
     return handle;
+}
+
+static std::unique_ptr<GgmlBackendTensorResource> sd_upload_tensor_to_backend_resource(sd_ctx_t* sd_ctx,
+                                                                                       const sd::Tensor<float>& tensor,
+                                                                                       const char* name,
+                                                                                       ggml_backend_t requested_backend = nullptr) {
+    return sd_upload_tensor_to_backend_resource_typed(sd_ctx, tensor, name, requested_backend);
 }
 
 static bool sd_conditioning_upload_backend_tensors(sd_ctx_t* sd_ctx,
@@ -8286,6 +8322,24 @@ static bool sd_conditioning_upload_backend_tensors(sd_ctx_t* sd_ctx,
                                                                         "conditioning_concat_f32",
                                                                         backend);
         if (resource->concat_backend == nullptr || resource->concat_backend->empty()) {
+            return false;
+        }
+    }
+    if (!condition.c_t5_ids.empty()) {
+        resource->t5_ids_backend = sd_upload_tensor_to_backend_resource_typed(sd_ctx,
+                                                                              condition.c_t5_ids,
+                                                                              "conditioning_t5_ids_i32",
+                                                                              backend);
+        if (resource->t5_ids_backend == nullptr || resource->t5_ids_backend->empty()) {
+            return false;
+        }
+    }
+    if (!condition.c_t5_weights.empty()) {
+        resource->t5_weights_backend = sd_upload_tensor_to_backend_resource(sd_ctx,
+                                                                            condition.c_t5_weights,
+                                                                            "conditioning_t5_weights_f32",
+                                                                            backend);
+        if (resource->t5_weights_backend == nullptr || resource->t5_weights_backend->empty()) {
             return false;
         }
     }
@@ -8537,13 +8591,21 @@ static bool sd_experimental_qwen_image_backend_enabled() {
            StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_X_BACKEND");
 }
 
+static bool sd_experimental_anima_backend_enabled() {
+    return StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_ANIMA_BACKEND");
+}
+
 static bool sd_version_is_flow_text_backend_candidate(SDVersion version) {
     return sd_version_is_flux2(version) ||
            sd_version_is_z_image(version) ||
-           sd_version_is_qwen_image(version);
+           sd_version_is_qwen_image(version) ||
+           sd_version_is_anima(version);
 }
 
 static const char* sd_flow_text_backend_name(SDVersion version) {
+    if (sd_version_is_anima(version)) {
+        return "anima";
+    }
     if (sd_version_is_qwen_image(version)) {
         return "qwen_image";
     }
@@ -8565,6 +8627,9 @@ static bool sd_experimental_flow_text_backend_enabled(SDVersion version) {
     }
     if (sd_version_is_qwen_image(version)) {
         return sd_experimental_qwen_image_backend_enabled();
+    }
+    if (sd_version_is_anima(version)) {
+        return sd_experimental_anima_backend_enabled();
     }
     return false;
 }
@@ -8605,6 +8670,9 @@ static bool sd_flow_text_backend_auto_release_disabled(SDVersion version) {
     }
     if (sd_version_is_qwen_image(version)) {
         return StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_QWEN_IMAGE_AUTO_RELEASE_TEXT_ENCODER");
+    }
+    if (sd_version_is_anima(version)) {
+        return StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_ANIMA_AUTO_RELEASE_TEXT_ENCODER");
     }
     return false;
 }
@@ -8653,14 +8721,12 @@ static bool sd_model_supports_gpu_latent_decode(SDVersion version) {
            sd_version_is_sdxl(version) ||
            sd_version_is_flux(version) ||
            sd_version_is_flux2(version) ||
-           sd_version_is_z_image(version) ||
-           sd_version_is_qwen_image(version) ||
-           sd_version_is_anima(version);
+           sd_version_is_z_image(version);
 }
 
 static bool sd_model_uses_gpu_latent_decode_bridge(SDVersion version) {
-    return sd_version_is_qwen_image(version) ||
-           sd_version_is_anima(version);
+    SD_UNUSED(version);
+    return false;
 }
 
 static bool sd_gpu_latent_shape_is_supported(SDVersion version, const sd_gpu_resource_private_t& resource) {
@@ -9965,7 +10031,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     const bool flow_reference_supported = is_supported_flow_backend &&
                                           sd_ctx->sd->version == VERSION_FLUX2_KLEIN;
     if (!is_sd_backend && !is_supported_flow_backend) {
-        LOG_ERROR("%s currently supports SDXL/SD1 UNet models or env-gated Qwen-family flow models only", name);
+        LOG_ERROR("%s currently supports SDXL/SD1 UNet models or env-gated text-only flow models only", name);
         return false;
     }
     const bool has_reference_images = sd_img_gen_params->ref_images_count > 0;
@@ -10304,9 +10370,13 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
                                                               embeds.cond,
                                                               positive_condition_resource != nullptr ? positive_condition_resource->crossattn_backend.get() : nullptr,
                                                               positive_condition_resource != nullptr ? positive_condition_resource->vector_backend.get() : nullptr,
+                                                              positive_condition_resource != nullptr ? positive_condition_resource->t5_ids_backend.get() : nullptr,
+                                                              positive_condition_resource != nullptr ? positive_condition_resource->t5_weights_backend.get() : nullptr,
                                                               embeds.uncond,
                                                               negative_condition_resource != nullptr ? negative_condition_resource->crossattn_backend.get() : nullptr,
                                                               negative_condition_resource != nullptr ? negative_condition_resource->vector_backend.get() : nullptr,
+                                                              negative_condition_resource != nullptr ? negative_condition_resource->t5_ids_backend.get() : nullptr,
+                                                              negative_condition_resource != nullptr ? negative_condition_resource->t5_weights_backend.get() : nullptr,
                                                               request.guidance,
                                                               request.seed,
                                                               plan.eta,
@@ -10528,7 +10598,11 @@ static bool sd_sample_latent_gpu_euler_backend_bridge(sd_ctx_t* sd_ctx,
                                                               embeds.cond,
                                                               nullptr,
                                                               nullptr,
+                                                              nullptr,
+                                                              nullptr,
                                                               embeds.uncond,
+                                                              nullptr,
+                                                              nullptr,
                                                               nullptr,
                                                               nullptr,
                                                               request.guidance,
@@ -11208,9 +11282,7 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
         sd_version_is_qwen_image(sd_ctx->sd->version);
     capabilities->supports_sampler_gpu_latent_output =
         supports_true_gpu_kdiffusion_sampler ||
-        supports_true_gpu_flux2_sampler ||
-        supports_true_gpu_z_image_sampler ||
-        supports_true_gpu_qwen_image_sampler;
+        supports_true_gpu_flow_text_sampler;
     capabilities->supports_sampler_gpu_latent_bridge_output = true;
     capabilities->supports_vae_gpu_latent_input = true;
     const bool true_vae_encode_gpu =
@@ -11290,12 +11362,16 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
     const bool qwen_image_conditioning_supported =
         flow_conditioning_supported &&
         sd_version_is_qwen_image(sd_ctx->sd->version);
+    const bool anima_conditioning_supported =
+        flow_conditioning_supported &&
+        sd_version_is_anima(sd_ctx->sd->version);
     capabilities->supports_sampler_conditioning_handle_input =
         sd_ctx == nullptr || sd_ctx->sd == nullptr ||
         (sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version)) ||
         flux2_conditioning_supported ||
         z_image_conditioning_supported ||
-        qwen_image_conditioning_supported;
+        qwen_image_conditioning_supported ||
+        anima_conditioning_supported;
 #ifdef SD_USE_CUDA
     capabilities->supports_conditioning_gpu_resident =
         capabilities->supports_sampler_conditioning_handle_input &&
@@ -11306,7 +11382,8 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
         (!sd_ctx->sd->is_flow_denoiser() ||
          flux2_conditioning_supported ||
          z_image_conditioning_supported ||
-         qwen_image_conditioning_supported) &&
+         qwen_image_conditioning_supported ||
+         anima_conditioning_supported) &&
         ggml_backend_is_cuda(sd_ctx->sd->backend);
 #else
     capabilities->supports_conditioning_gpu_resident = false;
@@ -12788,7 +12865,7 @@ static bool sd_conditioning_encode_text_impl(sd_ctx_t* sd_ctx,
     if (!sd_version_is_sd1(sd_ctx->sd->version) &&
         !sd_version_is_sdxl(sd_ctx->sd->version) &&
         !sd_version_is_flow_text_backend_candidate(sd_ctx->sd->version)) {
-        LOG_ERROR("sd_conditioning_encode_text currently supports SD1/SDXL and Qwen flow text-only conditioning only");
+        LOG_ERROR("sd_conditioning_encode_text currently supports SD1/SDXL and env-gated flow text-only conditioning only");
         return false;
     }
 

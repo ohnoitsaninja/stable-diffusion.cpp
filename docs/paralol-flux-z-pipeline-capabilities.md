@@ -1,8 +1,8 @@
 # Paralol Flux and Z-Image Pipeline Capabilities
 
 This fork exposes model-family capability metadata so Paralol can route SDXL,
-Flux-family, Flux2, and Z-Image workflows without hard-coding latent shapes or
-assuming SDXL semantics.
+Flux-family, Flux2, Z-Image, Qwen-Image, and Anima workflows without hard-coding
+latent shapes or assuming SDXL semantics.
 
 ## Public API
 
@@ -42,11 +42,13 @@ Important fields:
 | Flux / Flux1-style | 16 channels | model-reported | CLIP-L + T5XXL | Supported |
 | Z-Image | 16 channels | 8 | Qwen LLM | Supported |
 | Flux2 | 128 channels | 16 | Qwen LLM | Supported |
+| Qwen-Image | 16 channels | 8 | Qwen LLM | Sampler latent supported; VAE image decode not claimed |
+| Anima | 16 channels | 8 | Qwen LLM + T5 ids/weights | Sampler latent supported; VAE image decode not claimed |
 
 ## Shared Qwen Flow Backend Contract
 
-Flux2 and Z-Image now use the same narrow fork-side contract instead of two
-separate one-off code paths:
+Flux2, Z-Image, Qwen-Image, and Anima use the same narrow fork-side sampler
+contract instead of one-off code paths:
 
 - a model-family env gate enables the backend sampler lane;
 - `sd_conditioning_encode_text()` produces reusable Qwen conditioning handles;
@@ -58,7 +60,7 @@ separate one-off code paths:
   smoke coverage; masks, reference/edit images, ControlNet, and image-CFG stay
   unsupported;
 - `sd_decode_gpu_latent_normal_gpu()` consumes that handle and returns an
-  `SD_GPU_RESOURCE_IMAGE` handle;
+  `SD_GPU_RESOURCE_IMAGE` handle only for families whose VAE path is validated;
 - CPU pixels are only materialized by explicit caller-owned download.
 
 The shared helpers currently advertise only families that satisfy that exact
@@ -69,6 +71,49 @@ the conditioning descriptor reports `device_resident=true`, sampler timing
 reports `sampler_math_residency=gpu_backend_tensor`, init-latent timing reports
 `init_bridge_download=false` when an init handle is supplied, and the sampled
 latent has no bridge flags in `SDCPP_STRICT_GPU_RESIDENT=1`.
+
+## Anima Verification
+
+Anima has a first strict fork-side sampler lane, not a full end-to-end image
+lane yet. Enable it with:
+
+```powershell
+$env:SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1
+$env:SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS=1
+```
+
+The supported lane is text-only T2I, batch 1, Euler, cfg `1.0`, Qwen/T5
+conditioning handles, no ControlNet, no masks, no reference/edit images, and no
+multibatch. The default Anima workflow settings (`er_sde`, cfg around `4.5`,
+30 steps) are not claimed by this strict lane yet.
+
+Validated smoke:
+
+- Diffusion model:
+  `F:\automatic1111\Stability\Models\DiffusionModels\anima-base-v1.0.safetensors`
+- VAE:
+  `F:\automatic1111\Stability\Models\VAE\qwen_image_vae.safetensors`
+- LLM:
+  `F:\automatic1111\Stability\Models\TextEncoders\qwen_3_06b_base.safetensors`
+- Resolution: `512x512`
+- Steps: `1`
+- CFG: `1.0`
+- Sampler/scheduler: `euler` / `discrete`
+
+Observed strict handoff:
+
+- conditioning handle: device-resident backend tensors, including Anima
+  `t5_ids` and `t5_weights`
+- conditioning per-step upload: false
+- sampled GPU latent: `1x16x64x64`, f32, CUDA, 262,144 bytes
+- sampler math residency: `gpu_backend_tensor`
+- sampler bridge flags: none
+- VAE decode/image output: not claimed
+
+The Qwen-image VAE bridge is intentionally not advertised for Anima/Qwen image
+output because the local Qwen/X VAE decode test produced a blurry image. Keep
+Paralol on latent-only handoff for these families until that VAE path is fixed
+against a known-good Comfy reference.
 
 ## Z-Image Verification
 
@@ -472,24 +517,25 @@ For Flux2:
 For Qwen-Image and Anima:
 
 1. Treat both as Qwen-family flow models, not SDXL variants.
-2. Qwen-Image now has a narrow env-gated strict sampler lane for text-only T2I:
+2. Qwen-Image has a narrow env-gated strict sampler lane for text-only T2I:
    set `SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1` (or use
    `sd-latent-smoke --gpu-flow-sampler`) and keep the text encoder in RAM on
    16 GB cards with `SDCPP_QWEN_IMAGE_TEXT_ENCODER_CPU_PARAMS=1`.
-3. The supported Qwen-Image strict sampler lane is batch 1, Euler, `cfg=1`,
-   text conditioning handles, no ControlNet, no masks, no reference/edit, and
-   no image-CFG. The sampler consumes the Qwen conditioning tensor by reference
+3. Anima has the same narrow sampler contract behind
+   `SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1` with
+   `SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS=1`.
+4. The supported strict sampler lane is batch 1, Euler, `cfg=1`, text
+   conditioning handles, no ControlNet, no masks, no reference/edit, and no
+   image-CFG. The sampler consumes resident conditioning tensors by reference
    and returns a CUDA `SD_GPU_RESOURCE_LATENT` with no sampler bridge flags.
-4. The fork still reports GPU latent decode support through the Wan/Qwen VAE
-   bridge for Qwen-Image and Anima. This bridge is intentionally not strict
-   GPU-resident: it downloads the GPU latent for the legacy Wan/Qwen VAE decode
-   path and re-uploads the decoded image as a GPU image handle.
-5. In `SDCPP_STRICT_GPU_RESIDENT=1`, this bridge is refused. Paralol should
-   surface that as an honest unsupported strict path instead of retrying
-   silently.
-6. Anima currently advertises conservative defaults (`er_sde`, cfg `4.5`,
-   `30` steps) and no GPU VAE encode output. Its decode path remains a
-   compatibility bridge until the Wan/Qwen VAE is made backend-resident.
+5. Qwen-Image and Anima GPU VAE/image output is deliberately not claimed. The
+   local Qwen/X VAE bridge produced a blurry image, so the fork reports
+   `supports_gpu_latent_decode=false` / `supports_gpu_image_output=false` for
+   those families until the Qwen-image VAE path is fixed against Comfy.
+6. Anima still advertises conservative workflow defaults (`er_sde`, cfg `4.5`,
+   `30` steps), but those defaults are not part of the current strict sampler
+   lane. Paralol should only treat the explicit Euler/cfg=1 smoke as the strict
+   GPU-resident checkpoint for now.
 7. Qwen-Image reference/edit conditioning is still broader than the text-only
    flow backend contract. Do not claim strict GPU-resident Qwen-Image
    reference/edit until its conditioning and sampler path consume backend
@@ -537,11 +583,12 @@ Validated Qwen-Image strict sampler smoke:
 - output:
   `F:\Paralol\local\stable-diffusion.cpp-speed\build\qwen-image-speed\qwen-image-t2i-512-1step.png`
 
-The matching non-strict decode smoke succeeds through the Wan/Qwen VAE bridge
-and reports `host_copies=1`, `device_copies=1`, and `im2col=true`. This is
-usable for compatibility but is not the SDXL/Flux2-class strict VAE path.
+The matching non-strict decode smoke is not accepted as an image-quality pass:
+the local Qwen/X VAE output was visibly blurry. Keep Qwen-Image advertised as
+sampler-latent validated, not end-to-end GPU image validated, until the
+Qwen-image VAE is corrected.
 
-Validated Anima compatibility smoke:
+Validated Anima strict sampler smoke:
 
 - Diffusion model:
   `F:\automatic1111\Stability\Models\DiffusionModels\anima-base-v1.0.safetensors`
@@ -550,21 +597,22 @@ Validated Anima compatibility smoke:
 - LLM:
   `F:\automatic1111\Stability\Models\TextEncoders\qwen_3_06b_base.safetensors`
 - Resolution: `512x512`
-- Steps: `30`
-- CFG: `4.5`
-- Sampler: `er_sde`
+- Steps: `1`
+- CFG: `1.0`
+- Sampler: `euler`
 
 Observed handoff:
 
-- sampled latent is exposed as a GPU handle through the compatibility bridge
-- `sampler_math_residency=cpu_tensor`
-- `bridge_upload=true`
-- Wan/Qwen VAE bridge decode succeeds
-- decode report is honest: `im2col=true`, `host_copies=1`,
-  `device_copies=1`, planned workspace about `1874.5 MiB`
-- caller-owned image download succeeds
-- output:
-  `F:\Paralol\local\stable-diffusion.cpp-speed\build\anima-smoke\anima-512-30step.png`
+- conditioning handle is device-resident, including Anima `t5_ids` and
+  `t5_weights`
+- `conditioning_per_step_upload=false`
+- `sampler_math_residency=gpu_backend_tensor`
+- sampled latent is CUDA `1x16x64x64`, `262144` bytes
+- `init_bridge_download=false`
+- `output_bridge_upload=false`
+- GPU VAE/image output is not claimed
+- smoke log:
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\anima-up-to-par\anima-strict-sampler.stdout.log`
 
 This is a functional compatibility path, not parity with the SDXL/Flux2 strict
 GPU-resident lane.

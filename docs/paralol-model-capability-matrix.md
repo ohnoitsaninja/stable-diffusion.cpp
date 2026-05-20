@@ -39,8 +39,8 @@ least one local smoke or existing artifact supports the claim.
 | Flux.1 | 16 ch | model-reported, normally 8 | Supported | Supported | No | TAEF1 verified | Uses CLIP-L + T5XXL. |
 | Flux2 / Klein | 128 ch | 16 | Supported | Use reference images for edit mode, not SDXL-style init latent unless explicitly testing I2I | Yes, via `ref_images` | TAEF2 verified | Flux2 edit/reference conditioning is a different path than SDXL I2I init-latent sampling. |
 | Z-Image / Z-Anime | 16 ch | 8 | Supported | Supported for Z-Image smoke path | Not claimed | Not claimed | Z T2I and init-latent bridge smokes pass. Reference/edit capability is intentionally not advertised yet. |
-| Qwen-Image | 16 ch | 8 | Supported for text-only `cfg=1` strict sampler; VAE decode remains a bridge | Compatibility bridge | Qwen edit path, not strict-resident | TAEHV compatible, not claimed here | `SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1` enables the strict sampler lane. Wan/Qwen VAE decode still reports host copies and IM2COL honestly. |
-| Anima | 16 ch | 8 | Compatibility bridge | Compatibility bridge | No | Not claimed | Wan/Qwen VAE path is safe but not COMFY_NORMAL: high IM2COL memory and host bridge copies are reported honestly. |
+| Qwen-Image | 16 ch | 8 | Supported for text-only `cfg=1` strict sampler; VAE decode is not claimed | Compatibility bridge | Qwen edit path, not strict-resident | TAEHV compatible, not claimed here | `SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1` enables the strict sampler lane. The local Qwen VAE bridge produced a blurry image, so GPU image decode capability is deliberately false until that path is fixed. |
+| Anima | 16 ch | 8 | Supported for text-only `cfg=1` strict sampler, no VAE decode claim | Compatibility bridge | No | Not claimed | `SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1` enables the strict sampler lane. Default `er_sde` / `cfg=4.5` and Qwen-image VAE decode remain unclaimed. |
 | Marigold IID | 8 ch | model-specific | Not supported | Not supported | N/A | N/A | Uses the dedicated intrinsic-image decomposition API. |
 
 ## Verification snapshot
@@ -58,8 +58,9 @@ Known verified paths at the time this matrix was written:
   GPU VAE Decode at 512.
 - Z-Image VAE Encode GPU latent -> non-strict KSampler init bridge -> isolated
   GPU VAE Decode at 512.
-- Anima T2I and VAE Encode/Decode compatibility bridges with strict-mode
-  refusal for the bridge-only paths.
+- Anima text-only `cfg=1` T2I strict sampler lane: resident Qwen/T5
+  conditioning handle -> backend flow sampler -> CUDA `1x16x64x64` latent at
+  512px, with no sampler bridge flags.
 - Qwen-Image text-only `cfg=1` T2I strict sampler lane: resident Qwen
   conditioning handle -> backend flow sampler -> CUDA `1x16x64x64` latent, with
   no sampler bridge flags.
@@ -67,8 +68,12 @@ Known verified paths at the time this matrix was written:
 Pending or deliberately unclaimed:
 
 - Z reference/edit conditioning.
-- Qwen-Image CFG, reference/edit, vision conditioning, and true strict VAE
-  decode.
+- Qwen-Image and Anima VAE decode image-quality validation/fix for the
+  Qwen-image VAE. The Qwen/X bridge is not accepted because it produced a
+  blurry output in local testing.
+- Qwen-Image CFG, reference/edit, and vision conditioning.
+- Anima default sampler lane (`er_sde`, cfg around `4.5`) beyond the current
+  strict Euler/cfg=1 proof path.
 - TAE previews for SD1, Z-Image/Z-Anime, and Anima.
 - True all-GPU sampler internals. See
   `docs/paralol-true-gpu-sampler-plan.md`.
