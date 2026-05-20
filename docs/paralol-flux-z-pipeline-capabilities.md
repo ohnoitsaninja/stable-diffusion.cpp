@@ -646,3 +646,33 @@ Observed handoff:
 The sampler path is strict GPU-resident. The VAE image path is currently a
 recoverable compatibility bridge, not parity with the SDXL/Flux2 strict
 GPU-resident VAE lane.
+
+Anima VAE bridge correctness was checked against ComfyUI using the exact same
+fork-exported `1x16x64x64` sampled latent. The fork bridge matches Comfy only
+when the Comfy decode receives `Wan21.process_out(latent)` before
+`vae.decode(...)`; raw latent decode does not match. This confirms the fork's
+Wan21 latent mean/std transform is aligned with Comfy and that the bridge's
+current limitation is residency/performance rather than VAE math.
+
+- Comfy source behavior:
+  - `comfy.supported_models.Anima.latent_format = latent_formats.Wan21`
+  - `Wan21.process_out(latent) = latent * std + mean`
+  - `nodes.VAEDecode.decode()` calls `vae.decode(latent)` after sampler/model
+    code has produced VAE-space samples.
+- Fork source behavior:
+  - `AutoEncoderKL::uses_wan21_latent_format()` covers Qwen-Image and Anima.
+  - `decode_first_stage(...)` applies `diffusion_to_vae_latents(...)` before
+    VAE decode.
+- Diagnostic harness:
+  `scripts/anima_vae_bridge_parity.py`
+- Local comparison artifacts:
+  `F:\Paralol\local\stable-diffusion.cpp-speed\build\anima-up-to-par\vae-parity-bridge\comfy_compare`
+- Same-latent results:
+  - raw Comfy VAE decode: mean abs `17.9492`, p99 `116`, PSNR `18.20 dB`
+  - Comfy `Wan21.process_out` decode: mean abs `0.2078`, p99 `2`,
+    PSNR `53.77 dB`
+
+Do not promote Anima/Qwen VAE decode to true GPU-resident until the Wan/Qwen
+VAE graph itself can consume a backend latent and return a backend image without
+the bridge download/upload. The current capability split is intentional:
+`supports_gpu_latent_decode=false` and `supports_gpu_latent_decode_bridge=true`.
