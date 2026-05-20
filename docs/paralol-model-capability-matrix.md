@@ -19,6 +19,11 @@ least one local smoke or existing artifact supports the claim.
   true backend-resident sampler lanes.
 - GPU VAE Decode should prefer `sd_decode_gpu_latent_normal_gpu(...)` whenever
   `supports_gpu_latent_decode=true`.
+- Qwen-Image and Anima expose a separate decode bridge capability:
+  `supports_gpu_latent_decode_bridge=true` /
+  `supports_gpu_image_output_bridge=true`. That bridge consumes and returns GPU
+  handles, but internally downloads the latent for the legacy Wan/Qwen VAE
+  decode and re-uploads the image. Strict GPU-resident mode refuses it.
 - I2I KSampler init-latent handoff should use
   `sd_sample_latent_gpu_with_init_gpu(...)` only in non-strict mode. This API
   bridge-downloads the init latent internally, samples through the existing
@@ -39,8 +44,8 @@ least one local smoke or existing artifact supports the claim.
 | Flux.1 | 16 ch | model-reported, normally 8 | Supported | Supported | No | TAEF1 verified | Uses CLIP-L + T5XXL. |
 | Flux2 / Klein | 128 ch | 16 | Supported | Use reference images for edit mode, not SDXL-style init latent unless explicitly testing I2I | Yes, via `ref_images` | TAEF2 verified | Flux2 edit/reference conditioning is a different path than SDXL I2I init-latent sampling. |
 | Z-Image / Z-Anime | 16 ch | 8 | Supported | Supported for Z-Image smoke path | Not claimed | Not claimed | Z T2I and init-latent bridge smokes pass. Reference/edit capability is intentionally not advertised yet. |
-| Qwen-Image | 16 ch | 8 | Supported for text-only `cfg=1` strict sampler; VAE decode is not claimed | Compatibility bridge | Qwen edit path, not strict-resident | TAEHV compatible, not claimed here | `SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1` enables the strict sampler lane. The local Qwen VAE bridge produced a blurry image, so GPU image decode capability is deliberately false until that path is fixed. |
-| Anima | 16 ch | 8 | Supported for text-only strict sampler, no GPU VAE decode claim | Compatibility bridge | No | Not claimed | `SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1` enables the strict sampler lane. Validated sampler methods: `euler`, `euler_a`, `er_sde`, `dpmpp_2m_sde_gpu`. Qwen-image VAE GPU decode remains unclaimed. |
+| Qwen-Image | 16 ch | 8 | Supported for text-only `cfg=1` strict sampler; true GPU VAE decode is not claimed | Compatibility bridge | Qwen edit path, not strict-resident | TAEHV compatible, not claimed here | `SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1` enables the strict sampler lane. Non-strict VAE bridge is reported separately; the local Qwen VAE image remains unaccepted. |
+| Anima | 16 ch | 8 | Supported for text-only strict sampler; true GPU VAE decode is not claimed | Compatibility bridge | No | Not claimed | `SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1` enables the strict sampler lane. Validated sampler methods: `euler`, `euler_a`, `er_sde`, `dpmpp_2m_sde_gpu`. Non-strict Wan/Qwen VAE bridge produces coherent diagnostics at realistic settings. |
 | Marigold IID | 8 ch | model-specific | Not supported | Not supported | N/A | N/A | Uses the dedicated intrinsic-image decomposition API. |
 
 ## Verification snapshot
@@ -67,6 +72,10 @@ Known verified paths at the time this matrix was written:
   can write coherent Anima diagnostic images at realistic settings
   (`er_sde`, CFG 4.5, 30 steps), but GPU VAE image output is still not
   advertised for Anima/Qwen-image.
+- Anima non-strict GPU-handle VAE bridge: sampled CUDA latent ->
+  `sd_decode_gpu_latent_normal_gpu()` -> legacy Wan/Qwen VAE decode ->
+  uploaded CUDA image handle. The returned image handle carries CPU bridge
+  provenance flags and strict mode refuses this path.
 - Qwen-Image text-only `cfg=1` T2I strict sampler lane: resident Qwen
   conditioning handle -> backend flow sampler -> CUDA `1x16x64x64` latent, with
   no sampler bridge flags.
@@ -79,9 +88,10 @@ Pending or deliberately unclaimed:
   blurry output in local testing.
 - Qwen-Image CFG, reference/edit, and vision conditioning.
 - Anima Comfy/reference-quality image acceptance for the Qwen-image VAE path.
-  The current fork can decode diagnostics through the CPU compatibility path,
-  but `sd_decode_gpu_latent_normal_gpu()` remains intentionally disabled for
-  Anima/Qwen-image until the VAE output is verified.
+  The current fork can decode diagnostics through the CPU compatibility path or
+  non-strict GPU-handle bridge, but true device-resident VAE image output
+  remains intentionally disabled for Anima/Qwen-image until the VAE output is
+  verified.
 - TAE previews for SD1, Z-Image/Z-Anime, and Anima.
 - True all-GPU sampler internals. See
   `docs/paralol-true-gpu-sampler-plan.md`.

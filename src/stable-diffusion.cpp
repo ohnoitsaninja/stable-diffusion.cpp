@@ -8719,7 +8719,7 @@ static bool sd_version_is_base_sd1_vae_gpu_safe(SDVersion version) {
     return version == VERSION_SD1;
 }
 
-static bool sd_model_supports_gpu_latent_decode(SDVersion version) {
+static bool sd_model_supports_true_gpu_latent_decode(SDVersion version) {
     return sd_version_is_base_sd1_vae_gpu_safe(version) ||
            sd_version_is_sdxl(version) ||
            sd_version_is_flux(version) ||
@@ -8728,8 +8728,12 @@ static bool sd_model_supports_gpu_latent_decode(SDVersion version) {
 }
 
 static bool sd_model_uses_gpu_latent_decode_bridge(SDVersion version) {
-    SD_UNUSED(version);
-    return false;
+    return sd_version_is_qwen_image(version) || sd_version_is_anima(version);
+}
+
+static bool sd_model_supports_gpu_latent_decode(SDVersion version) {
+    return sd_model_supports_true_gpu_latent_decode(version) ||
+           sd_model_uses_gpu_latent_decode_bridge(version);
 }
 
 static bool sd_gpu_latent_shape_is_supported(SDVersion version, const sd_gpu_resource_private_t& resource) {
@@ -11136,7 +11140,8 @@ SD_API sd_image_t* sd_decode_latent_normal(sd_ctx_t* sd_ctx,
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
         return nullptr;
     }
-    if (!sd_model_supports_gpu_latent_decode(sd_ctx->sd->version)) {
+    if (sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version) ||
+        !sd_model_supports_gpu_latent_decode(sd_ctx->sd->version)) {
         if (sd_ctx->sd->first_stage_model == nullptr) {
             LOG_ERROR("sd_decode_latent_normal compatibility fallback requires a loaded VAE");
             return nullptr;
@@ -11379,7 +11384,7 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
         sd_ctx != nullptr &&
         sd_ctx->sd != nullptr &&
         sd_version_is_flux2(sd_ctx->sd->version) &&
-        sd_model_supports_gpu_latent_decode(sd_ctx->sd->version);
+        sd_model_supports_true_gpu_latent_decode(sd_ctx->sd->version);
     capabilities->supports_flux2_qwen_conditioning_gpu_resident =
         supports_true_gpu_flux2_sampler &&
         !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT");
@@ -11389,7 +11394,7 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
         sd_ctx != nullptr &&
         sd_ctx->sd != nullptr &&
         sd_version_is_z_image(sd_ctx->sd->version) &&
-        sd_model_supports_gpu_latent_decode(sd_ctx->sd->version);
+        sd_model_supports_true_gpu_latent_decode(sd_ctx->sd->version);
     capabilities->supports_z_image_qwen_conditioning_gpu_resident =
         supports_true_gpu_z_image_sampler &&
         !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT");
@@ -11399,10 +11404,24 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
         sd_ctx != nullptr &&
         sd_ctx->sd != nullptr &&
         sd_version_is_qwen_image(sd_ctx->sd->version) &&
-        sd_model_supports_gpu_latent_decode(sd_ctx->sd->version);
+        sd_model_supports_true_gpu_latent_decode(sd_ctx->sd->version);
     capabilities->supports_qwen_image_qwen_conditioning_gpu_resident =
         supports_true_gpu_qwen_image_sampler &&
         !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_CONDITIONING_GPU_RESIDENT");
+    capabilities->supports_vae_gpu_latent_decode_bridge =
+        sd_ctx == nullptr ||
+        sd_ctx->sd == nullptr ||
+        sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version);
+    capabilities->supports_qwen_image_vae_decode_bridge =
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        sd_version_is_qwen_image(sd_ctx->sd->version) &&
+        sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version);
+    capabilities->supports_anima_vae_decode_bridge =
+        sd_ctx != nullptr &&
+        sd_ctx->sd != nullptr &&
+        sd_version_is_anima(sd_ctx->sd->version) &&
+        sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version);
     return true;
 }
 
@@ -11602,8 +11621,10 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
     capabilities->default_scheduler = sd_get_default_scheduler(sd_ctx, capabilities->default_sample_method);
     capabilities->default_flow_shift = std::isfinite(sd_ctx->sd->default_flow_shift) ? sd_ctx->sd->default_flow_shift : 0.0f;
     capabilities->supports_gpu_sample_bridge_output = true;
-    capabilities->supports_gpu_latent_decode = sd_model_supports_gpu_latent_decode(version);
+    capabilities->supports_gpu_latent_decode = sd_model_supports_true_gpu_latent_decode(version);
     capabilities->supports_gpu_image_output = capabilities->supports_gpu_latent_decode;
+    capabilities->supports_gpu_latent_decode_bridge = sd_model_uses_gpu_latent_decode_bridge(version);
+    capabilities->supports_gpu_image_output_bridge = capabilities->supports_gpu_latent_decode_bridge;
     capabilities->supports_vae_encode_gpu_output =
         capabilities->supports_vae_encode &&
         should_use_normal_vae_for_generation_encode(sd_ctx);
@@ -11702,12 +11723,16 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
             sd_ctx_supports_true_gpu_flow_text_backend(sd_ctx);
         capabilities->supports_qwen_image_gpu_latent_output = capabilities->supports_qwen_image_flow_backend_sampler;
         capabilities->supports_qwen_image_vae_decode_gpu = capabilities->supports_gpu_latent_decode;
+        capabilities->supports_qwen_image_vae_decode_bridge = capabilities->supports_gpu_latent_decode_bridge;
         capabilities->supports_qwen_image_vae_bf16_or_compact_storage = false;
         capabilities->supports_qwen_image_controlnet = false;
         capabilities->supports_qwen_image_masks = false;
         capabilities->supports_qwen_image_reference = false;
         capabilities->supports_qwen_image_edit = false;
         capabilities->supports_qwen_image_multibatch = false;
+    }
+    if (sd_version_is_anima(version)) {
+        capabilities->supports_anima_vae_decode_bridge = capabilities->supports_gpu_latent_decode_bridge;
     }
     if (sd_version_is_marigold_iid(version)) {
         capabilities->latent_channels = 8;

@@ -486,7 +486,10 @@ typedef struct sd_gpu_capabilities_t {
     bool supports_qwen_image_flow_backend_sampler;
     bool supports_qwen_image_vae_decode_gpu;
     bool supports_qwen_image_qwen_conditioning_gpu_resident;
-    uint32_t reserved[4];
+    bool supports_vae_gpu_latent_decode_bridge;
+    bool supports_qwen_image_vae_decode_bridge;
+    bool supports_anima_vae_decode_bridge;
+    uint32_t reserved[3];
 } sd_gpu_capabilities_t;
 
 typedef uint64_t sd_conditioning_handle_t;
@@ -642,6 +645,10 @@ typedef struct sd_model_pipeline_capabilities_t {
     bool supports_qwen_image_reference;
     bool supports_qwen_image_edit;
     bool supports_qwen_image_multibatch;
+    bool supports_gpu_latent_decode_bridge;
+    bool supports_gpu_image_output_bridge;
+    bool supports_qwen_image_vae_decode_bridge;
+    bool supports_anima_vae_decode_bridge;
 } sd_model_pipeline_capabilities_t;
 
 typedef struct sd_marigold_iid_options_t {

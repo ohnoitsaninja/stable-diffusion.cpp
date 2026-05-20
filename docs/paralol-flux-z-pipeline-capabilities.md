@@ -20,9 +20,14 @@ Important fields:
   lanes for split-model loading.
 - `supports_gpu_sample_bridge_output`: sampler can return a GPU latent handle,
   currently by bridge-uploading the final latent.
-- `supports_gpu_latent_decode`: `sd_decode_gpu_latent_normal_gpu()` is supported
-  for this family.
-- `supports_gpu_image_output`: VAE decode can return a GPU image handle.
+- `supports_gpu_latent_decode`: `sd_decode_gpu_latent_normal_gpu()` is a true
+  device-resident decode for this family.
+- `supports_gpu_image_output`: VAE decode can return a GPU image handle without
+  an internal CPU bridge.
+- `supports_gpu_latent_decode_bridge` / `supports_gpu_image_output_bridge`:
+  `sd_decode_gpu_latent_normal_gpu()` can consume and return GPU handles, but
+  the VAE path downloads the latent for legacy decode and re-uploads the image.
+  Strict GPU-resident mode refuses this bridge.
 - `supports_reference_images`: generation params may carry reference images.
 - `supports_edit_mode`: the model expects edit/reference conditioning rather
   than plain text-to-image only conditioning.
@@ -541,18 +546,23 @@ For Qwen-Image and Anima:
 3. Anima has the same narrow sampler contract behind
    `SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1` with
    `SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS=1`.
-4. The supported strict sampler lane is batch 1, Euler, `cfg=1`, text
-   conditioning handles, no ControlNet, no masks, no reference/edit, and no
-   image-CFG. The sampler consumes resident conditioning tensors by reference
-   and returns a CUDA `SD_GPU_RESOURCE_LATENT` with no sampler bridge flags.
-5. Qwen-Image and Anima GPU VAE/image output is deliberately not claimed. The
-   local Qwen/X VAE bridge produced a blurry image, so the fork reports
-   `supports_gpu_latent_decode=false` / `supports_gpu_image_output=false` for
-   those families until the Qwen-image VAE path is fixed against Comfy.
-6. Anima still advertises conservative workflow defaults (`er_sde`, cfg `4.5`,
-   `30` steps), but those defaults are not part of the current strict sampler
-   lane. Paralol should only treat the explicit Euler/cfg=1 smoke as the strict
-   GPU-resident checkpoint for now.
+4. The supported strict sampler lane is batch 1, text conditioning handles, no
+   ControlNet, no masks, no reference/edit, and no image-CFG. Qwen-Image
+   remains text-only `euler`/cfg `1` until separately validated. Anima has
+   strict sampler smokes for `euler`, `euler_a`, `er_sde`, and
+   `dpmpp_2m_sde_gpu` with cfg `4.5`. The sampler consumes resident
+   conditioning tensors by reference and returns a CUDA `SD_GPU_RESOURCE_LATENT`
+   with no sampler bridge flags.
+5. Qwen-Image and Anima true GPU VAE/image output is deliberately not claimed:
+   `supports_gpu_latent_decode=false` and `supports_gpu_image_output=false`.
+   They now expose a separate non-strict bridge capability:
+   `supports_gpu_latent_decode_bridge=true` and
+   `supports_gpu_image_output_bridge=true`. The bridge accepts a GPU latent
+   handle and returns a GPU image handle, but logs/flags the internal latent
+   download and decoded-image upload. `SDCPP_STRICT_GPU_RESIDENT=1` refuses it.
+6. Anima advertises workflow defaults (`er_sde`, cfg `4.5`, `30` steps). Use
+   those settings for image-quality checks; short Euler/cfg=1 smokes are API
+   validation only and produce misleading low-quality images.
 7. Qwen-Image reference/edit conditioning is still broader than the text-only
    flow backend contract. Do not claim strict GPU-resident Qwen-Image
    reference/edit until its conditioning and sampler path consume backend
@@ -602,8 +612,8 @@ Validated Qwen-Image strict sampler smoke:
 
 The matching non-strict decode smoke is not accepted as an image-quality pass:
 the local Qwen/X VAE output was visibly blurry. Keep Qwen-Image advertised as
-sampler-latent validated, not end-to-end GPU image validated, until the
-Qwen-image VAE is corrected.
+sampler-latent validated plus VAE bridge-capable, not true GPU image validated,
+until the Qwen-image VAE is corrected against Comfy.
 
 Validated Anima strict sampler smoke:
 
@@ -614,9 +624,9 @@ Validated Anima strict sampler smoke:
 - LLM:
   `F:\automatic1111\Stability\Models\TextEncoders\qwen_3_06b_base.safetensors`
 - Resolution: `512x512`
-- Steps: `1`
-- CFG: `1.0`
-- Sampler: `euler`
+- Steps: `2` sampler-only strict smoke, `30` decoded bridge smoke
+- CFG: `4.5`
+- Samplers validated: `euler`, `euler_a`, `er_sde`, `dpmpp_2m_sde_gpu`
 
 Observed handoff:
 
@@ -627,9 +637,12 @@ Observed handoff:
 - sampled latent is CUDA `1x16x64x64`, `262144` bytes
 - `init_bridge_download=false`
 - `output_bridge_upload=false`
-- GPU VAE/image output is not claimed
+- true GPU VAE/image output is not claimed
+- non-strict VAE bridge is available and marks decoded image handles with
+  CPU bridge provenance flags
 - smoke log:
   `F:\Paralol\local\stable-diffusion.cpp-speed\build\anima-up-to-par\anima-strict-sampler.stdout.log`
 
-This is a functional compatibility path, not parity with the SDXL/Flux2 strict
-GPU-resident lane.
+The sampler path is strict GPU-resident. The VAE image path is currently a
+recoverable compatibility bridge, not parity with the SDXL/Flux2 strict
+GPU-resident VAE lane.
