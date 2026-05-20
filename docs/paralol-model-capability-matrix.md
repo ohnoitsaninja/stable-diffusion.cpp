@@ -7,15 +7,16 @@ least one local smoke or existing artifact supports the claim.
 
 ## Common rules
 
-- KSampler GPU latent output is still a non-strict bridge. The sampler loop
-  materializes the final latent on the host and uploads it into an owned CUDA
+- KSampler GPU latent output is family-specific. SD1/SDXL and the env-gated
+  Flux2/Z text-flow lanes can return true backend-resident CUDA latent handles.
+  Unsupported families still use the compatibility bridge that materializes the
+  final latent on the host and uploads it into an owned CUDA
   `SD_GPU_RESOURCE_LATENT` handle.
-- `sd_get_gpu_capabilities(...)` reports this split explicitly:
-  `supports_sampler_gpu_latent_output=false` and
-  `supports_sampler_gpu_latent_bridge_output=true`.
-- `SDCPP_STRICT_GPU_RESIDENT=1` must refuse sampler GPU output and sampler
-  GPU init-latent bridge APIs until the sampler loop itself becomes
-  GPU-resident.
+- `sd_get_gpu_capabilities(...)` reports this split explicitly with
+  `supports_sampler_gpu_latent_output` for true paths and
+  `supports_sampler_gpu_latent_bridge_output` for bridge paths.
+- `SDCPP_STRICT_GPU_RESIDENT=1` must refuse bridge paths and allow only the
+  true backend-resident sampler lanes.
 - GPU VAE Decode should prefer `sd_decode_gpu_latent_normal_gpu(...)` whenever
   `supports_gpu_latent_decode=true`.
 - I2I KSampler init-latent handoff should use
@@ -38,6 +39,7 @@ least one local smoke or existing artifact supports the claim.
 | Flux.1 | 16 ch | model-reported, normally 8 | Supported | Supported | No | TAEF1 verified | Uses CLIP-L + T5XXL. |
 | Flux2 / Klein | 128 ch | 16 | Supported | Use reference images for edit mode, not SDXL-style init latent unless explicitly testing I2I | Yes, via `ref_images` | TAEF2 verified | Flux2 edit/reference conditioning is a different path than SDXL I2I init-latent sampling. |
 | Z-Image / Z-Anime | 16 ch | 8 | Supported | Supported for Z-Image smoke path | Not claimed | Not claimed | Z T2I and init-latent bridge smokes pass. Reference/edit capability is intentionally not advertised yet. |
+| Qwen-Image | 16 ch | 8 | Compatibility bridge | Compatibility bridge | Qwen edit path, not strict-resident | TAEHV compatible, not claimed here | Wan/Qwen VAE decode bridge is available for handle compatibility; strict GPU-resident sampler is not claimed. |
 | Anima | 16 ch | 8 | Compatibility bridge | Compatibility bridge | No | Not claimed | Wan/Qwen VAE path is safe but not COMFY_NORMAL: high IM2COL memory and host bridge copies are reported honestly. |
 | Marigold IID | 8 ch | model-specific | Not supported | Not supported | N/A | N/A | Uses the dedicated intrinsic-image decomposition API. |
 
@@ -58,6 +60,9 @@ Known verified paths at the time this matrix was written:
   GPU VAE Decode at 512.
 - Anima T2I and VAE Encode/Decode compatibility bridges with strict-mode
   refusal for the bridge-only paths.
+- Qwen-Image diffusion runner has backend-resource graph plumbing, but the
+  strict sampler lane is not advertised until conditioning/CFG/edit semantics
+  are wired and smoked.
 
 Pending or deliberately unclaimed:
 

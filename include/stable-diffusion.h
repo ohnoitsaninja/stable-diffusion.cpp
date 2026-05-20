@@ -470,12 +470,19 @@ typedef struct sd_gpu_capabilities_t {
     bool supports_sampler_gpu_init_latent_input;
     bool supports_sampler_gpu_init_latent_bridge_input;
     bool supports_sampler_gpu_latent_bridge_output;
-    uint8_t reserved_capability_padding;
+    bool supports_sampler_imported_initial_noise;
+    bool supports_sampler_imported_step_noise_schedule;
+    bool supports_sampler_brownian_step_noise_import;
+    bool supports_sampler_step_noise_count_query;
     bool supports_flux2_gpu_latent_output;
     bool supports_flux2_flow_backend_sampler;
     bool supports_flux2_vae_decode_gpu;
     bool supports_flux2_qwen_conditioning_gpu_resident;
-    uint32_t reserved[6];
+    bool supports_z_image_gpu_latent_output;
+    bool supports_z_image_flow_backend_sampler;
+    bool supports_z_image_vae_decode_gpu;
+    bool supports_z_image_qwen_conditioning_gpu_resident;
+    uint32_t reserved[5];
 } sd_gpu_capabilities_t;
 
 typedef uint64_t sd_conditioning_handle_t;
@@ -542,8 +549,10 @@ typedef struct sd_conditioning_capabilities_t {
     bool supports_sampler_conditioning_gpu_init_latent_bridge_input;
     bool supports_flux2_qwen_conditioning;
     bool supports_flux2_qwen_conditioning_gpu_resident;
+    bool supports_z_image_qwen_conditioning;
+    bool supports_z_image_qwen_conditioning_gpu_resident;
     bool supports_conditioning_per_step_upload_fallback;
-    uint32_t reserved[14];
+    uint32_t reserved[13];
 } sd_conditioning_capabilities_t;
 
 enum sd_model_family_t {
@@ -603,7 +612,19 @@ typedef struct sd_model_pipeline_capabilities_t {
     bool supports_flux2_reference;
     bool supports_flux2_edit;
     bool supports_flux2_multibatch;
-    uint32_t reserved[6];
+    bool supports_z_image_model_load;
+    bool supports_z_image_qwen_conditioning;
+    bool supports_z_image_qwen_conditioning_gpu_resident;
+    bool supports_z_image_flow_backend_sampler;
+    bool supports_z_image_gpu_latent_output;
+    bool supports_z_image_vae_decode_gpu;
+    bool supports_z_image_vae_bf16_or_compact_storage;
+    bool supports_z_image_controlnet;
+    bool supports_z_image_masks;
+    bool supports_z_image_reference;
+    bool supports_z_image_edit;
+    bool supports_z_image_multibatch;
+    uint32_t reserved[3];
 } sd_model_pipeline_capabilities_t;
 
 typedef struct sd_marigold_iid_options_t {
@@ -797,6 +818,9 @@ SD_API const char* sd_rng_type_name(enum rng_type_t rng_type);
 SD_API enum rng_type_t str_to_rng_type(const char* str);
 SD_API const char* sd_sample_method_name(enum sample_method_t sample_method);
 SD_API enum sample_method_t str_to_sample_method(const char* str);
+SD_API bool sd_sampler_uses_step_noise(enum sample_method_t sample_method);
+SD_API bool sd_sampler_uses_brownian_step_noise(enum sample_method_t sample_method);
+SD_API uint32_t sd_sampler_step_noise_count(enum sample_method_t sample_method, uint32_t sigma_count);
 SD_API const char* sd_scheduler_name(enum scheduler_t scheduler);
 SD_API enum scheduler_t str_to_scheduler(const char* str);
 SD_API const char* sd_prediction_name(enum prediction_t prediction);
@@ -856,6 +880,15 @@ SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_gpu(sd
                                                                              sd_conditioning_handle_t positive,
                                                                              sd_conditioning_handle_t negative,
                                                                              sd_gpu_handle_t* out_gpu_latent);
+SD_API bool sd_sample_latent_gpu_with_init_gpu_and_conditioning_and_noise_schedule_gpu(sd_ctx_t* sd_ctx,
+                                                                                       const sd_img_gen_params_t* sd_img_gen_params,
+                                                                                       sd_gpu_handle_t init_gpu_latent,
+                                                                                       sd_gpu_handle_t noise_gpu_latent,
+                                                                                       const sd_gpu_handle_t* step_noise_gpu_latents,
+                                                                                       uint32_t step_noise_count,
+                                                                                       sd_conditioning_handle_t positive,
+                                                                                       sd_conditioning_handle_t negative,
+                                                                                       sd_gpu_handle_t* out_gpu_latent);
 // Experimental SDXL/SD1 Euler proof path. Requires SDCPP_EXPERIMENTAL_TRUE_GPU_SAMPLER=1.
 // This is not production sampling: initial noise is device-procedural rather than seed-compatible Philox.
 SD_API bool sd_sample_latent_gpu_true_euler_spike(sd_ctx_t* sd_ctx,
@@ -963,6 +996,13 @@ SD_API bool sd_conditioning_encode_text(sd_ctx_t* sd_ctx,
                                         const sd_conditioning_encode_options_t* options,
                                         sd_conditioning_handle_t* out_handle,
                                         sd_conditioning_desc_t* out_desc);
+SD_API bool sd_conditioning_encode_text_with_ref_images(sd_ctx_t* sd_ctx,
+                                                        const char* text,
+                                                        const sd_image_t* ref_images,
+                                                        uint32_t ref_images_count,
+                                                        const sd_conditioning_encode_options_t* options,
+                                                        sd_conditioning_handle_t* out_handle,
+                                                        sd_conditioning_desc_t* out_desc);
 SD_API bool sd_conditioning_retain(sd_ctx_t* sd_ctx, sd_conditioning_handle_t handle);
 SD_API bool sd_conditioning_release(sd_ctx_t* sd_ctx, sd_conditioning_handle_t handle);
 SD_API bool sd_conditioning_get_desc(sd_ctx_t* sd_ctx,

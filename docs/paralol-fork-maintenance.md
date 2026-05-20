@@ -147,6 +147,9 @@ Validate:
 
 Validate capability reporting instead of relying on filenames:
 
+- Use `sd-latent-smoke --capabilities-only` for loader/capability checks that
+  should not launch diffusion. This is the preferred first check for large
+  Qwen-family split models on 16 GB cards.
 - Flux2 Klein reports `latent_channels=128`, edit/reference support, and Qwen
   LLM requirements
 - Z-Image reports `latent_channels=16` and Qwen LLM requirements
@@ -167,13 +170,28 @@ Validate:
 - default scheduler is `discrete`
 - `supports_gpu_latent_decode=true`
 - `supports_vae_encode=true`
-- `supports_vae_encode_gpu_output=true`
+- `supports_vae_encode_gpu_output=false`
 - sampled latent descriptor is `1x16x128x128` for 1024 output
 - decode reports the Wan/Qwen bridge with `host_copies=1` and `device_copies=1`
 - VAE Encode reports the Wan/Qwen bridge with `host_copies=1` and `device_copies=1`
 - `SDCPP_STRICT_GPU_RESIDENT=1` refuses the sampler, decode, and encode bridges
 - 1024 Anima VAE Encode/Decode currently uses the legacy Wan/Qwen IM2COL graph
   and plans roughly 7702 MB encode / 7493 MB decode workspace
+
+Qwen-Image shares the Wan/Qwen VAE bridge behavior. Its diffusion graph now has
+backend-resource plumbing, but a strict Qwen-Image sampler lane is not claimed
+until Qwen edit conditioning, CFG behavior, and reference latents are all wired
+through backend tensors and smoked.
+
+For Qwen-family loader checks on 16 GB CUDA cards, prefer CPU-resident text
+encoder params:
+
+- `SDCPP_QWEN_IMAGE_TEXT_ENCODER_CPU_PARAMS=1`
+- `SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS=1`
+
+The smoke tool exposes matching flags:
+`--qwen-image-text-encoder-cpu-params` and
+`--anima-text-encoder-cpu-params`.
 
 ### ControlNet
 

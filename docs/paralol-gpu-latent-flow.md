@@ -46,24 +46,24 @@ then runs COMFY_NORMAL VAE decode and returns a GPU image handle. SD1 support is
 intentionally limited to the base model version until inpaint, pix2pix, tiny,
 and other variants get their own smokes. SD2 is not a current Paralol target.
 
-Anima is supported through a compatibility bridge, not true GPU-resident VAE
-decode. The sampler/CPU-upload latent handle is downloaded into the existing
-legacy Wan/Qwen VAE decode path, then the decoded RGB tensor is uploaded back
-into an `SD_GPU_RESOURCE_IMAGE` handle. This is exposed so Paralol can use the
-same latent/image handle contract for Anima while the fork still reports the
-bridge honestly:
+Anima and Qwen-Image use the Wan/Qwen VAE compatibility bridge, not true
+GPU-resident VAE decode. The sampler/CPU-upload latent handle is downloaded
+into the existing legacy Wan/Qwen VAE decode path, then the decoded RGB tensor
+is uploaded back into an `SD_GPU_RESOURCE_IMAGE` handle. This is exposed so
+Paralol can use the same latent/image handle contract for Qwen-family models
+while the fork still reports the bridge honestly:
 
-- `supports_gpu_latent_decode=true` for Anima
+- `supports_gpu_latent_decode=true` for Anima and Qwen-Image
 - `host_copies=1`, `device_copies=1` in the VAE report
 - output image handle flags include `CPU_BRIDGE_DOWNLOAD | CPU_BRIDGE_UPLOAD`
 - `SDCPP_STRICT_GPU_RESIDENT=1` refuses this path
 
-This bridge does not change Anima image semantics; it uses the same
-`decode_first_stage(...)` path as direct `sd-cli` generation. Anima public
+This bridge does not change image semantics; it uses the same
+`decode_first_stage(...)` path as direct `sd-cli` generation. Wan/Qwen public
 normal VAE encode/decode keeps the Wan/Qwen VAE on the legacy convolution path.
-The Anima public VAE encode/decode path reports large IM2COL workspaces instead
-of failing the SDXL COMFY_NORMAL guard because that legacy graph is currently
-the known-good Anima path.
+That path reports large IM2COL workspaces instead of failing the SDXL
+COMFY_NORMAL guard because that legacy graph is currently the known-good
+Wan/Qwen path.
 
 Separated `sd_encode_image_normal(...)` and `sd_encode_image_normal_gpu(...)`
 are enabled for Anima as compatibility bridges. The modular Paralol path
@@ -278,9 +278,9 @@ For encoded-latent I2I, the first cold decode is expected to show non-zero
 `decode_context_ms` near zero while leaving `decode_graph_ms` around the actual
 BF16 COMFY_NORMAL graph time.
 
-Anima uses the Wan/Qwen bridge instead of the SDXL cached decode-only bridge;
+Anima and Qwen-Image use the Wan/Qwen bridge instead of the SDXL cached decode-only bridge;
 the decode report should say
-`fallback_reason="Anima uses the Wan/Qwen VAE bridge: GPU latent is downloaded for legacy decode and decoded image is re-uploaded"`.
+`fallback_reason="Wan/Qwen VAE bridge: GPU latent is downloaded for legacy decode and decoded image is re-uploaded"`.
 
 ## SDXL 1024 latent descriptor
 

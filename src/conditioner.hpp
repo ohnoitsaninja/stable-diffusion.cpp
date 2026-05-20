@@ -1925,9 +1925,15 @@ struct LLMEmbedder : public Conditioner {
                 prompt = "<|im_start|>user\n<|vision_start|>";
                 for (int i = 0; i < conditioner_params.ref_images->size() - 1; i++) {
                     extra_prompts.push_back("<|vision_end|><|vision_start|>");
+                    extra_prompts_attn_range.emplace_back(0, 0);
                 }
-                extra_prompts.push_back("<|vision_end|>" + conditioner_params.text + "<|im_end|>\n<|im_start|>assistant\n<|vision_start|>");
+                const std::string text_extra_prefix = "<|vision_end|>";
+                std::string text_extra_prompt = text_extra_prefix + conditioner_params.text + "<|im_end|>\n<|im_start|>assistant\n<|vision_start|>";
+                extra_prompts_attn_range.emplace_back(static_cast<int>(text_extra_prefix.size()),
+                                                       static_cast<int>(text_extra_prefix.size() + conditioner_params.text.size()));
+                extra_prompts.push_back(std::move(text_extra_prompt));
                 extra_prompts.push_back("<|vision_end|><|im_end|>");
+                extra_prompts_attn_range.emplace_back(0, 0);
             } else {
                 prompt = "<|im_start|>user\n";
 
@@ -1973,6 +1979,12 @@ struct LLMEmbedder : public Conditioner {
                                            out_layers,
                                            prompt_template_encode_start_idx);
         std::vector<sd::Tensor<float>> extra_hidden_states_vec;
+        if (extra_prompts_attn_range.size() != extra_prompts.size()) {
+            LOG_ERROR("extra prompt attention range count mismatch: prompts=%zu ranges=%zu",
+                      extra_prompts.size(),
+                      extra_prompts_attn_range.size());
+            return {};
+        }
         for (int i = 0; i < extra_prompts.size(); i++) {
             auto extra_hidden_states = encode_prompt(n_threads,
                                                      extra_prompts[i],

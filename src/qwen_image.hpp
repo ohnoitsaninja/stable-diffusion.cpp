@@ -529,17 +529,29 @@ namespace Qwen {
                                  const sd::Tensor<float>& timesteps_tensor,
                                  const sd::Tensor<float>& context_tensor,
                                  const std::vector<sd::Tensor<float>>& ref_latents_tensor = {},
-                                 bool increase_ref_index                                  = false) {
+                                 bool increase_ref_index                                  = false,
+                                 const GgmlBackendTensorResource* x_resource              = nullptr,
+                                 const GgmlBackendTensorResource* context_resource        = nullptr,
+                                 const std::vector<const GgmlBackendTensorResource*>* ref_latents_resources = nullptr) {
             ggml_cgraph* gf        = new_graph_custom(QWEN_IMAGE_GRAPH_SIZE);
-            ggml_tensor* x         = make_input(x_tensor);
+            ggml_tensor* x         = x_resource != nullptr ? make_backend_input(*x_resource) : make_input(x_tensor);
             ggml_tensor* timesteps = make_input(timesteps_tensor);
             GGML_ASSERT(x->ne[3] == 1);
-            GGML_ASSERT(!context_tensor.empty());
-            ggml_tensor* context = make_input(context_tensor);
+            GGML_ASSERT(context_resource != nullptr || !context_tensor.empty());
+            ggml_tensor* context = context_resource != nullptr ? make_backend_input(*context_resource) : make_input(context_tensor);
             std::vector<ggml_tensor*> ref_latents;
-            ref_latents.reserve(ref_latents_tensor.size());
-            for (const auto& ref_latent_tensor : ref_latents_tensor) {
-                ref_latents.push_back(make_input(ref_latent_tensor));
+            if (ref_latents_resources != nullptr) {
+                ref_latents.reserve(ref_latents_resources->size());
+                for (const GgmlBackendTensorResource* ref_latent_resource : *ref_latents_resources) {
+                    if (ref_latent_resource != nullptr && !ref_latent_resource->empty()) {
+                        ref_latents.push_back(make_backend_input(*ref_latent_resource));
+                    }
+                }
+            } else {
+                ref_latents.reserve(ref_latents_tensor.size());
+                for (const auto& ref_latent_tensor : ref_latents_tensor) {
+                    ref_latents.push_back(make_input(ref_latent_tensor));
+                }
             }
 
             pe_vec      = Rope::gen_qwen_image_pe(static_cast<int>(x->ne[1]),
@@ -615,6 +627,29 @@ namespace Qwen {
             };
 
             return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
+        }
+
+        std::unique_ptr<GgmlBackendTensorResource> compute_to_backend_resource(
+            int n_threads,
+            const GgmlBackendTensorResource& x,
+            const sd::Tensor<float>& timesteps,
+            const sd::Tensor<float>& context,
+            const GgmlBackendTensorResource* context_resource = nullptr,
+            const std::vector<sd::Tensor<float>>& ref_latents = {},
+            const std::vector<const GgmlBackendTensorResource*>* ref_latents_resources = nullptr,
+            bool increase_ref_index                           = false) {
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_graph({},
+                                   timesteps,
+                                   context,
+                                   ref_latents,
+                                   increase_ref_index,
+                                   &x,
+                                   context_resource,
+                                   ref_latents_resources);
+            };
+
+            return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "qwen_image_backend_output");
         }
 
         void test() {

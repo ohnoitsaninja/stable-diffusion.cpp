@@ -25,6 +25,7 @@ struct DiffusionParams {
     const sd::Tensor<float>* t5_weights               = nullptr;
     const sd::Tensor<float>* guidance                 = nullptr;
     const std::vector<sd::Tensor<float>>* ref_latents = nullptr;
+    const std::vector<const GgmlBackendTensorResource*>* ref_latents_backend = nullptr;
     bool increase_ref_index                           = false;
     int num_video_frames                              = -1;
     const std::vector<sd::Tensor<float>>* controls    = nullptr;
@@ -412,6 +413,7 @@ struct FluxModel : public DiffusionModel {
                                                 diffusion_params.y_backend,
                                                 tensor_or_empty(diffusion_params.guidance),
                                                 diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
+                                                diffusion_params.ref_latents_backend,
                                                 diffusion_params.increase_ref_index,
                                                 diffusion_params.skip_layers ? *diffusion_params.skip_layers : empty_skip_layers);
     }
@@ -614,6 +616,22 @@ struct QwenImageModel : public DiffusionModel {
                                   diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
                                   true);
     }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_to_backend_resource(
+        int n_threads,
+        const DiffusionParams& diffusion_params) override {
+        GGML_ASSERT(diffusion_params.x_backend != nullptr);
+        GGML_ASSERT(diffusion_params.timesteps != nullptr);
+        static const std::vector<sd::Tensor<float>> empty_ref_latents;
+        return qwen_image.compute_to_backend_resource(n_threads,
+                                                      *diffusion_params.x_backend,
+                                                      *diffusion_params.timesteps,
+                                                      tensor_or_empty(diffusion_params.context),
+                                                      diffusion_params.context_backend,
+                                                      diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
+                                                      diffusion_params.ref_latents_backend,
+                                                      true);
+    }
 };
 
 struct ZImageModel : public DiffusionModel {
@@ -679,6 +697,22 @@ struct ZImageModel : public DiffusionModel {
                                tensor_or_empty(diffusion_params.context),
                                diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
                                true);
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> compute_to_backend_resource(
+        int n_threads,
+        const DiffusionParams& diffusion_params) override {
+        GGML_ASSERT(diffusion_params.x_backend != nullptr);
+        GGML_ASSERT(diffusion_params.timesteps != nullptr);
+        static const std::vector<sd::Tensor<float>> empty_ref_latents;
+        return z_image.compute_to_backend_resource(n_threads,
+                                                   *diffusion_params.x_backend,
+                                                   *diffusion_params.timesteps,
+                                                   tensor_or_empty(diffusion_params.context),
+                                                   diffusion_params.context_backend,
+                                                   diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
+                                                   diffusion_params.ref_latents_backend,
+                                                   true);
     }
 };
 

@@ -1366,7 +1366,8 @@ namespace Flux {
                                  const GgmlBackendTensorResource* x_resource              = nullptr,
                                  const GgmlBackendTensorResource* context_resource        = nullptr,
                                  const GgmlBackendTensorResource* c_concat_resource       = nullptr,
-                                 const GgmlBackendTensorResource* y_resource              = nullptr) {
+                                 const GgmlBackendTensorResource* y_resource              = nullptr,
+                                 const std::vector<const GgmlBackendTensorResource*>* ref_latents_resources = nullptr) {
             ggml_tensor* x         = x_resource != nullptr ? make_backend_input(*x_resource) : make_input(x_tensor);
             ggml_tensor* timesteps = make_input(timesteps_tensor);
             ggml_tensor* context   = context_resource != nullptr ? make_backend_input(*context_resource) : make_optional_input(context_tensor);
@@ -1382,9 +1383,18 @@ namespace Flux {
             }
             ggml_tensor* guidance = make_optional_input(this->guidance_tensor);
             std::vector<ggml_tensor*> ref_latents;
-            ref_latents.reserve(ref_latents_tensor.size());
-            for (const auto& ref_latent_tensor : ref_latents_tensor) {
-                ref_latents.push_back(make_input(ref_latent_tensor));
+            if (ref_latents_resources != nullptr) {
+                ref_latents.reserve(ref_latents_resources->size());
+                for (const GgmlBackendTensorResource* ref_latent_resource : *ref_latents_resources) {
+                    if (ref_latent_resource != nullptr && !ref_latent_resource->empty()) {
+                        ref_latents.push_back(make_backend_input(*ref_latent_resource));
+                    }
+                }
+            } else {
+                ref_latents.reserve(ref_latents_tensor.size());
+                for (const auto& ref_latent_tensor : ref_latents_tensor) {
+                    ref_latents.push_back(make_input(ref_latent_tensor));
+                }
             }
 
             GGML_ASSERT(x->ne[3] == 1);
@@ -1498,6 +1508,7 @@ namespace Flux {
             const GgmlBackendTensorResource* y_resource               = nullptr,
             const sd::Tensor<float>& guidance                        = {},
             const std::vector<sd::Tensor<float>>& ref_latents         = {},
+            const std::vector<const GgmlBackendTensorResource*>* ref_latents_resources = nullptr,
             bool increase_ref_index                                  = false,
             std::vector<int> skip_layers                             = std::vector<int>()) {
             auto get_graph = [&]() -> ggml_cgraph* {
@@ -1513,7 +1524,8 @@ namespace Flux {
                                    &x,
                                    context_resource,
                                    c_concat_resource,
-                                   y_resource);
+                                   y_resource,
+                                   ref_latents_resources);
             };
 
             return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "flux_backend_output");
