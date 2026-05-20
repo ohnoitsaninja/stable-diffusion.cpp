@@ -47,8 +47,8 @@ Important fields:
 | Flux / Flux1-style | 16 channels | model-reported | CLIP-L + T5XXL | Supported |
 | Z-Image | 16 channels | 8 | Qwen LLM | Supported |
 | Flux2 | 128 channels | 16 | Qwen LLM | Supported |
-| Qwen-Image | 16 channels | 8 | Qwen LLM | Sampler latent supported; VAE image decode not claimed |
-| Anima | 16 channels | 8 | Qwen LLM + T5 ids/weights | Sampler latent supported; VAE image decode not claimed |
+| Qwen-Image | 16 channels | 8 | Qwen LLM | Sampler latent supported; VAE image decode remains experimental |
+| Anima | 16 channels | 8 | Qwen LLM + T5 ids/weights | Sampler latent supported; env-gated direct GPU VAE decode |
 
 ## Shared Qwen Flow Backend Contract
 
@@ -79,12 +79,13 @@ latent has no bridge flags in `SDCPP_STRICT_GPU_RESIDENT=1`.
 
 ## Anima Verification
 
-Anima has a strict fork-side sampler lane, but the Qwen-image VAE output path is
-still not advertised as a GPU image-output lane. Enable it with:
+Anima has a strict fork-side sampler lane. Its Wan/Qwen VAE output path is now
+available as an explicit experimental direct GPU decode lane. Enable it with:
 
 ```powershell
 $env:SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1
 $env:SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS=1
+$env:SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1
 ```
 
 The supported sampler lane is text-only T2I, batch 1, Qwen/T5 conditioning
@@ -94,9 +95,14 @@ Validated sampler methods are `euler`, `euler_a`, `er_sde`, and
 remain `er_sde`, cfg `4.5`, 30 steps.
 
 The fork applies ComfyUI's Wan21 latent mean/std transform for Anima and
-Qwen-Image latents. This fixes the obvious latent-format mismatch, but VAE
-image output is still routed through the CPU compatibility decode path and is
-not claimed as `sd_decode_gpu_latent_normal_gpu()` support.
+Qwen-Image latents. The default path still keeps the older CPU compatibility
+decode bridge. With `SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1`, the same transform
+is applied inside the Wan/Qwen VAE graph and `sd_decode_gpu_latent_normal_gpu()`
+returns a CUDA image handle without the latent download / image re-upload
+bridge. This path is strict-mode clean for Anima T2I, but it still uses the
+existing Wan/Qwen VAE graph and therefore still reports `IM2COL_3D`, about
+1874.5 MiB planned workspace at 512x512, and f32 storage. It is a handoff
+correctness improvement, not a Wan/Qwen VAE performance fix.
 
 Use realistic Anima settings for image-quality checks. The official Anima model
 card recommends about 1MP output, 30-50 steps, CFG 4-5, and lists `er_sde`,
@@ -118,7 +124,7 @@ Validated smoke:
 - CFG: `4.5`
 - Sampler/scheduler: `er_sde` / `discrete`
 
-Observed strict handoff:
+Observed strict handoff without the experimental Wan/Qwen VAE GPU flag:
 
 - conditioning handle: device-resident backend tensors, including Anima
   `t5_ids` and `t5_weights`
@@ -126,16 +132,25 @@ Observed strict handoff:
 - sampled GPU latent: `1x16x64x64`, f32, CUDA, 262,144 bytes
 - sampler math residency: `gpu_backend_tensor`
 - sampler bridge flags: none
-- VAE decode/image output: not claimed as GPU output; CPU compatibility decode
-  works for diagnostics and applies Wan21 latent scaling
+- VAE decode/image output: bridge path; CPU compatibility decode applies Wan21
+  latent scaling and re-uploads the image for GPU-handle compatibility
 
-The Qwen-image VAE bridge is intentionally not advertised for Anima/Qwen image
-output because the local Qwen/X VAE decode test produced a blurry image. The
-Anima 30-step ER_SDE smoke now produces coherent diagnostic images after the
-Wan21 transform, but it is still using the CPU compatibility decode path. Keep
-Paralol on latent-only handoff for these families until the Qwen-image VAE path
-is validated against a known-good Comfy reference and promoted to the GPU image
-output API.
+Observed strict handoff with `SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1`:
+
+- `sd_decode_gpu_latent_normal_gpu()` accepts the Anima CUDA latent handle
+- VAE decode bridge flags: none
+- VAE host copies: 0
+- VAE device copies: 0
+- GPU image handle: `1x3x512x512`, f32, CUDA
+- caller-owned explicit image download: supported
+- strict GPU resident mode: passes
+- VAE graph: `direct_graph`, `IM2COL_3D=true`, workspace about 1874.5 MiB
+
+The 30-step ER-SDE Anima smoke is the meaningful image-quality acceptance here;
+short 2-4 step samples are only API/residency smokes and can look misleadingly
+bad. The direct GPU VAE output was byte-identical to the bridge output on the
+30-step test, and both matched a ComfyUI Wan21 `process_out` decode of the same
+latent with mean abs `0.4908`, p99 `4`, and PSNR `48.09 dB`.
 
 ## Z-Image Verification
 

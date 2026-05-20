@@ -8691,6 +8691,10 @@ static bool sd_experimental_vae_same_context_decode_enabled() {
     return StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_VAE_SAME_CONTEXT_DECODE");
 }
 
+static bool sd_experimental_wan_qwen_vae_gpu_enabled() {
+    return StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU");
+}
+
 static bool sd_gpu_resource_is_cuda(const sd_gpu_resource_private_t& resource) {
     return resource.tensor != nullptr &&
            !resource.tensor->empty() &&
@@ -8724,11 +8728,14 @@ static bool sd_model_supports_true_gpu_latent_decode(SDVersion version) {
            sd_version_is_sdxl(version) ||
            sd_version_is_flux(version) ||
            sd_version_is_flux2(version) ||
-           sd_version_is_z_image(version);
+           sd_version_is_z_image(version) ||
+           ((sd_version_is_qwen_image(version) || sd_version_is_anima(version)) &&
+            sd_experimental_wan_qwen_vae_gpu_enabled());
 }
 
 static bool sd_model_uses_gpu_latent_decode_bridge(SDVersion version) {
-    return sd_version_is_qwen_image(version) || sd_version_is_anima(version);
+    return (sd_version_is_qwen_image(version) || sd_version_is_anima(version)) &&
+           !sd_experimental_wan_qwen_vae_gpu_enabled();
 }
 
 static bool sd_model_supports_gpu_latent_decode(SDVersion version) {
@@ -12811,9 +12818,16 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
     if (!prepare_normal_vae_run(sd_ctx, effective, &resolved_mode, &used_taesd)) {
         return false;
     }
+    const bool wan_qwen_gpu_vae =
+        sd_experimental_wan_qwen_vae_gpu_enabled() &&
+        (sd_version_is_qwen_image(sd_ctx->sd->version) || sd_version_is_anima(sd_ctx->sd->version)) &&
+        resolved_mode == SD_VAE_EXEC_DIRECT_GRAPH;
     if (resolved_mode != SD_VAE_EXEC_COMFY_NORMAL) {
-        LOG_ERROR("sd_decode_gpu_latent_normal_gpu currently requires COMFY_NORMAL");
-        return false;
+        if (!wan_qwen_gpu_vae) {
+            LOG_ERROR("sd_decode_gpu_latent_normal_gpu currently requires COMFY_NORMAL");
+            return false;
+        }
+        LOG_INFO("sd_decode_gpu_latent_normal_gpu using experimental Wan/Qwen direct GPU VAE path");
     }
     ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
     int64_t t_setup1 = ggml_time_ms();
@@ -12839,6 +12853,11 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
     full_report.decode_context_reuse = 0;
     full_report.decode_same_context_attempted = try_same_context_decode ? 1u : 0u;
     full_report.decode_same_context_succeeded = try_same_context_decode ? 1u : 0u;
+    if (gpu_image != nullptr && !gpu_image->empty()) {
+        full_report.device_resident_stages = gpu_image->buffer != nullptr &&
+                                             !ggml_backend_buffer_is_host(gpu_image->buffer) &&
+                                             full_report.stage_boundary_host_copies == 0;
+    }
     log_vae_report("decode_gpu_latent", full_report);
     if (report != nullptr) {
         *report = full_report;
@@ -12846,7 +12865,7 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
     if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
         sd_ctx->sd->first_stage_model->free_params_buffer();
     }
-    if (vae_report_large_im2col_disallowed(graph_report, effective)) {
+    if (!wan_qwen_gpu_vae && vae_report_large_im2col_disallowed(graph_report, effective)) {
         LOG_ERROR("sd_decode_gpu_latent_normal_gpu refused oversized IM2COL tensor: largest=%" PRIu64 " threshold=%" PRIu64,
                   graph_report.largest_tensor_bytes,
                   effective.im2col_warn_bytes);
@@ -12866,11 +12885,13 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         LOG_ERROR("sd_decode_gpu_latent_normal_gpu failed after %.2fs", (t1 - t0) * 1.0f / 1000);
         return false;
     }
+    const uint32_t image_flags = SD_GPU_RESOURCE_FLAG_VAE_DECODE_OUTPUT |
+                                 (wan_qwen_gpu_vae ? 0u : SD_GPU_RESOURCE_FLAG_REQUIRES_VAE_OUTPUT_SCALE);
     sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
                                                       std::move(gpu_image),
                                                       SD_GPU_RESOURCE_IMAGE,
                                                       SD_LAYOUT_WHCN_GGML,
-                                                      SD_GPU_RESOURCE_FLAG_VAE_DECODE_OUTPUT | SD_GPU_RESOURCE_FLAG_REQUIRES_VAE_OUTPUT_SCALE,
+                                                      image_flags,
                                                       "vae_decode_rgb_f32_from_gpu_latent");
     if (handle == 0) {
         LOG_ERROR("sd_decode_gpu_latent_normal_gpu failed to register GPU image handle");

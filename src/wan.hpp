@@ -1111,6 +1111,9 @@ namespace WAN {
     struct WanVAERunner : public VAE {
         float scale_factor = 1.0f;
         bool decode_only   = true;
+        float decode_output_shift_input = 0.5f;
+        std::vector<float> diffusion_to_vae_mean_input;
+        std::vector<float> diffusion_to_vae_std_scaled_input;
         WanVAE ae;
 
         WanVAERunner(ggml_backend_t backend,
@@ -1201,6 +1204,68 @@ namespace WAN {
             return gf;
         }
 
+        void prepare_diffusion_to_vae_inputs(int64_t channels) {
+            if (static_cast<int64_t>(diffusion_to_vae_mean_input.size()) == channels &&
+                static_cast<int64_t>(diffusion_to_vae_std_scaled_input.size()) == channels) {
+                return;
+            }
+            sd::Tensor<float> dummy({1, 1, channels, 1});
+            auto [mean_tensor, std_tensor] = get_latents_mean_std(dummy);
+            diffusion_to_vae_mean_input.assign(mean_tensor.data(), mean_tensor.data() + mean_tensor.numel());
+            diffusion_to_vae_std_scaled_input.resize(static_cast<size_t>(std_tensor.numel()));
+            for (int64_t i = 0; i < std_tensor.numel(); ++i) {
+                diffusion_to_vae_std_scaled_input[static_cast<size_t>(i)] = std_tensor[i] / scale_factor;
+            }
+        }
+
+        ggml_tensor* build_diffusion_to_vae_latent_tensor(ggml_context* ctx, ggml_tensor* z) {
+            GGML_ASSERT(z != nullptr);
+            GGML_ASSERT(z->ne[2] == 16 || z->ne[2] == 48);
+            prepare_diffusion_to_vae_inputs(z->ne[2]);
+
+            ggml_tensor* std_scaled = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, z->ne[2], 1);
+            set_backend_tensor_data(std_scaled, diffusion_to_vae_std_scaled_input.data());
+            ggml_tensor* out = ggml_mul(ctx, z, std_scaled);
+
+            ggml_tensor* mean_base = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, z->ne[2], 1);
+            set_backend_tensor_data(mean_base, diffusion_to_vae_mean_input.data());
+            ggml_tensor* mean = ggml_repeat(ctx, mean_base, out);
+            out = ggml_add(ctx, out, mean);
+            return out;
+        }
+
+        ggml_cgraph* build_decode_backend_resource_graph(const GgmlBackendTensorResource& resource) {
+            ggml_cgraph* gf = new_graph_custom(10240 * resource.tensor->ne[2]);
+            ggml_tensor* z  = make_backend_input(resource);
+            z = build_diffusion_to_vae_latent_tensor(compute_ctx, z);
+
+            // sd::Tensor 5D input [w,h,t,c,b] is flattened to ggml [w,h,t,c*b].
+            // The exported sampler latent is [w,h,c,b], so insert a singleton
+            // frame dimension without moving data.
+            z = ggml_reshape_4d(compute_ctx, z, z->ne[0], z->ne[1], 1, z->ne[2] * z->ne[3]);
+
+            auto runner_ctx = get_context();
+            ggml_tensor* out = ae.decode(&runner_ctx, z);
+
+            // Single-image Wan/Qwen decode returns [w,h,t,c]. Convert it back
+            // to the fork's standard image layout [w,h,c,n].
+            if (out->ne[2] == 1) {
+                out = ggml_reshape_4d(compute_ctx, out, out->ne[0], out->ne[1], out->ne[3], out->ne[2]);
+            }
+
+            if (scale_input) {
+                out = ggml_scale(compute_ctx, out, 0.5f);
+                decode_output_shift_input = 0.5f;
+                ggml_tensor* shift = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_F32, 1);
+                set_backend_tensor_data(shift, &decode_output_shift_input);
+                out = ggml_add1(compute_ctx, out, shift);
+                out = ggml_clamp(compute_ctx, out, 0.0f, 1.0f);
+            }
+
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        }
+
         ggml_cgraph* build_graph_partial(const sd::Tensor<float>& z_tensor, bool decode_graph, int i) {
             ggml_cgraph* gf = new_graph_custom(20480);
 
@@ -1282,6 +1347,37 @@ namespace WAN {
                 free_cache_ctx_and_buffer();
                 return output;
             }
+        }
+
+        std::unique_ptr<GgmlBackendTensorResource> decode_latent_resource_to_backend_resource(int n_threads,
+                                                                                              const GgmlBackendTensorResource* x,
+                                                                                              sd_tiling_params_t tiling_params,
+                                                                                              bool circular_x = false,
+                                                                                              bool circular_y = false) override {
+            SD_UNUSED(tiling_params);
+            SD_UNUSED(circular_x);
+            SD_UNUSED(circular_y);
+            if (x == nullptr || x->empty()) {
+                return nullptr;
+            }
+            if (x->tensor == nullptr || (x->tensor->ne[2] != 16 && x->tensor->ne[2] != 48)) {
+                LOG_ERROR("Wan/Qwen VAE GPU decode expected latent channels 16 or 48");
+                return nullptr;
+            }
+            int64_t t0 = ggml_time_ms();
+            auto output = compute_to_backend_resource_handle(
+                [&]() -> ggml_cgraph* {
+                    return build_decode_backend_resource_graph(*x);
+                },
+                n_threads,
+                "wan_qwen_vae_decode_gpu_output");
+            int64_t t1 = ggml_time_ms();
+            if (output == nullptr || output->empty()) {
+                LOG_ERROR("Wan/Qwen VAE GPU decode compute failed");
+                return nullptr;
+            }
+            LOG_DEBUG("computing Wan/Qwen VAE GPU decode completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+            return output;
         }
 
         void test() {
