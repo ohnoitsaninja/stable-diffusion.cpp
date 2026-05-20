@@ -93,6 +93,13 @@ Qwen-Image latents. This fixes the obvious latent-format mismatch, but VAE
 image output is still routed through the CPU compatibility decode path and is
 not claimed as `sd_decode_gpu_latent_normal_gpu()` support.
 
+Use realistic Anima settings for image-quality checks. The official Anima model
+card recommends about 1MP output, 30-50 steps, CFG 4-5, and lists `er_sde`,
+`euler_a`, and `dpmpp_2m_sde_gpu` as preferred sampler choices. Very short
+Euler/cfg=1 smoke runs are useful for API and residency validation, but they
+produce misleading low-quality images and must not be used as quality
+acceptance.
+
 Validated smoke:
 
 - Diffusion model:
@@ -102,7 +109,7 @@ Validated smoke:
 - LLM:
   `F:\automatic1111\Stability\Models\TextEncoders\qwen_3_06b_base.safetensors`
 - Resolution: `512x512`
-- Steps: `2` sampler-only strict smoke, `6` decoded image smoke
+- Steps: `2` sampler-only strict smoke, `30` decoded image smoke
 - CFG: `4.5`
 - Sampler/scheduler: `er_sde` / `discrete`
 
@@ -119,10 +126,11 @@ Observed strict handoff:
 
 The Qwen-image VAE bridge is intentionally not advertised for Anima/Qwen image
 output because the local Qwen/X VAE decode test produced a blurry image. The
-Anima 6-step ER_SDE smoke now produces a non-blank decoded image after the
-Wan21 transform, but it is not a Comfy/reference-quality acceptance yet. Keep
+Anima 30-step ER_SDE smoke now produces coherent diagnostic images after the
+Wan21 transform, but it is still using the CPU compatibility decode path. Keep
 Paralol on latent-only handoff for these families until the Qwen-image VAE path
-is validated against a known-good Comfy reference.
+is validated against a known-good Comfy reference and promoted to the GPU image
+output API.
 
 ## Z-Image Verification
 

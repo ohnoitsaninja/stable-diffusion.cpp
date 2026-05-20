@@ -64,8 +64,9 @@ Known verified paths at the time this matrix was written:
   `dpmpp_2m_sde_gpu`; CFG `4.5` validated for the Anima lane.
 - Anima/Qwen-image Wan21 latent mean/std transforms are applied for
   diffusion-latent <-> VAE-latent conversion. The CPU compatibility decode path
-  can write a diagnostic image, but GPU VAE image output is still not advertised
-  for Anima/Qwen-image.
+  can write coherent Anima diagnostic images at realistic settings
+  (`er_sde`, CFG 4.5, 30 steps), but GPU VAE image output is still not
+  advertised for Anima/Qwen-image.
 - Qwen-Image text-only `cfg=1` T2I strict sampler lane: resident Qwen
   conditioning handle -> backend flow sampler -> CUDA `1x16x64x64` latent, with
   no sampler bridge flags.
