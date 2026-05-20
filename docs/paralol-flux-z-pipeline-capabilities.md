@@ -202,10 +202,16 @@ backend lane, but remains explicitly gated. Enable it with:
 $env:SDCPP_EXPERIMENTAL_Z_IMAGE_BACKEND=1
 ```
 
-The supported lane is intentionally narrow: Z-Image/Z-Image Turbo text T2I or
-GPU-init I2I, batch 1, Euler, cfg `1.0`, Qwen text conditioning handles, no
-ControlNet, no masks, no reference/edit images, and no multibatch. Unsupported requests fail closed in
-`SDCPP_STRICT_GPU_RESIDENT=1`.
+The supported lane is intentionally narrow: Z-Image/Z-Image Turbo/Z-Anime text
+T2I or GPU-init I2I, batch 1, Qwen text conditioning handles, no ControlNet, no
+masks, no direct sampler reference/edit images, and no multibatch. The flow
+backend accepts the Z sampler set used by the current local models:
+
+- Z-Image Turbo: `res_multistep` / `simple`, CFG `1.0`, 9 steps by default.
+- Z-Anime Base: `euler_a` / `beta`, CFG above `1.0`, 28+ steps recommended.
+- Compatibility/debug: `euler` and `res_2s` remain selectable.
+
+Unsupported requests fail closed in `SDCPP_STRICT_GPU_RESIDENT=1`.
 
 On 16 GB CUDA cards, use `SDCPP_Z_IMAGE_TEXT_ENCODER_CPU_PARAMS=1` for this
 lane. The fork keeps Qwen parameters in RAM, executes Qwen on the GPU during
@@ -242,7 +248,7 @@ primary cross-attention context, uploads that single context as a backend tensor
 and the flow sampler consumes it by reference with
 `conditioning_per_step_upload=false`.
 
-Validated target assets:
+Validated Z-Image Turbo handoff target assets:
 
 - Diffusion model:
   `F:\automatic1111\Stability\Models\DiffusionModels\z-image-turbo-q4_k_m.gguf`
@@ -253,7 +259,7 @@ Validated target assets:
 - Resolution: `1024x1024`
 - Steps: `9`
 - CFG: `1.0`
-- Sampler/scheduler: `euler` / `discrete`
+- Sampler/scheduler: `res_multistep` / `simple`
 
 Expected API handoff:
 
@@ -282,7 +288,7 @@ build\codex\bin\sd-latent-smoke.exe `
   --sample-without-init --gpu-flow-sampler --condition-handles `
   --z-image-text-encoder-cpu-params `
   --strict-gpu-resident --steps 9 --cfg-scale 1.0 `
-  --sampling-method euler --width 1024 --height 1024 `
+  --sampling-method res_multistep --scheduler simple --width 1024 --height 1024 `
   --skip-estimate --gpu-latent-decode-input --gpu-decode-output `
   --download-gpu-output-buffer --dump-gpu-handle-desc
 ```
@@ -290,14 +296,41 @@ build\codex\bin\sd-latent-smoke.exe `
 This proves the fork-side T2I handoff contract. It does not claim direct Z
 KSampler reference/edit image inputs.
 
-Current local validation caveat: the strict handoff smoke and the stock
-`sd-cli` compatibility path both complete with the local
-`z-image-turbo-q4_k_m.gguf` plus `Qwen3-4B-Q5_K_M.gguf` pairing, but both write
-a blank/white image at 512px/9 steps. That means the GPU handoff path is not the
-source of the blank output; the same model/text-encoder/VAE combination is not a
-usable image-quality acceptance pair in this checkout. Keep Z-Image advertised
-as API-handoff validated, not image-quality validated, until a known-good
-Z/Qwen asset pair produces coherent pixels through the CLI compatibility path.
+Current local validation caveat: the strict handoff smoke completes with the
+local `z-image-turbo-q4_k_m.gguf` plus `Qwen3-4B-Q5_K_M.gguf` pairing, but it
+still writes a blank/white image at 512px/9 steps even after switching to
+`res_multistep` / `simple`. That means the GPU handoff path is not the source of
+the blank output; this local Turbo model/text-encoder/VAE combination is not a
+usable image-quality acceptance pair in this checkout. Keep Z-Image Turbo
+advertised as API-handoff validated, not image-quality validated, until a
+known-good Turbo/Qwen asset pair produces coherent pixels through the CLI
+compatibility path.
+
+Validated Z-Anime Base image-quality smoke:
+
+- Diffusion model:
+  `F:\automatic1111\Stability\Models\DiffusionModels\z-anime-base-q8_0.gguf`
+- VAE:
+  `F:\automatic1111\Stability\Models\VAE\ae.safetensors`
+- LLM:
+  `F:\automatic1111\Stability\Models\TextEncoders\Qwen3-4B-Q5_K_M.gguf`
+- Resolution: `512x512`
+- Steps: `28`
+- CFG: `4.0`
+- Sampler/scheduler: `euler_a` / `beta`
+- Output:
+  `build\z-finish-smoke\z-anime-t2i-strict-512-28step.png`
+
+Observed Z-Anime handoff:
+
+- Qwen conditioning handle: CUDA device-resident cross-attention tensor
+- CFG evaluation: separate cond/uncond, `56` UNet calls for `28` steps
+- sampled GPU latent: `1x16x64x64`, f32, CUDA, no bridge flags
+- sampler math residency: `gpu_backend_tensor`
+- conditioning per-step upload: false
+- VAE decode output: `1x3x512x512`, f32, CUDA
+- COMFY_NORMAL VAE decode: no tiling, no TAESD, no IM2COL, host copies `0`
+- VAE workspace: `704 MiB`
 
 Validated narrow Z reference-aware conditioning-handle smoke:
 

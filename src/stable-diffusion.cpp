@@ -3383,8 +3383,15 @@ public:
             LOG_ERROR("GPU sampler backend path only supports SDXL/SD1 k-diffusion sampler methods in this pass");
             return nullptr;
         }
-        if (is_flow && !is_anima_flow && method != EULER_SAMPLE_METHOD) {
-            LOG_ERROR("GPU sampler backend flow path currently supports Euler only for this model family");
+        const bool is_z_image_flow = is_flow && sd_version_is_z_image(version);
+        const bool z_image_sampler_supported =
+            method == EULER_SAMPLE_METHOD ||
+            method == EULER_A_SAMPLE_METHOD ||
+            method == RES_MULTISTEP_SAMPLE_METHOD ||
+            method == RES_2S_SAMPLE_METHOD;
+        if (is_flow && !is_anima_flow &&
+            !(is_z_image_flow ? z_image_sampler_supported : method == EULER_SAMPLE_METHOD)) {
+            LOG_ERROR("GPU sampler backend flow path currently supports Euler for this model family; Z-Image additionally supports Euler A, RES multistep, and RES 2S");
             return nullptr;
         }
         if (method == DPMPP_SDE_SAMPLE_METHOD || method == DPMPP_SDE_GPU_SAMPLE_METHOD) {
@@ -3435,11 +3442,12 @@ public:
         }
         if (is_flow && !is_anima_flow) {
             if (!sd_version_is_qwen_image(version) &&
+                !sd_version_is_z_image(version) &&
                 (!uncond.empty() || guidance.txt_cfg != 1.0f || guidance.img_cfg != guidance.txt_cfg)) {
                 LOG_ERROR("GPU sampler backend flow path currently supports distilled cfg=1 text conditioning only for this model family");
                 return nullptr;
             }
-            if (eta != 0.0f) {
+            if (!sd_version_is_z_image(version) && eta != 0.0f) {
                 LOG_ERROR("GPU sampler backend flow path currently supports eta=0 Euler only");
                 return nullptr;
             }
@@ -6781,10 +6789,22 @@ static bool sd_ctx_looks_low_step_distilled(const sd_ctx_t* sd_ctx) {
     return sd_text_contains_any(sd_ctx_model_hint_text(sd_ctx), needles, sizeof(needles) / sizeof(needles[0]));
 }
 
+static bool sd_ctx_looks_z_anime(const sd_ctx_t* sd_ctx) {
+    static const char* const needles[] = {
+        "z-anime",
+        "z_anime",
+        "zanime",
+    };
+    return sd_text_contains_any(sd_ctx_model_hint_text(sd_ctx), needles, sizeof(needles) / sizeof(needles[0]));
+}
+
 enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx) {
     if (sd_ctx != nullptr && sd_ctx->sd != nullptr) {
         if (sd_version_is_anima(sd_ctx->sd->version)) {
             return ER_SDE_SAMPLE_METHOD;
+        }
+        if (sd_version_is_z_image(sd_ctx->sd->version)) {
+            return sd_ctx_looks_z_anime(sd_ctx) ? EULER_A_SAMPLE_METHOD : RES_MULTISTEP_SAMPLE_METHOD;
         }
         if ((sd_version_is_sd1(sd_ctx->sd->version) || sd_version_is_sdxl(sd_ctx->sd->version)) &&
             sd_ctx_looks_lcm_distilled(sd_ctx)) {
@@ -6806,6 +6826,9 @@ enum scheduler_t sd_get_default_scheduler(const sd_ctx_t* sd_ctx, enum sample_me
     }
     if (sample_method == LCM_SAMPLE_METHOD) {
         return LCM_SCHEDULER;
+    }
+    if (sd_ctx != nullptr && sd_ctx->sd != nullptr && sd_version_is_z_image(sd_ctx->sd->version)) {
+        return sd_ctx_looks_z_anime(sd_ctx) ? BETA_SCHEDULER : SIMPLE_SCHEDULER;
     }
     return DISCRETE_SCHEDULER;
 }
@@ -7611,6 +7634,7 @@ static bool sd_ctx_supports_flow_backend_reference_edit(sd_ctx_t* sd_ctx) {
 
 static bool sd_version_allows_flow_backend_cfg(SDVersion version) {
     return sd_version_is_anima(version) ||
+           sd_version_is_z_image(version) ||
            sd_version_is_qwen_image(version);
 }
 
@@ -10111,12 +10135,19 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     SamplePlan plan(sd_ctx, sd_img_gen_params, request);
     if (is_supported_flow_backend) {
         const bool is_anima_flow = sd_version_is_anima(sd_ctx->sd->version);
+        const bool is_z_image_flow = sd_version_is_z_image(sd_ctx->sd->version);
         if (!use_conditioning_handles) {
             LOG_ERROR("%s flow backend path requires pre-encoded conditioning handles", name);
             return false;
         }
-        if (!is_anima_flow && plan.sample_method != EULER_SAMPLE_METHOD) {
-            LOG_ERROR("%s flow backend path currently supports Euler only", name);
+        const bool z_image_sampler_supported =
+            plan.sample_method == EULER_SAMPLE_METHOD ||
+            plan.sample_method == EULER_A_SAMPLE_METHOD ||
+            plan.sample_method == RES_MULTISTEP_SAMPLE_METHOD ||
+            plan.sample_method == RES_2S_SAMPLE_METHOD;
+        if (!is_anima_flow &&
+            !(is_z_image_flow ? z_image_sampler_supported : plan.sample_method == EULER_SAMPLE_METHOD)) {
+            LOG_ERROR("%s flow backend path currently supports Euler only for this family; Z-Image additionally supports Euler A, RES multistep, and RES 2S", name);
             return false;
         }
         if (is_anima_flow &&
@@ -10132,7 +10163,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
             LOG_ERROR("%s flow backend path currently supports cfg=1 only", name);
             return false;
         }
-        if (!is_anima_flow && plan.eta != 0.0f) {
+        if (!is_anima_flow && !is_z_image_flow && plan.eta != 0.0f) {
             LOG_ERROR("%s flow backend path currently supports eta=0 Euler only", name);
             return false;
         }

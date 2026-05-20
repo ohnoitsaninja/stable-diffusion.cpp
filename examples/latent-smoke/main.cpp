@@ -37,6 +37,7 @@ struct Args {
     std::string negative_prompt = "blurry, low quality, noisy";
     std::string model_family;
     std::string sampling_method;
+    std::string scheduler;
     int image_channels = 4;
     int width          = 0;
     int height         = 0;
@@ -113,6 +114,7 @@ static void usage(const char* argv0) {
         << "  --sampler-rng <name>     sampler RNG; cpu selects Comfy-compatible CPU torch initial noise in GPU backend\n"
         << "  --cfg-scale <float>      text/image CFG override\n"
         << "  --sampling-method <name> sampler method override\n"
+        << "  --scheduler <name>       scheduler override\n"
         << "  --image-channels <3|4>   channel count to load and pass into sd_encode_image (default: 4)\n"
         << "  --ref-image <path>       reference image for edit/reference-conditioning smoke\n"
         << "  --conditioning-ref-image <path> reference image used only for conditioning handle encoding\n"
@@ -273,6 +275,10 @@ static bool parse_args(int argc, char** argv, Args& args) {
             const char* value = need_value("--sampling-method");
             if (value == nullptr) return false;
             args.sampling_method = value;
+        } else if (arg == "--scheduler") {
+            const char* value = need_value("--scheduler");
+            if (value == nullptr) return false;
+            args.scheduler = value;
         } else if (arg == "--image-channels") {
             const char* value = need_value("--image-channels");
             if (value == nullptr) return false;
@@ -1392,6 +1398,16 @@ int main(int argc, char** argv) {
             gen_params.sample_params.sample_method = str_to_sample_method(args.sampling_method.c_str());
         }
         gen_params.sample_params.scheduler             = caps.default_scheduler;
+        if (!args.scheduler.empty()) {
+            gen_params.sample_params.scheduler = str_to_scheduler(args.scheduler.c_str());
+            if (gen_params.sample_params.scheduler == SCHEDULER_COUNT) {
+                std::cerr << "unknown --scheduler value: " << args.scheduler << "\n";
+                if (ref_image.data != nullptr) free(ref_image.data);
+                if (encoded != nullptr) free_sd_latent(encoded);
+                free_sd_ctx(ctx);
+                return 1;
+            }
+        }
         gen_params.sample_params.flow_shift            = caps.default_flow_shift;
         gen_params.vae_tiling_params                   = tiling;
         if (!args.ref_image.empty()) {

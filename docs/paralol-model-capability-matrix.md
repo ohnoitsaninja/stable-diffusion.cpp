@@ -43,7 +43,7 @@ least one local smoke or existing artifact supports the claim.
 | SDXL | 4 ch | 8 | Supported | Supported | No | TAESDXL verified | COMFY_NORMAL + implicit-GEMM VAE path is the production target. |
 | Flux.1 | 16 ch | model-reported, normally 8 | Supported | Supported | No | TAEF1 verified | Uses CLIP-L + T5XXL. |
 | Flux2 / Klein | 128 ch | 16 | Supported | Supported for the strict GPU-init I2I lane | Yes, via `ref_images` | TAEF2 verified | Flux2 edit/reference conditioning uses `ref_images`; plain I2I uses the GPU VAE Encode -> GPU init-latent sampler path. |
-| Z-Image / Z-Anime | 16 ch | 8 | Supported | Supported for Z-Image smoke path | Not claimed | Not claimed | Z T2I and init-latent bridge smokes pass. Reference/edit capability is intentionally not advertised yet. |
+| Z-Image / Z-Anime | 16 ch | 8 | Supported | Supported for Z-Image smoke path | Not claimed | Not claimed | Z-Turbo handoff and Z-Anime image smoke pass through the strict GPU path. Reference/edit capability is intentionally not advertised yet. |
 | Qwen-Image | 16 ch | 8 | Supported for text-only `cfg=1` strict sampler; true GPU VAE decode is not claimed | Compatibility bridge | Qwen edit path, not strict-resident | TAEHV compatible, not claimed here | `SDCPP_EXPERIMENTAL_QWEN_IMAGE_BACKEND=1` enables the strict sampler lane. Non-strict VAE bridge is reported separately; the local Qwen VAE image remains unaccepted. |
 | Anima | 16 ch | 8 | Supported for text-only strict sampler; true GPU VAE decode is not claimed | Compatibility bridge | No | Not claimed | `SDCPP_EXPERIMENTAL_ANIMA_BACKEND=1` enables the strict sampler lane. Validated sampler methods: `euler`, `euler_a`, `er_sde`, `dpmpp_2m_sde_gpu`. Non-strict Wan/Qwen VAE bridge produces coherent diagnostics at realistic settings. |
 | Marigold IID | 8 ch | model-specific | Not supported | Not supported | N/A | N/A | Uses the dedicated intrinsic-image decomposition API. |
@@ -55,7 +55,12 @@ Known verified paths at the time this matrix was written:
 - SDXL T2I GPU sampled latent -> GPU VAE Decode -> caller-owned image download.
 - SDXL I2I VAE Encode GPU latent -> non-strict KSampler init bridge -> isolated
   GPU VAE Decode.
-- Z-Image T2I GPU sampled latent -> GPU VAE Decode at 512 and 1024 resolutions.
+- Z-Image Turbo T2I GPU sampled latent -> GPU VAE Decode at 512 and 1024
+  resolutions. The local Turbo/Qwen pairing remains blank/white, so this is
+  handoff validation only.
+- Z-Anime Base T2I strict GPU sampled latent -> GPU VAE Decode at 512 with
+  `euler_a` / `beta`, CFG `4.0`, 28 steps. The output is nonblank and coherent
+  enough for fork-side image-quality acceptance.
 - Flux2/Klein T2I GPU sampled latent -> GPU VAE Decode at 1024.
 - Flux2/Klein edit/reference conditioning through `ref_images`.
 - Flux.1 T2I GPU sampled latent -> GPU VAE Decode at 512.
@@ -82,7 +87,7 @@ Known verified paths at the time this matrix was written:
 
 Pending or deliberately unclaimed:
 
-- Z reference/edit conditioning.
+- Direct Z sampler reference/edit image inputs.
 - Qwen-Image and Anima VAE decode image-quality validation/fix for the
   Qwen-image VAE. The Qwen/X bridge is not accepted because it produced a
   blurry output in local testing.
