@@ -99,10 +99,11 @@ Qwen-Image latents. The default path still keeps the older CPU compatibility
 decode bridge. With `SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1`, the same transform
 is applied inside the Wan/Qwen VAE graph and `sd_decode_gpu_latent_normal_gpu()`
 returns a CUDA image handle without the latent download / image re-upload
-bridge. This path is strict-mode clean for Anima T2I, but it still uses the
-existing Wan/Qwen VAE graph and therefore still reports `IM2COL_3D`, about
-1874.5 MiB planned workspace at 512x512, and f32 storage. It is a handoff
-correctness improvement, not a Wan/Qwen VAE performance fix.
+bridge. This path is strict-mode clean for Anima T2I. For single-frame
+Anima/Qwen image decode, CausalConv3d is reduced to an equivalent direct Conv2D
+slice and uses the existing CUDA implicit-GEMM Conv2D backend. Set
+`SDCPP_DISABLE_WAN_QWEN_VAE_DIRECT_CONV3D=1` to force the older Conv3D/IM2COL
+graph for diagnostics.
 
 Use realistic Anima settings for image-quality checks. The official Anima model
 card recommends about 1MP output, 30-50 steps, CFG 4-5, and lists `er_sde`,
@@ -144,13 +145,20 @@ Observed strict handoff with `SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1`:
 - GPU image handle: `1x3x512x512`, f32, CUDA
 - caller-owned explicit image download: supported
 - strict GPU resident mode: passes
-- VAE graph: `direct_graph`, `IM2COL_3D=true`, workspace about 1874.5 MiB
+- VAE graph: `direct_graph`, direct conv true, IM2COL false
+- planned workspace: about 676.2 MiB at 512x512
+- largest tensor: about 290.3 MiB, `PAD`
+- decode graph: about 129 ms on the local RTX 4080 SUPER
 
 The 30-step ER-SDE Anima smoke is the meaningful image-quality acceptance here;
 short 2-4 step samples are only API/residency smokes and can look misleadingly
-bad. The direct GPU VAE output was byte-identical to the bridge output on the
-30-step test, and both matched a ComfyUI Wan21 `process_out` decode of the same
-latent with mean abs `0.4908`, p99 `4`, and PSNR `48.09 dB`.
+bad. The direct-conv GPU VAE output matches the older bridge output closely
+despite the different conv accumulation order, and it is slightly closer to a
+ComfyUI Wan21 `process_out` decode of the same latent:
+
+- direct-conv vs bridge: mean abs `0.2356`, p99 `2`, PSNR `52.95 dB`
+- direct-conv vs Comfy Wan21: mean abs `0.4680`, p99 `3`, PSNR `48.50 dB`
+- bridge vs Comfy Wan21: mean abs `0.4908`, p99 `4`, PSNR `48.09 dB`
 
 ## Z-Image Verification
 
@@ -687,7 +695,9 @@ current limitation is residency/performance rather than VAE math.
   - Comfy `Wan21.process_out` decode: mean abs `0.2078`, p99 `2`,
     PSNR `53.77 dB`
 
-Do not promote Anima/Qwen VAE decode to true GPU-resident until the Wan/Qwen
-VAE graph itself can consume a backend latent and return a backend image without
-the bridge download/upload. The current capability split is intentional:
+Anima/Qwen VAE decode can be promoted only when the experimental Wan/Qwen GPU
+VAE flag is set. Without that flag the capability split remains intentional:
 `supports_gpu_latent_decode=false` and `supports_gpu_latent_decode_bridge=true`.
+With `SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1`, the fork advertises true GPU
+decode for the validated Anima/Qwen single-frame path and strict mode refuses
+the old bridge.

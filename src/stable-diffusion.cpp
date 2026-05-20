@@ -9097,10 +9097,15 @@ static bool prepare_normal_vae_run(sd_ctx_t* sd_ctx,
                  fallback_reason.c_str());
     } else {
         sd_ctx->sd->first_stage_model->set_comfy_normal_enabled(false);
-        const bool use_direct_conv = !sd_version_is_anima(sd_ctx->sd->version);
+        const bool wan_qwen_gpu_vae =
+            sd_experimental_wan_qwen_vae_gpu_enabled() &&
+            (sd_version_is_qwen_image(sd_ctx->sd->version) || sd_version_is_anima(sd_ctx->sd->version));
+        const bool use_direct_conv = wan_qwen_gpu_vae || !sd_version_is_anima(sd_ctx->sd->version);
         sd_ctx->sd->first_stage_model->set_conv2d_direct_enabled(use_direct_conv);
         if (!use_direct_conv) {
             LOG_INFO("[VAE] direct graph using legacy convolution for Anima Wan/Qwen VAE compatibility");
+        } else if (wan_qwen_gpu_vae) {
+            LOG_INFO("[VAE] direct graph using experimental Wan/Qwen direct Conv2D/Conv3D reduction");
         }
     }
     return true;
@@ -9108,8 +9113,8 @@ static bool prepare_normal_vae_run(sd_ctx_t* sd_ctx,
 
 class ScopedVaeImplicitGemmConv {
 public:
-    explicit ScopedVaeImplicitGemmConv(sd_vae_exec_mode_t resolved_mode) {
-        if (resolved_mode != SD_VAE_EXEC_COMFY_NORMAL ||
+    explicit ScopedVaeImplicitGemmConv(sd_vae_exec_mode_t resolved_mode, bool force_enable = false) {
+        if ((!force_enable && resolved_mode != SD_VAE_EXEC_COMFY_NORMAL) ||
             StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV")) {
             return;
         }
@@ -9124,7 +9129,7 @@ public:
         setenv(kEnvName, "1", 1);
 #endif
         active_ = true;
-        LOG_INFO("[VAE] COMFY_NORMAL conv backend: implicit_gemm (set SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV=1 to force direct conv)");
+        LOG_INFO("[VAE] conv backend: implicit_gemm (set SDCPP_DISABLE_VAE_IMPLICIT_GEMM_CONV=1 to force direct conv)");
     }
 
     ~ScopedVaeImplicitGemmConv() {
@@ -12829,7 +12834,7 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         }
         LOG_INFO("sd_decode_gpu_latent_normal_gpu using experimental Wan/Qwen direct GPU VAE path");
     }
-    ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode);
+    ScopedVaeImplicitGemmConv implicit_conv_scope(resolved_mode, wan_qwen_gpu_vae);
     int64_t t_setup1 = ggml_time_ms();
 
     int64_t t0 = ggml_time_ms();

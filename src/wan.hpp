@@ -1,6 +1,7 @@
 #ifndef __WAN_HPP__
 #define __WAN_HPP__
 
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <utility>
@@ -14,6 +15,15 @@ namespace WAN {
 
     constexpr int CACHE_T        = 2;
     constexpr int WAN_GRAPH_SIZE = 10240;
+
+    static bool wan_qwen_vae_direct_conv3d_enabled() {
+        const char* enabled = std::getenv("SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU");
+        if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0') {
+            return false;
+        }
+        const char* disabled = std::getenv("SDCPP_DISABLE_WAN_QWEN_VAE_DIRECT_CONV3D");
+        return disabled == nullptr || disabled[0] == '\0' || disabled[0] == '0';
+    }
 
     class CausalConv3d : public GGMLBlock {
     protected:
@@ -75,6 +85,67 @@ namespace WAN {
             }
 
             x = ggml_ext_pad_ext(ctx->ggml_ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+            const int kt = std::get<0>(kernel_size);
+            const int kh = std::get<1>(kernel_size);
+            const int kw = std::get<2>(kernel_size);
+            const int st = std::get<0>(stride);
+            const int dy = std::get<1>(dilation);
+            const int dx = std::get<2>(dilation);
+            const int dt = std::get<0>(dilation);
+            if (wan_qwen_vae_direct_conv3d_enabled() &&
+                cache_x == nullptr &&
+                x->ne[2] == kt &&
+                st == 1 &&
+                dt == 1 &&
+                kw == w->ne[0] &&
+                kh == w->ne[1] &&
+                kt == w->ne[2] &&
+                x->ne[3] % in_channels == 0) {
+                // Single-frame Wan/Qwen image VAE decode pads only historical
+                // frames, so only the current temporal kernel plane
+                // contributes. Collapse that causal Conv3D into an equivalent
+                // Conv2D and let the CUDA implicit-GEMM Conv2D backend avoid
+                // the old IM2COL_3D workspace.
+                const int64_t n_batches = x->ne[3] / in_channels;
+                const int64_t out_channels = w->ne[3] / in_channels;
+                const int64_t temporal_slice = kt - 1;
+                ggml_tensor* x_frame = ggml_view_4d(ctx->ggml_ctx,
+                                                    x,
+                                                    x->ne[0],
+                                                    x->ne[1],
+                                                    in_channels,
+                                                    n_batches,
+                                                    x->nb[1],
+                                                    x->nb[3],
+                                                    x->nb[3] * in_channels,
+                                                    x->nb[2] * temporal_slice);
+                x_frame = ggml_cont(ctx->ggml_ctx, x_frame);
+                ggml_tensor* w_frame = ggml_view_4d(ctx->ggml_ctx,
+                                                    w,
+                                                    w->ne[0],
+                                                    w->ne[1],
+                                                    in_channels,
+                                                    out_channels,
+                                                    w->nb[1],
+                                                    w->nb[3],
+                                                    w->nb[3] * in_channels,
+                                                    w->nb[2] * temporal_slice);
+                w_frame = ggml_cont(ctx->ggml_ctx, w_frame);
+                ggml_tensor* out = ggml_ext_conv_2d(ctx->ggml_ctx,
+                                                    x_frame,
+                                                    w_frame,
+                                                    b,
+                                                    std::get<2>(stride),
+                                                    std::get<1>(stride),
+                                                    0,
+                                                    0,
+                                                    dx,
+                                                    dy,
+                                                    true,
+                                                    false,
+                                                    false);
+                return ggml_reshape_4d(ctx->ggml_ctx, out, out->ne[0], out->ne[1], 1, out->ne[2] * out->ne[3]);
+            }
             return ggml_ext_conv_3d(ctx->ggml_ctx, x, w, b, in_channels,
                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                     0, 0, 0,
