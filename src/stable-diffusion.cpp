@@ -36,6 +36,8 @@
 #include <sstream>
 #include <unordered_map>
 
+const char* sd_preview_name(enum preview_t preview);
+
 const char* model_version_to_str[] = {
     "SD 1.x",
     "SD 1.x Inpaint",
@@ -1693,7 +1695,7 @@ public:
                 vae_backend = backend;
             }
 
-            auto create_tae = [&]() -> std::shared_ptr<VAE> {
+            auto create_tae = [&](bool decoder_only) -> std::shared_ptr<VAE> {
                 if (sd_version_is_wan(version) ||
                     sd_version_is_qwen_image(version) ||
                     sd_version_is_anima(version)) {
@@ -1701,7 +1703,7 @@ public:
                                                                   offload_params_to_cpu,
                                                                   tensor_storage_map,
                                                                   "decoder",
-                                                                  vae_decode_only,
+                                                                  decoder_only,
                                                                   version);
 
                 } else {
@@ -1709,7 +1711,7 @@ public:
                                                                         offload_params_to_cpu,
                                                                         tensor_storage_map,
                                                                         "decoder.layers",
-                                                                        vae_decode_only,
+                                                                        decoder_only,
                                                                         version);
                     return model;
                 }
@@ -1753,7 +1755,7 @@ public:
                                                               offload_params_to_cpu);
             } else if (use_tae && !tae_preview_only) {
                 LOG_INFO("using TAE for encoding / decoding");
-                first_stage_model = create_tae();
+                first_stage_model = create_tae(vae_decode_only);
                 first_stage_model->alloc_params_buffer();
                 first_stage_model->get_param_tensors(tensors, "tae");
             } else {
@@ -1763,7 +1765,7 @@ public:
                 first_stage_model->get_param_tensors(tensors, "first_stage_model");
                 if (use_tae && tae_preview_only) {
                     LOG_INFO("using TAE for preview");
-                    preview_vae = create_tae();
+                    preview_vae = create_tae(true);
                     preview_vae->alloc_params_buffer();
                     preview_vae->get_param_tensors(tensors, "tae");
                 }
@@ -2588,6 +2590,9 @@ public:
             if (decoded.empty()) {
                 LOG_ERROR("preview decode failed at step %d", step);
                 return;
+            }
+            if (decoded.dim() == 3) {
+                decoded = decoded.unsqueeze(3);
             }
 
             is_video           = preview_latent_tensor_is_video(decoded);
@@ -3768,6 +3773,49 @@ public:
         LatentBackendGraphRunner latent_runner(backend);
         const int steps = static_cast<int>(sigmas.size()) - 1;
         const int64_t t0 = ggml_time_us();
+        SamplePreviewContext preview = prepare_sample_preview_context();
+        int preview_frame_count = 0;
+        auto emit_backend_preview = [&](int step,
+                                        const GgmlBackendTensorResource& latent,
+                                        bool is_noisy,
+                                        const char* source) -> bool {
+            if (!should_emit_preview(&preview, step, static_cast<size_t>(steps), is_noisy)) {
+                return true;
+            }
+            if (latent.empty() || latent.tensor == nullptr) {
+                LOG_WARN("[Preview] backend=%s step=%d source=%s skipped empty latent",
+                         sd_preview_name(preview.options.mode),
+                         step,
+                         source != nullptr ? source : "unknown");
+                return true;
+            }
+            int64_t start_ms = ggml_time_ms();
+            sd::Tensor<float> preview_latents = sd::make_sd_tensor_from_ggml<float>(latent.tensor);
+            if (preview_latents.empty()) {
+                LOG_WARN("[Preview] backend=%s step=%d source=%s skipped empty downloaded latent",
+                         sd_preview_name(preview.options.mode),
+                         step,
+                         source != nullptr ? source : "unknown");
+                return true;
+            }
+            preview_image(step,
+                          preview_latents,
+                          version,
+                          preview.options.mode,
+                          preview.callback,
+                          preview.data,
+                          is_noisy);
+            preview_frame_count += 1;
+            LOG_INFO("[Preview] backend=%s step=%d/%d source=%s noisy=%s frame_count=%d download_decode_ms=%" PRId64,
+                     sd_preview_name(preview.options.mode),
+                     step,
+                     steps,
+                     source != nullptr ? source : "unknown",
+                     is_noisy ? "true" : "false",
+                     preview_frame_count,
+                     ggml_time_ms() - start_ms);
+            return true;
+        };
         int unet_calls = 0;
         int backend_post_graphs = 0;
         int euler_denoised_cache_skips = 0;
@@ -4016,6 +4064,9 @@ public:
                     remember_euler_denoised(std::move(forecast_denoised));
                 }
                 x = std::move(next_x);
+                if (!emit_backend_preview(i + 1, *x, false, "post_update_cache_skip")) {
+                    return nullptr;
+                }
                 LOG_INFO("GPU Euler denoised cache skipped UNet at step %d/%d mode=%s",
                          i + 1,
                          steps,
@@ -4064,6 +4115,9 @@ public:
                 unet_calls += 2;
                 backend_post_graphs += 1;
                 x = std::move(next_x);
+                if (!emit_backend_preview(i + 1, *x, false, "post_update_dual_branch_fused")) {
+                    return nullptr;
+                }
                 if (trace_step) {
                     char label[128];
                     snprintf(label, sizeof(label), "step%d_post_update_x", i);
@@ -4082,6 +4136,9 @@ public:
                 return nullptr;
             }
             backend_post_graphs += 1;
+            if (!emit_backend_preview(i + 1, *noised_input, true, "noised_input")) {
+                return nullptr;
+            }
             if (trace_step) {
                 LOG_INFO("[EulerParity] step=%d sigma=%.9g sigma_next=%.9g c_in=%.9g c_skip=%.9g c_out=%.9g",
                          i,
@@ -4317,6 +4374,7 @@ public:
                 }
             }
 
+            bool denoised_preview_emitted = false;
             auto make_cfg_denoised = [&](const GgmlBackendTensorResource& output,
                                          const GgmlBackendTensorResource* separate_uncond,
                                          bool batched_cfg,
@@ -4324,24 +4382,33 @@ public:
                                          float local_c_out,
                                          float local_c_skip,
                                          const char* output_name) -> std::unique_ptr<GgmlBackendTensorResource> {
+                std::unique_ptr<GgmlBackendTensorResource> denoised;
                 if (separate_uncond != nullptr && !separate_uncond->empty()) {
-                    return latent_runner.denoised_from_cfg_outputs(output,
-                                                                   *separate_uncond,
-                                                                   latent,
-                                                                   guidance.txt_cfg,
-                                                                   local_c_out,
-                                                                   local_c_skip,
-                                                                   n_threads,
-                                                                   output_name);
+                    denoised = latent_runner.denoised_from_cfg_outputs(output,
+                                                                       *separate_uncond,
+                                                                       latent,
+                                                                       guidance.txt_cfg,
+                                                                       local_c_out,
+                                                                       local_c_skip,
+                                                                       n_threads,
+                                                                       output_name);
+                } else {
+                    denoised = latent_runner.denoised_from_cfg_model_output(output,
+                                                                            latent,
+                                                                            guidance.txt_cfg,
+                                                                            batched_cfg,
+                                                                            local_c_out,
+                                                                            local_c_skip,
+                                                                            n_threads,
+                                                                            output_name);
                 }
-                return latent_runner.denoised_from_cfg_model_output(output,
-                                                                    latent,
-                                                                    guidance.txt_cfg,
-                                                                    batched_cfg,
-                                                                    local_c_out,
-                                                                    local_c_skip,
-                                                                    n_threads,
-                                                                    output_name);
+                if (!denoised_preview_emitted && denoised != nullptr && !denoised->empty()) {
+                    if (!emit_backend_preview(i + 1, *denoised, false, output_name)) {
+                        return nullptr;
+                    }
+                    denoised_preview_emitted = true;
+                }
+                return denoised;
             };
 
             std::unique_ptr<GgmlBackendTensorResource> next_x;
@@ -4366,6 +4433,25 @@ public:
                                                         n_threads,
                                                         "gpu_euler_denoised_cache_refresh_update");
                     remember_euler_denoised(std::move(denoised));
+                } else if (preview.callback != nullptr && preview.options.mode != PREVIEW_NONE && preview.options.denoised) {
+                    auto denoised = make_cfg_denoised(*model_output,
+                                                      separate_uncond_output.get(),
+                                                      model_output_is_batched_cfg,
+                                                      *x,
+                                                      c_out,
+                                                      c_skip,
+                                                      "gpu_euler_denoised_preview");
+                    if (denoised == nullptr || denoised->empty()) {
+                        LOG_ERROR("GPU Euler sampler backend path failed denoised preview/update tensor at step %d", i + 1);
+                        return nullptr;
+                    }
+                    backend_post_graphs += 1;
+                    next_x = latent_runner.euler_update(*x,
+                                                        *denoised,
+                                                        sigma,
+                                                        sigma_next,
+                                                        n_threads,
+                                                        "gpu_euler_preview_update");
                 } else if (separate_uncond_output != nullptr && !separate_uncond_output->empty()) {
                     next_x = latent_runner.euler_update_from_cfg_outputs(*model_output,
                                                                          *separate_uncond_output,
@@ -5832,6 +5918,10 @@ public:
             }
             backend_post_graphs += 1;
             x = std::move(next_x);
+            if (!denoised_preview_emitted &&
+                !emit_backend_preview(i + 1, *x, false, "post_update")) {
+                return nullptr;
+            }
             if (trace_step) {
                 char label[128];
                 snprintf(label, sizeof(label), "step%d_post_update_x", i);
@@ -5865,6 +5955,18 @@ public:
                  step_noise_backend,
                  expected_imported_step_noise_count,
                  has_imported_step_noise ? static_cast<unsigned>(imported_step_noise_backend->size()) : 0u);
+        if (preview.callback != nullptr && preview.options.mode != PREVIEW_NONE) {
+            LOG_INFO("[Preview] sample_kdiffusion_gpu_backend backend=%s path=%s schedule_mode=%u every_steps=%d percent_interval=%.6g explicit_count=%u include_first=%s include_final=%s frames=%d",
+                     sd_preview_name(preview.options.mode),
+                     preview_vae != nullptr ? preview_vae->get_desc().c_str() : "model_vae",
+                     static_cast<unsigned>(preview.options.schedule_mode),
+                     preview.options.step_interval,
+                     static_cast<double>(preview.options.percent_interval),
+                     preview.options.percent_point_count,
+                     preview.options.include_first_step ? "true" : "false",
+                     preview.options.include_final_step ? "true" : "false",
+                     preview_frame_count);
+        }
         if (euler_denoised_cache_enabled) {
             LOG_INFO("[Timing] sample_kdiffusion_gpu_backend euler_denoised_cache_skips=%d forecasts=%d effective_unet_calls=%d/%d",
                      euler_denoised_cache_skips,

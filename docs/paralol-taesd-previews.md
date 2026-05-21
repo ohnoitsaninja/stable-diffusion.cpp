@@ -8,6 +8,8 @@ The verified targets are:
 - SDXL with TAESDXL.
 - Flux.1 with TAEF1.
 - Flux.2 / Flux2 Klein with TAEF2.
+- Qwen-Image / Anima / Wan 2.1 with TAEHV `taew2_1`.
+- Wan 2.2 with TAEHV `taew2_2`.
 
 The context must be created with `taesd_path` pointing at a compatible tiny
 autoencoder checkpoint and `tae_preview_only=true` if the tiny autoencoder
@@ -99,6 +101,70 @@ shape for Flux.1:
 
 Keep TAEF1 as preview-only until final image quality is explicitly accepted for
 the workflow.
+
+For Qwen-Image, Anima, and Wan 2.1, use:
+
+- `taesd_path = %models%/VAE/taew2_1.safetensors`
+- `tae_preview_only=true`
+- the normal model VAE for final decode, for example
+  `qwen_image_vae.safetensors` for Anima/Qwen-Image.
+
+For Wan 2.2, use:
+
+- `taesd_path = %models%/VAE/taew2_2.safetensors`
+- `tae_preview_only=true`
+
+The local LightTAE variants `lighttaew2_1`, `lighttaew2_2`, and
+`lighttaehy1_5` use the same TAEHV-style decoder contract and can be used as
+preview decoders when their latent family matches the model. Preview-only
+TAEHV contexts are decoder-only, so encoder tensors in full TAEHV checkpoints
+are ignored as extra file tensors rather than required model tensors.
+
+The resident GPU sampler path now emits previews from backend sampler tensors.
+This intentionally downloads only the temporary preview latent/image for the
+callback; the final sampled latent remains GPU-resident and is still returned as
+an `sd_gpu_handle_t`.
+
+Anima DMDX 4-step LoRA + TAEHV smoke:
+
+```powershell
+$env:SDCPP_EXPERIMENTAL_ANIMA_BACKEND = "1"
+$env:SDCPP_ANIMA_TEXT_ENCODER_CPU_PARAMS = "1"
+$env:SDCPP_STRICT_GPU_RESIDENT = "1"
+
+.\build\codex\bin\sd-latent-smoke.exe `
+  --diffusion-model "F:\automatic1111\Stability\Models\DiffusionModels\anima-base-v1.0.safetensors" `
+  --vae "F:\automatic1111\Stability\Models\VAE\qwen_image_vae.safetensors" `
+  --llm "F:\automatic1111\Stability\Models\TextEncoders\qwen_3_06b_base.safetensors" `
+  --taesd "F:\automatic1111\Stability\Models\VAE\taew2_1.safetensors" `
+  --image "F:\Paralol\examples\orc.png" --image-channels 3 `
+  --model-family anima `
+  --prompt "<lora:anima-dmdx-4step-comfy:1> Astronaut in a jungle, cold color palette, muted colors, detailed, 8k" `
+  --width 512 --height 512 --steps 4 --cfg-scale 1.0 --seed 42 `
+  --sampling-method er_sde --scheduler simple `
+  --lora "F:\automatic1111\Stability\Models\Lora\anima-dmdx-4step-comfy.safetensors" --lora-strength 1.0 `
+  --type-f16 --sample-without-init --gpu-flow-sampler --condition-handles `
+  --release-text-encoder-after-conditioning --anima-text-encoder-cpu-params --strict-gpu-resident `
+  --gpu-latent-decode-input --gpu-decode-output --download-gpu-output-buffer `
+  --preview-tae --preview-every 1 `
+  --preview-prefix "F:\Paralol\local\stable-diffusion.cpp-speed\build\anima-taehv-preview-smoke\preview" `
+  --skip-estimate --no-decode
+```
+
+Expected previews:
+
+- `preview_step1_denoised_frame0.png`
+- `preview_step2_denoised_frame0.png`
+- `preview_step3_denoised_frame0.png`
+- `preview_step4_denoised_frame0.png`
+
+Expected sampler diagnostics:
+
+- `conditioning_storage=device_tensor`
+- `conditioning_per_step_upload=false`
+- `sampler_math_residency=gpu_backend_tensor`
+- `output_bridge_upload=false`
+- `[Preview] sample_kdiffusion_gpu_backend backend=tae path=taehv ... frames=4`
 
 ## Verification
 
