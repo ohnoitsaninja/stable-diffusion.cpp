@@ -193,6 +193,42 @@ ComfyUI Wan21 `process_out` decode of the same latent:
 - direct-conv vs Comfy Wan21: mean abs `0.4680`, p99 `3`, PSNR `48.50 dB`
 - bridge vs Comfy Wan21: mean abs `0.4908`, p99 `4`, PSNR `48.09 dB`
 
+### Anima Distill LoRA
+
+`darask0/anima-distill-loras` provides ComfyUI-format model-only LoRAs for
+Anima v1.0. The validated DMDX smoke uses:
+
+- LoRA:
+  `F:\automatic1111\Stability\Models\Lora\anima-dmdx-4step-comfy.safetensors`
+- steps: `4`
+- CFG: `1.0`
+- sampler/scheduler: `er_sde` / `simple`
+- flow shift: `3.0`
+- LoRA strength: `1.0`
+
+The conditioning-handle sampler now permits LoRA stacks only when every LoRA
+looks diffusion-model-only. If a LoRA contains conditioner/text-encoder or VAE
+tensors, the sampler still fails closed because pre-encoded conditioning would
+not include that LoRA effect.
+
+Validated strict DMDX handoff:
+
+- conditioning handle: device-resident backend tensor
+- text encoder release before diffusion: true
+- LoRA application: `980 / 980` tensors applied
+- sampled GPU latent: `1x16x64x64`, f32, CUDA, 262,144 bytes
+- sampler math residency: `gpu_backend_tensor`
+- sampler bridge flags: none
+- denoise: about `386 ms`
+- `SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1` strict VAE decode: passes
+- VAE decode graph: about `100 ms`, workspace `676.2 MiB`
+- VAE host copies: 0
+- VAE IM2COL: false
+- GPU image handle: `1x3x512x512`, f32, CUDA
+- caller-owned image download: about `2 ms`
+- output:
+  `build/anima-distill-lora/resident-strict-gpu-vae/anima_dmdx_strict_gpu_vae.png`
+
 ## Z-Image Verification
 
 Z-Image now has the same first-class T2I handoff shape as the Flux2 strict

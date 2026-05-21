@@ -38,6 +38,7 @@ struct Args {
     std::string model_family;
     std::string sampling_method;
     std::string scheduler;
+    std::vector<std::string> loras;
     int image_channels = 4;
     int width          = 0;
     int height         = 0;
@@ -46,6 +47,7 @@ struct Args {
     rng_type_t rng_type = RNG_TYPE_COUNT;
     rng_type_t sampler_rng_type = RNG_TYPE_COUNT;
     float cfg_scale    = 0.0f;
+    float lora_strength = 1.0f;
     bool sample        = false;
     bool sample_without_init = false;
     bool decode        = true;
@@ -115,6 +117,8 @@ static void usage(const char* argv0) {
         << "  --cfg-scale <float>      text/image CFG override\n"
         << "  --sampling-method <name> sampler method override\n"
         << "  --scheduler <name>       scheduler override\n"
+        << "  --lora <path>            LoRA path to apply during sampling, repeatable\n"
+        << "  --lora-strength <float>  multiplier for --lora entries (default: 1.0)\n"
         << "  --image-channels <3|4>   channel count to load and pass into sd_encode_image (default: 4)\n"
         << "  --ref-image <path>       reference image for edit/reference-conditioning smoke\n"
         << "  --conditioning-ref-image <path> reference image used only for conditioning handle encoding\n"
@@ -279,6 +283,14 @@ static bool parse_args(int argc, char** argv, Args& args) {
             const char* value = need_value("--scheduler");
             if (value == nullptr) return false;
             args.scheduler = value;
+        } else if (arg == "--lora") {
+            const char* value = need_value("--lora");
+            if (value == nullptr) return false;
+            args.loras.push_back(value);
+        } else if (arg == "--lora-strength") {
+            const char* value = need_value("--lora-strength");
+            if (value == nullptr) return false;
+            args.lora_strength = static_cast<float>(std::atof(value));
         } else if (arg == "--image-channels") {
             const char* value = need_value("--image-channels");
             if (value == nullptr) return false;
@@ -1384,6 +1396,17 @@ int main(int argc, char** argv) {
         sd_img_gen_params_init(&gen_params);
         sd_model_pipeline_capabilities_t caps{};
         sd_get_model_pipeline_capabilities(ctx, &caps);
+        std::vector<sd_lora_t> lora_entries;
+        lora_entries.reserve(args.loras.size());
+        for (const std::string& lora_path : args.loras) {
+            sd_lora_t entry{};
+            entry.is_high_noise = false;
+            entry.multiplier = args.lora_strength;
+            entry.path = lora_path.c_str();
+            lora_entries.push_back(entry);
+        }
+        gen_params.loras          = lora_entries.empty() ? nullptr : lora_entries.data();
+        gen_params.lora_count     = static_cast<uint32_t>(lora_entries.size());
         gen_params.prompt          = args.prompt.c_str();
         gen_params.negative_prompt = args.negative_prompt.c_str();
         gen_params.width           = args.width > 0 ? args.width : static_cast<int>(image.width);

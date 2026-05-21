@@ -73,6 +73,10 @@ Known verified paths at the time this matrix was written:
   -> backend flow sampler -> CUDA `1x16x64x64` latent at 512px, with no sampler
   bridge flags. Validated methods: `euler`, `euler_a`, `er_sde`,
   `dpmpp_2m_sde_gpu`; CFG `4.5` validated for the Anima lane.
+- Anima DMDX 4-step distill LoRA strict T2I lane: diffusion-only LoRA accepted
+  with pre-encoded conditioning, `980 / 980` LoRA tensors applied,
+  `er_sde` / `simple`, CFG `1.0`, 4 steps, `SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU=1`,
+  no sampler bridge flags, no VAE host copies, and coherent 512px output.
 - Anima/Qwen-image Wan21 latent mean/std transforms are applied for
   diffusion-latent <-> VAE-latent conversion. The CPU compatibility decode path
   can write coherent Anima diagnostic images at realistic settings

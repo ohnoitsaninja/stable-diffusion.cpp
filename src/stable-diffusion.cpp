@@ -27,6 +27,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -7648,6 +7649,84 @@ static bool sd_version_allows_flow_backend_cfg(SDVersion version) {
            sd_version_is_qwen_image(version);
 }
 
+static bool sd_lora_file_is_diffusion_only_for_preencoded_conditioning(const char* path, std::string& reason) {
+    if (path == nullptr || path[0] == '\0') {
+        reason = "empty LoRA path";
+        return false;
+    }
+
+    constexpr const char* high_noise_tag = "|high_noise|";
+    std::string file_path = path;
+    if (starts_with(file_path, high_noise_tag)) {
+        file_path = file_path.substr(std::strlen(high_noise_tag));
+    }
+
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file) {
+        reason = "could not open LoRA file";
+        return false;
+    }
+
+    uint64_t header_size = 0;
+    file.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
+    if (!file || header_size == 0 || header_size > 64ull * 1024ull * 1024ull) {
+        reason = "invalid safetensors header size";
+        return false;
+    }
+
+    std::string header(static_cast<size_t>(header_size), '\0');
+    file.read(header.data(), static_cast<std::streamsize>(header.size()));
+    if (!file) {
+        reason = "could not read safetensors header";
+        return false;
+    }
+
+    auto contains_token = [&](const char* token) {
+        return header.find(token) != std::string::npos;
+    };
+    if (contains_token("cond_stage_model.") ||
+        contains_token("conditioner.embedders.") ||
+        contains_token("text_encoders.") ||
+        contains_token("first_stage_model.") ||
+        contains_token("\"vae.")) {
+        reason = "LoRA contains conditioner or VAE tensors";
+        return false;
+    }
+
+    if (!contains_token("diffusion_model.") &&
+        !contains_token("model.diffusion_model.")) {
+        reason = "LoRA does not look like a diffusion-model LoRA";
+        return false;
+    }
+
+    reason.clear();
+    return true;
+}
+
+static bool sd_lora_stack_is_diffusion_only_for_preencoded_conditioning(const sd_lora_t* loras,
+                                                                        uint32_t lora_count,
+                                                                        std::string& reason) {
+    if (lora_count == 0) {
+        reason.clear();
+        return true;
+    }
+    if (loras == nullptr) {
+        reason = "LoRA count is nonzero but LoRA pointer is null";
+        return false;
+    }
+    for (uint32_t i = 0; i < lora_count; ++i) {
+        std::string one_reason;
+        if (!sd_lora_file_is_diffusion_only_for_preencoded_conditioning(loras[i].path, one_reason)) {
+            std::ostringstream ss;
+            ss << "LoRA[" << i << "] " << one_reason;
+            reason = ss.str();
+            return false;
+        }
+    }
+    reason.clear();
+    return true;
+}
+
 static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
                                                          const sd_img_gen_params_t* sd_img_gen_params,
                                                          const sd_latent_t* init_latent,
@@ -7678,8 +7757,17 @@ static bool conditioning_handle_sampler_supports_request(sd_ctx_t* sd_ctx,
         return false;
     }
     if (sd_img_gen_params->lora_count != 0) {
-        LOG_ERROR("conditioning handle sampler currently rejects LoRA stacks; encode conditioning after CLIP LoRA application is not ABI-defined yet");
-        return false;
+        std::string lora_reason;
+        if (!is_supported_flow_backend_text ||
+            !sd_lora_stack_is_diffusion_only_for_preencoded_conditioning(sd_img_gen_params->loras,
+                                                                         sd_img_gen_params->lora_count,
+                                                                         lora_reason)) {
+            LOG_ERROR("conditioning handle sampler rejects this LoRA stack; encode conditioning after conditioner LoRA application is not ABI-defined yet: %s",
+                      lora_reason.empty() ? "not a diffusion-only env-gated flow LoRA stack" : lora_reason.c_str());
+            return false;
+        }
+        LOG_INFO("conditioning handle sampler allowing %u diffusion-only LoRA(s) with pre-encoded flow conditioning",
+                 sd_img_gen_params->lora_count);
     }
     if (request.batch_count != 1) {
         LOG_ERROR("conditioning handle sampler currently supports batch_count=1, got %d", request.batch_count);
