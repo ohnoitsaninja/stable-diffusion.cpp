@@ -6407,7 +6407,6 @@ void sd_loader_config_init(sd_loader_config_t* loader_config) {
     loader_config->ram_headroom_bytes = 2ull * 1024ull * 1024ull * 1024ull;
     loader_config->max_staging_bytes = 256ull * 1024ull * 1024ull;
     loader_config->min_tensor_bytes = 4ull * 1024ull * 1024ull;
-    loader_config->max_run_bytes = 0;
 }
 
 bool sd_set_loader_config(const sd_loader_config_t* loader_config) {
@@ -6426,10 +6425,6 @@ bool sd_set_loader_config(const sd_loader_config_t* loader_config) {
     config.min_tensor_bytes = 4ull * 1024ull * 1024ull;
     if (loader_config->struct_size >= offsetof(sd_loader_config_t, min_tensor_bytes) + sizeof(loader_config->min_tensor_bytes)) {
         config.min_tensor_bytes = loader_config->min_tensor_bytes;
-    }
-    config.max_run_bytes = 0;
-    if (loader_config->struct_size >= offsetof(sd_loader_config_t, max_run_bytes) + sizeof(loader_config->max_run_bytes)) {
-        config.max_run_bytes = loader_config->max_run_bytes;
     }
     sd::loader::set_config(config);
     return true;
@@ -6452,7 +6447,6 @@ bool sd_get_loader_config(sd_loader_config_t* loader_config) {
     loader_config->ram_headroom_bytes = config.ram_headroom_bytes;
     loader_config->max_staging_bytes = config.max_staging_bytes;
     loader_config->min_tensor_bytes = config.min_tensor_bytes;
-    loader_config->max_run_bytes = config.max_run_bytes;
 #else
     loader_config->enable_threaded_loader = false;
     loader_config->enable_pinned_staging = false;

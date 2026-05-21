@@ -781,7 +781,6 @@ typedef struct sd_loader_config_t {
     uint64_t ram_headroom_bytes;
     uint64_t max_staging_bytes;
     uint64_t min_tensor_bytes;
-    uint64_t max_run_bytes;
 } sd_loader_config_t;
 
 typedef struct sd_loader_stats_t {
