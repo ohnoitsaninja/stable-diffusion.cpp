@@ -26,6 +26,7 @@ struct Args {
     uint64_t pin_budget_mb = 1024;
     uint64_t max_staging_mb = 256;
     uint64_t min_tensor_kb = 4096;
+    uint64_t max_run_mb = 0;
     bool disable_threaded_loader = false;
 };
 
@@ -70,7 +71,7 @@ void usage() {
         << "  [--vae <path>] [--control-net <path>] [--lora <path>]\n"
         << "  [--prompt <text>] [--negative-prompt <text>] [--steps <n>]\n"
         << "  [--width <px>] [--height <px>] [--threads <n>] [--read-threads <n>]\n"
-        << "  [--pin-budget-mb <n>] [--max-staging-mb <n>] [--min-tensor-kb <n>]\n"
+        << "  [--pin-budget-mb <n>] [--max-staging-mb <n>] [--min-tensor-kb <n>] [--max-run-mb <n>]\n"
         << "  [--disable-threaded-loader]\n";
 }
 
@@ -107,6 +108,8 @@ bool parse_args(int argc, char** argv, Args& args) {
             if (!require_u64(i, argc, argv, args.max_staging_mb)) return false;
         } else if (arg == "--min-tensor-kb") {
             if (!require_u64(i, argc, argv, args.min_tensor_kb)) return false;
+        } else if (arg == "--max-run-mb") {
+            if (!require_u64(i, argc, argv, args.max_run_mb)) return false;
         } else if (arg == "--disable-threaded-loader") {
             args.disable_threaded_loader = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -230,6 +233,7 @@ int main(int argc, char** argv) {
     loader_config.pin_budget_bytes = args.pin_budget_mb * 1024ull * 1024ull;
     loader_config.max_staging_bytes = args.max_staging_mb * 1024ull * 1024ull;
     loader_config.min_tensor_bytes = args.min_tensor_kb * 1024ull;
+    loader_config.max_run_bytes = args.max_run_mb * 1024ull * 1024ull;
     sd_set_loader_config(&loader_config);
 
     bool ok = true;

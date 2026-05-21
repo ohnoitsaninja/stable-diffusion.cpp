@@ -14,6 +14,7 @@ struct LoaderConfig {
     uint64_t ram_headroom_bytes = 2ull * 1024ull * 1024ull * 1024ull;
     uint64_t max_staging_bytes = 256ull * 1024ull * 1024ull;
     uint64_t min_tensor_bytes = 4ull * 1024ull * 1024ull;
+    uint64_t max_run_bytes = 0;
 };
 
 struct LoaderStats {

@@ -1434,6 +1434,18 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
     const sd::loader::LoaderConfig loader_config = sd::loader::get_config();
     const bool threaded_loader_requested = loader_config.enable_threaded_loader;
+
+    struct ThreadedLoadTensor {
+        const TensorStorage* storage = nullptr;
+        size_t relative_offset = 0;
+    };
+
+    struct ThreadedLoadWork {
+        uint64_t offset = 0;
+        size_t bytes = 0;
+        bool staged = false;
+        std::vector<ThreadedLoadTensor> tensors;
+    };
 #endif
 
     for (size_t file_index = 0; file_index < file_paths_.size(); file_index++) {
@@ -1479,7 +1491,99 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
         }
         last_n_threads = n_threads;
 
-        std::atomic<size_t> tensor_idx(0);
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+        std::vector<ThreadedLoadWork> load_work;
+        if (threaded_loader_requested && !is_zip && !mmapped && loader_config.max_run_bytes > 0) {
+            std::vector<const TensorStorage*> eligible_tensors;
+            for (const TensorStorage* ts : file_tensors) {
+                if (static_cast<uint64_t>(ts->nbytes_to_read()) < loader_config.min_tensor_bytes ||
+                    ts->is_f8_e4m3 ||
+                    ts->is_f8_e5m2 ||
+                    ts->is_f64 ||
+                    ts->is_i64) {
+                    continue;
+                }
+                eligible_tensors.push_back(ts);
+            }
+            std::sort(eligible_tensors.begin(), eligible_tensors.end(), [](const TensorStorage* a, const TensorStorage* b) {
+                if (a->offset != b->offset) {
+                    return a->offset < b->offset;
+                }
+                return a->name < b->name;
+            });
+
+            const uint64_t near_gap_bytes = 4096;
+            const uint64_t max_run_bytes = std::max<uint64_t>(loader_config.min_tensor_bytes, loader_config.max_run_bytes);
+            std::set<const TensorStorage*> planned_tensors;
+            ThreadedLoadWork current_run;
+            uint64_t current_end = 0;
+            auto flush_run = [&]() {
+                if (!current_run.tensors.empty()) {
+                    load_work.push_back(std::move(current_run));
+                    current_run = ThreadedLoadWork{};
+                    current_end = 0;
+                }
+            };
+
+            for (const TensorStorage* ts : eligible_tensors) {
+                const uint64_t tensor_offset = ts->offset;
+                const uint64_t tensor_bytes = static_cast<uint64_t>(ts->nbytes_to_read());
+                const uint64_t tensor_end = tensor_offset + tensor_bytes;
+                if (current_run.tensors.empty()) {
+                    current_run.offset = tensor_offset;
+                    current_run.bytes = static_cast<size_t>(tensor_bytes);
+                    current_run.staged = true;
+                    current_run.tensors.push_back(ThreadedLoadTensor{ts, 0});
+                    current_end = tensor_end;
+                    planned_tensors.insert(ts);
+                    continue;
+                }
+
+                const uint64_t gap = tensor_offset > current_end ? tensor_offset - current_end : 0;
+                const uint64_t merged_end = std::max(current_end, tensor_end);
+                const uint64_t merged_bytes = merged_end - current_run.offset;
+                if (gap <= near_gap_bytes && (merged_bytes <= max_run_bytes || current_run.tensors.empty())) {
+                    current_run.bytes = static_cast<size_t>(merged_bytes);
+                    current_run.tensors.push_back(ThreadedLoadTensor{ts, static_cast<size_t>(tensor_offset - current_run.offset)});
+                    current_end = merged_end;
+                    planned_tensors.insert(ts);
+                } else {
+                    flush_run();
+                    current_run.offset = tensor_offset;
+                    current_run.bytes = static_cast<size_t>(tensor_bytes);
+                    current_run.staged = true;
+                    current_run.tensors.push_back(ThreadedLoadTensor{ts, 0});
+                    current_end = tensor_end;
+                    planned_tensors.insert(ts);
+                }
+            }
+            flush_run();
+
+            for (const TensorStorage* ts : file_tensors) {
+                if (planned_tensors.find(ts) != planned_tensors.end()) {
+                    continue;
+                }
+                ThreadedLoadWork fallback_work;
+                fallback_work.offset = ts->offset;
+                fallback_work.bytes = ts->nbytes_to_read();
+                fallback_work.tensors.push_back(ThreadedLoadTensor{ts, 0});
+                load_work.push_back(std::move(fallback_work));
+            }
+        } else {
+            for (const TensorStorage* ts : file_tensors) {
+                ThreadedLoadWork fallback_work;
+                fallback_work.offset = ts->offset;
+                fallback_work.bytes = ts->nbytes_to_read();
+                fallback_work.tensors.push_back(ThreadedLoadTensor{ts, 0});
+                load_work.push_back(std::move(fallback_work));
+            }
+        }
+#else
+        std::vector<const TensorStorage*> load_work = file_tensors;
+#endif
+
+        std::atomic<size_t> work_idx(0);
+        std::atomic<size_t> tensors_started(0);
         std::atomic<bool> failed(false);
         std::vector<std::thread> workers;
 
@@ -1494,7 +1598,8 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                 if (threaded_loader_requested && !is_zip) {
                     pinned_arena = std::make_unique<sd::loader::PinnedHostArena>(loader_config);
                     threaded_reader = std::make_unique<sd::loader::ThreadedFileReader>(
-                        sd::loader::FileReadOptions{std::max<uint32_t>(1, loader_config.read_threads), 8ull * 1024ull * 1024ull});
+                        sd::loader::FileReadOptions{std::max<uint32_t>(1, loader_config.read_threads),
+                                                    loader_config.max_run_bytes > 0 ? static_cast<size_t>(loader_config.max_run_bytes) : 8ull * 1024ull * 1024ull});
                     async_loader = std::make_unique<sd::loader::AsyncWeightLoader>();
                 }
 #endif
@@ -1517,28 +1622,23 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                 std::vector<uint8_t> read_buffer;
                 std::vector<uint8_t> convert_buffer;
 
-                while (true) {
+                auto process_tensor = [&](const TensorStorage& tensor_storage, char* staged_data, bool staged_pinned) {
                     int64_t t0, t1;
-                    size_t idx = tensor_idx.fetch_add(1);
-                    if (idx >= file_tensors.size() || failed) {
-                        break;
-                    }
-
-                    const TensorStorage& tensor_storage = *file_tensors[idx];
                     ggml_tensor* dst_tensor             = nullptr;
+                    tensors_started.fetch_add(1);
 
                     t0 = ggml_time_ms();
 
                     if (!on_new_tensor_cb(tensor_storage, &dst_tensor)) {
                         LOG_WARN("process tensor failed: '%s'", tensor_storage.name.c_str());
                         failed = true;
-                        break;
+                        return;
                     }
 
                     if (dst_tensor == nullptr) {
                         t1 = ggml_time_ms();
                         read_time_ms.fetch_add(t1 - t0);
-                        continue;
+                        return;
                     }
 
                     size_t nbytes_to_read = tensor_storage.nbytes_to_read();
@@ -1600,8 +1700,6 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                         const bool direct_cuda_upload_candidate =
                             threaded_loader_requested &&
                             !is_zip &&
-                            pinned_arena != nullptr &&
-                            threaded_reader != nullptr &&
                             async_loader != nullptr &&
                             async_loader->available() &&
                             static_cast<uint64_t>(tensor_storage.nbytes_to_read()) >= loader_config.min_tensor_bytes &&
@@ -1612,18 +1710,24 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                             !tensor_storage.is_i64 &&
                             ggml_nbytes(dst_tensor) == tensor_storage.nbytes_to_read();
                         if (direct_cuda_upload_candidate) {
-                            sd::loader::PinnedHostSpan span = pinned_arena->acquire(tensor_storage.nbytes_to_read());
-                            if (span.data == nullptr) {
-                                async_loader->synchronize();
-                                pinned_arena->reset();
-                                span = pinned_arena->acquire(tensor_storage.nbytes_to_read());
-                            }
-                            if (span.data != nullptr && (!loader_config.enable_pinned_staging || span.pinned)) {
-                                read_buf = static_cast<char*>(span.data);
+                            if (staged_data != nullptr && (!loader_config.enable_pinned_staging || staged_pinned)) {
+                                read_buf = staged_data;
                                 target_buf = read_buf;
                                 use_threaded_pinned_read = true;
                             } else {
-                                sd::loader::note_fallback();
+                                sd::loader::PinnedHostSpan span = pinned_arena != nullptr ? pinned_arena->acquire(tensor_storage.nbytes_to_read()) : sd::loader::PinnedHostSpan{};
+                                if (span.data == nullptr && pinned_arena != nullptr) {
+                                    async_loader->synchronize();
+                                    pinned_arena->reset();
+                                    span = pinned_arena->acquire(tensor_storage.nbytes_to_read());
+                                }
+                                if (span.data != nullptr && (!loader_config.enable_pinned_staging || span.pinned)) {
+                                    read_buf = static_cast<char*>(span.data);
+                                    target_buf = read_buf;
+                                    use_threaded_pinned_read = true;
+                                } else {
+                                    sd::loader::note_fallback();
+                                }
                             }
                         }
                         if (!use_threaded_pinned_read) {
@@ -1649,7 +1753,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     t0 = ggml_time_ms();
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
                     if (use_threaded_pinned_read) {
-                        if (!threaded_reader->read(file_path, tensor_storage.offset, read_buf, nbytes_to_read)) {
+                        if (staged_data == nullptr && (threaded_reader == nullptr || !threaded_reader->read(file_path, tensor_storage.offset, read_buf, nbytes_to_read))) {
                             LOG_ERROR("threaded pinned read failed: '%s'", file_path.c_str());
                             failed = true;
                         }
@@ -1710,6 +1814,54 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     }
 
                     bytes_processed.fetch_add((uint64_t)nbytes_to_read);
+                };
+
+                while (true) {
+                    size_t idx = work_idx.fetch_add(1);
+                    if (idx >= load_work.size() || failed) {
+                        break;
+                    }
+
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                    const ThreadedLoadWork& work = load_work[idx];
+                    if (work.staged) {
+                        sd::loader::PinnedHostSpan span = pinned_arena != nullptr ? pinned_arena->acquire(work.bytes) : sd::loader::PinnedHostSpan{};
+                        if (span.data == nullptr && pinned_arena != nullptr && async_loader != nullptr) {
+                            async_loader->synchronize();
+                            pinned_arena->reset();
+                            span = pinned_arena->acquire(work.bytes);
+                        }
+                        if (span.data != nullptr && (!loader_config.enable_pinned_staging || span.pinned) && threaded_reader != nullptr) {
+                            const int64_t t0 = ggml_time_ms();
+                            if (!threaded_reader->read(file_path, work.offset, span.data, work.bytes)) {
+                                LOG_ERROR("threaded pinned read failed: '%s'", file_path.c_str());
+                                failed = true;
+                                break;
+                            }
+                            const int64_t t1 = ggml_time_ms();
+                            read_time_ms.fetch_add(t1 - t0);
+                            char* base = static_cast<char*>(span.data);
+                            for (const ThreadedLoadTensor& tensor : work.tensors) {
+                                if (failed) {
+                                    break;
+                                }
+                                process_tensor(*tensor.storage, base + tensor.relative_offset, span.pinned);
+                            }
+                        } else {
+                            sd::loader::note_fallback(static_cast<uint64_t>(work.bytes));
+                            for (const ThreadedLoadTensor& tensor : work.tensors) {
+                                if (failed) {
+                                    break;
+                                }
+                                process_tensor(*tensor.storage, nullptr, false);
+                            }
+                        }
+                    } else {
+                        process_tensor(*work.tensors.front().storage, nullptr, false);
+                    }
+#else
+                    process_tensor(*load_work[idx], nullptr, false);
+#endif
                 }
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
                 if (async_loader != nullptr) {
@@ -1723,7 +1875,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
         }
 
         while (true) {
-            size_t current_idx = tensor_idx.load();
+            size_t current_idx = tensors_started.load();
             if (current_idx >= file_tensors.size() || failed) {
                 break;
             }

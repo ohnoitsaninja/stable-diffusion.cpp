@@ -32,6 +32,9 @@ void set_config(const LoaderConfig& config) {
     if (g_loader_config.min_tensor_bytes == 0) {
         g_loader_config.min_tensor_bytes = 1;
     }
+    if (g_loader_config.max_run_bytes > 0 && g_loader_config.max_run_bytes < g_loader_config.min_tensor_bytes) {
+        g_loader_config.max_run_bytes = g_loader_config.min_tensor_bytes;
+    }
 }
 
 LoaderStats get_stats() {
