@@ -22,10 +22,15 @@
 #include "latent-preview.h"
 #include "name_conversion.h"
 
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+#include "loader/loader_stats.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -6389,6 +6394,114 @@ void sd_cache_params_init(sd_cache_params_t* cache_params) {
     cache_params->spectrum_stop_percent       = 0.9f;
 }
 
+void sd_loader_config_init(sd_loader_config_t* loader_config) {
+    if (loader_config == nullptr) {
+        return;
+    }
+    *loader_config = {};
+    loader_config->struct_size = sizeof(sd_loader_config_t);
+    loader_config->enable_threaded_loader = true;
+    loader_config->enable_pinned_staging = true;
+    loader_config->read_threads = 4;
+    loader_config->pin_budget_bytes = 1024ull * 1024ull * 1024ull;
+    loader_config->ram_headroom_bytes = 2ull * 1024ull * 1024ull * 1024ull;
+    loader_config->max_staging_bytes = 256ull * 1024ull * 1024ull;
+    loader_config->min_tensor_bytes = 4ull * 1024ull * 1024ull;
+}
+
+bool sd_set_loader_config(const sd_loader_config_t* loader_config) {
+    const size_t required_size = offsetof(sd_loader_config_t, max_staging_bytes) + sizeof(loader_config->max_staging_bytes);
+    if (loader_config == nullptr || loader_config->struct_size < required_size) {
+        return false;
+    }
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+    sd::loader::LoaderConfig config{};
+    config.enable_threaded_loader = loader_config->enable_threaded_loader;
+    config.enable_pinned_staging = loader_config->enable_pinned_staging;
+    config.read_threads = loader_config->read_threads;
+    config.pin_budget_bytes = loader_config->pin_budget_bytes;
+    config.ram_headroom_bytes = loader_config->ram_headroom_bytes;
+    config.max_staging_bytes = loader_config->max_staging_bytes;
+    config.min_tensor_bytes = 4ull * 1024ull * 1024ull;
+    if (loader_config->struct_size >= offsetof(sd_loader_config_t, min_tensor_bytes) + sizeof(loader_config->min_tensor_bytes)) {
+        config.min_tensor_bytes = loader_config->min_tensor_bytes;
+    }
+    sd::loader::set_config(config);
+    return true;
+#else
+    return !loader_config->enable_threaded_loader && !loader_config->enable_pinned_staging;
+#endif
+}
+
+bool sd_get_loader_config(sd_loader_config_t* loader_config) {
+    if (loader_config == nullptr) {
+        return false;
+    }
+    sd_loader_config_init(loader_config);
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+    const sd::loader::LoaderConfig config = sd::loader::get_config();
+    loader_config->enable_threaded_loader = config.enable_threaded_loader;
+    loader_config->enable_pinned_staging = config.enable_pinned_staging;
+    loader_config->read_threads = config.read_threads;
+    loader_config->pin_budget_bytes = config.pin_budget_bytes;
+    loader_config->ram_headroom_bytes = config.ram_headroom_bytes;
+    loader_config->max_staging_bytes = config.max_staging_bytes;
+    loader_config->min_tensor_bytes = config.min_tensor_bytes;
+#else
+    loader_config->enable_threaded_loader = false;
+    loader_config->enable_pinned_staging = false;
+#endif
+    return true;
+}
+
+void sd_loader_stats_init(sd_loader_stats_t* loader_stats) {
+    if (loader_stats == nullptr) {
+        return;
+    }
+    *loader_stats = {};
+    loader_stats->struct_size = sizeof(sd_loader_stats_t);
+}
+
+bool sd_get_loader_stats(sd_loader_stats_t* loader_stats) {
+    if (loader_stats == nullptr) {
+        return false;
+    }
+    sd_loader_stats_init(loader_stats);
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+    const sd::loader::LoaderStats stats = sd::loader::get_stats();
+    loader_stats->disk_read_bytes = stats.disk_read_bytes;
+    loader_stats->pinned_bytes_peak = stats.pinned_bytes_peak;
+    loader_stats->h2d_bytes = stats.h2d_bytes;
+    loader_stats->disk_read_ms = stats.disk_read_ms;
+    loader_stats->h2d_ms = stats.h2d_ms;
+    loader_stats->total_model_load_ms = stats.total_model_load_ms;
+    loader_stats->fallback_count = stats.fallback_count;
+    loader_stats->fallback_bytes = stats.fallback_bytes;
+    loader_stats->read_call_count = stats.read_call_count;
+    loader_stats->read_chunk_count = stats.read_chunk_count;
+    loader_stats->read_chunk_bytes = stats.read_chunk_bytes;
+    loader_stats->tensor_count = stats.tensor_count;
+    loader_stats->cuda_host_register_count = stats.cuda_host_register_count;
+    loader_stats->cuda_host_unregister_count = stats.cuda_host_unregister_count;
+    loader_stats->cuda_stream_synchronize_count = stats.cuda_stream_synchronize_count;
+    loader_stats->cuda_device_synchronize_count = stats.cuda_device_synchronize_count;
+    loader_stats->disk_read_wall_ms = stats.disk_read_wall_ms;
+    loader_stats->h2d_event_ms = stats.h2d_event_ms;
+    loader_stats->tensor_bookkeeping_ms = stats.tensor_bookkeeping_ms;
+    loader_stats->model_construction_ms = stats.model_construction_ms;
+    loader_stats->lora_patch_prep_ms = stats.lora_patch_prep_ms;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void sd_reset_loader_stats(void) {
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+    sd::loader::reset_stats();
+#endif
+}
+
 void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     *sd_ctx_params                         = {};
     sd_ctx_params->vae_decode_only         = true;
@@ -11700,6 +11813,17 @@ SD_API bool sd_get_gpu_capabilities(sd_ctx_t* sd_ctx, sd_gpu_capabilities_t* cap
         sd_ctx->sd != nullptr &&
         sd_version_is_anima(sd_ctx->sd->version) &&
         sd_model_uses_gpu_latent_decode_bridge(sd_ctx->sd->version);
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+    capabilities->supports_loader_threaded_file_read = true;
+    capabilities->supports_loader_pinned_host_staging = true;
+    capabilities->supports_loader_async_h2d = true;
+    capabilities->supports_loader_stats = true;
+#else
+    capabilities->supports_loader_threaded_file_read = false;
+    capabilities->supports_loader_pinned_host_staging = false;
+    capabilities->supports_loader_async_h2d = false;
+    capabilities->supports_loader_stats = false;
+#endif
     return true;
 }
 

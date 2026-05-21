@@ -25,6 +25,13 @@
 #include "name_conversion.h"
 #include "stable-diffusion.h"
 
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+#include "loader/async_weight_loader.h"
+#include "loader/loader_stats.h"
+#include "loader/pinned_host_arena.h"
+#include "loader/threaded_file_reader.h"
+#endif
+
 #ifdef SD_USE_METAL
 #include "ggml-metal.h"
 #endif
@@ -1424,6 +1431,11 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
     const int64_t t_start                 = ggml_time_ms();
     int last_n_threads                    = 1;
 
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+    const sd::loader::LoaderConfig loader_config = sd::loader::get_config();
+    const bool threaded_loader_requested = loader_config.enable_threaded_loader;
+#endif
+
     for (size_t file_index = 0; file_index < file_paths_.size(); file_index++) {
         std::string file_path = file_paths_[file_index];
         LOG_DEBUG("loading tensors from %s", file_path.c_str());
@@ -1456,6 +1468,12 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
         }
 
         int n_threads = is_zip ? 1 : std::min(num_threads_to_use, (int)file_tensors.size());
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+        if (threaded_loader_requested && !is_zip) {
+            n_threads = std::min(static_cast<int>(std::max<uint32_t>(1, loader_config.read_threads)),
+                                 static_cast<int>(file_tensors.size()));
+        }
+#endif
         if (n_threads < 1) {
             n_threads = 1;
         }
@@ -1469,6 +1487,17 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
             workers.emplace_back([&, file_path, is_zip]() {
                 std::ifstream file;
                 zip_t* zip = nullptr;
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                std::unique_ptr<sd::loader::PinnedHostArena> pinned_arena;
+                std::unique_ptr<sd::loader::ThreadedFileReader> threaded_reader;
+                std::unique_ptr<sd::loader::AsyncWeightLoader> async_loader;
+                if (threaded_loader_requested && !is_zip) {
+                    pinned_arena = std::make_unique<sd::loader::PinnedHostArena>(loader_config);
+                    threaded_reader = std::make_unique<sd::loader::ThreadedFileReader>(
+                        sd::loader::FileReadOptions{std::max<uint32_t>(1, loader_config.read_threads), 8ull * 1024ull * 1024ull});
+                    async_loader = std::make_unique<sd::loader::AsyncWeightLoader>();
+                }
+#endif
                 if (is_zip) {
                     zip = zip_open(file_path.c_str(), 0, 'r');
                     if (zip == nullptr) {
@@ -1547,6 +1576,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     char* read_buf    = nullptr;
                     char* target_buf  = nullptr;
                     char* convert_buf = nullptr;
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                    bool use_threaded_pinned_read = false;
+#endif
                     if (dst_tensor->buffer == nullptr || ggml_backend_buffer_is_host(dst_tensor->buffer)) {
                         if (tensor_storage.type == dst_tensor->type) {
                             GGML_ASSERT(ggml_nbytes(dst_tensor) == tensor_storage.nbytes());
@@ -1564,9 +1596,49 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                             convert_buf = (char*)dst_tensor->data;
                         }
                     } else {
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                        const bool direct_cuda_upload_candidate =
+                            threaded_loader_requested &&
+                            !is_zip &&
+                            pinned_arena != nullptr &&
+                            threaded_reader != nullptr &&
+                            async_loader != nullptr &&
+                            async_loader->available() &&
+                            static_cast<uint64_t>(tensor_storage.nbytes_to_read()) >= loader_config.min_tensor_bytes &&
+                            tensor_storage.type == dst_tensor->type &&
+                            !tensor_storage.is_f8_e4m3 &&
+                            !tensor_storage.is_f8_e5m2 &&
+                            !tensor_storage.is_f64 &&
+                            !tensor_storage.is_i64 &&
+                            ggml_nbytes(dst_tensor) == tensor_storage.nbytes_to_read();
+                        if (direct_cuda_upload_candidate) {
+                            sd::loader::PinnedHostSpan span = pinned_arena->acquire(tensor_storage.nbytes_to_read());
+                            if (span.data == nullptr) {
+                                async_loader->synchronize();
+                                pinned_arena->reset();
+                                span = pinned_arena->acquire(tensor_storage.nbytes_to_read());
+                            }
+                            if (span.data != nullptr && (!loader_config.enable_pinned_staging || span.pinned)) {
+                                read_buf = static_cast<char*>(span.data);
+                                target_buf = read_buf;
+                                use_threaded_pinned_read = true;
+                            } else {
+                                sd::loader::note_fallback();
+                            }
+                        }
+                        if (!use_threaded_pinned_read) {
+                            read_buffer.resize(std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
+                            read_buf   = (char*)read_buffer.data();
+                            target_buf = read_buf;
+                            if (threaded_loader_requested) {
+                                sd::loader::note_fallback(static_cast<uint64_t>(tensor_storage.nbytes_to_read()));
+                            }
+                        }
+#else
                         read_buffer.resize(std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
                         read_buf   = (char*)read_buffer.data();
                         target_buf = read_buf;
+#endif
 
                         if (tensor_storage.type != dst_tensor->type) {
                             convert_buffer.resize(ggml_nbytes(dst_tensor));
@@ -1575,7 +1647,17 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     }
 
                     t0 = ggml_time_ms();
-                    read_data(read_buf, nbytes_to_read);
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                    if (use_threaded_pinned_read) {
+                        if (!threaded_reader->read(file_path, tensor_storage.offset, read_buf, nbytes_to_read)) {
+                            LOG_ERROR("threaded pinned read failed: '%s'", file_path.c_str());
+                            failed = true;
+                        }
+                    } else
+#endif
+                    {
+                        read_data(read_buf, nbytes_to_read);
+                    }
                     t1 = ggml_time_ms();
                     read_time_ms.fetch_add(t1 - t0);
 
@@ -1615,13 +1697,25 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
 
                     if (dst_tensor->buffer != nullptr && !ggml_backend_buffer_is_host(dst_tensor->buffer)) {
                         t0 = ggml_time_ms();
-                        ggml_backend_tensor_set(dst_tensor, convert_buf, 0, ggml_nbytes(dst_tensor));
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                        if (use_threaded_pinned_read) {
+                            async_loader->upload(nullptr, dst_tensor, convert_buf, 0, ggml_nbytes(dst_tensor));
+                        } else
+#endif
+                        {
+                            ggml_backend_tensor_set(dst_tensor, convert_buf, 0, ggml_nbytes(dst_tensor));
+                        }
                         t1 = ggml_time_ms();
                         copy_to_backend_time_ms.fetch_add(t1 - t0);
                     }
 
                     bytes_processed.fetch_add((uint64_t)nbytes_to_read);
                 }
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                if (async_loader != nullptr) {
+                    async_loader->synchronize();
+                }
+#endif
                 if (zip != nullptr) {
                     zip_close(zip);
                 }
@@ -1668,6 +1762,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
              (memcpy_time_ms.load() / (float)last_n_threads) / 1000.f,
              (convert_time_ms.load() / (float)last_n_threads) / 1000.f,
              (copy_to_backend_time_ms.load() / (float)last_n_threads) / 1000.f);
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+    sd::loader::add_model_load_ms(static_cast<double>(end_time - start_time));
+#endif
     return success;
 }
 

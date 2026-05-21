@@ -54,6 +54,7 @@ option(SD_USE_SYSTEM_WEBP            "sd: link against system libwebp" OFF)
 option(SD_WEBM                       "sd: enable WebM video output support" ${SD_WEBM_DEFAULT})
 option(SD_USE_SYSTEM_WEBM            "sd: link against system libwebm" OFF)
 option(SD_CUDA                       "sd: cuda backend" OFF)
+option(SD_CUDA_THREADED_WEIGHT_LOADER "sd: experimental threaded pinned CUDA model loader" OFF)
 option(SD_HIPBLAS                    "sd: rocm backend" OFF)
 option(SD_METAL                      "sd: metal backend" OFF)
 option(SD_VULKAN                     "sd: vulkan backend" OFF)
@@ -69,6 +70,14 @@ if(SD_CUDA)
     message("-- Use CUDA as backend stable-diffusion")
     set(GGML_CUDA ON)
     add_definitions(-DSD_USE_CUDA)
+endif()
+
+if(SD_CUDA_THREADED_WEIGHT_LOADER AND NOT SD_CUDA)
+    message(STATUS "SD_CUDA_THREADED_WEIGHT_LOADER requested without SD_CUDA; CUDA threaded weight loader will not be built")
+endif()
+
+if(SD_CUDA AND SD_CUDA_THREADED_WEIGHT_LOADER)
+    find_package(CUDAToolkit REQUIRED)
 endif()
 
 if(SD_METAL)
@@ -160,6 +169,14 @@ file(GLOB SD_LIB_SOURCES
     "src/vocab/*.cpp"
 )
 
+if(SD_CUDA AND SD_CUDA_THREADED_WEIGHT_LOADER)
+    file(GLOB SD_CUDA_THREADED_WEIGHT_LOADER_SOURCES
+        "src/loader/*.h"
+        "src/loader/*.cpp"
+    )
+    list(APPEND SD_LIB_SOURCES ${SD_CUDA_THREADED_WEIGHT_LOADER_SOURCES})
+endif()
+
 find_program(GIT_EXE NAMES git git.exe NO_CMAKE_FIND_ROOT_PATH)
 if(GIT_EXE)
     execute_process(COMMAND ${GIT_EXE} describe --tags --abbrev=7 --dirty=+
@@ -208,6 +225,13 @@ else()
         set(BUILD_SHARED_LIBS OFF)
     endif()
     add_library(${SD_LIB} STATIC ${SD_LIB_SOURCES})
+endif()
+
+if(SD_CUDA AND SD_CUDA_THREADED_WEIGHT_LOADER)
+    target_compile_definitions(${SD_LIB} PRIVATE SD_CUDA_THREADED_WEIGHT_LOADER)
+    if(TARGET CUDA::cudart)
+        target_link_libraries(${SD_LIB} PRIVATE CUDA::cudart)
+    endif()
 endif()
 
 if(SD_SYCL)

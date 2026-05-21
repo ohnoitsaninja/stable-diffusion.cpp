@@ -489,7 +489,11 @@ typedef struct sd_gpu_capabilities_t {
     bool supports_vae_gpu_latent_decode_bridge;
     bool supports_qwen_image_vae_decode_bridge;
     bool supports_anima_vae_decode_bridge;
-    uint32_t reserved[3];
+    bool supports_loader_threaded_file_read;
+    bool supports_loader_pinned_host_staging;
+    bool supports_loader_async_h2d;
+    bool supports_loader_stats;
+    uint32_t reserved[2];
 } sd_gpu_capabilities_t;
 
 typedef uint64_t sd_conditioning_handle_t;
@@ -768,6 +772,42 @@ typedef struct {
     float spectrum_stop_percent;
 } sd_cache_params_t;
 
+typedef struct sd_loader_config_t {
+    uint32_t struct_size;
+    bool enable_threaded_loader;
+    bool enable_pinned_staging;
+    uint32_t read_threads;
+    uint64_t pin_budget_bytes;
+    uint64_t ram_headroom_bytes;
+    uint64_t max_staging_bytes;
+    uint64_t min_tensor_bytes;
+} sd_loader_config_t;
+
+typedef struct sd_loader_stats_t {
+    uint32_t struct_size;
+    uint64_t disk_read_bytes;
+    uint64_t pinned_bytes_peak;
+    uint64_t h2d_bytes;
+    double disk_read_ms;
+    double h2d_ms;
+    double total_model_load_ms;
+    uint32_t fallback_count;
+    uint64_t fallback_bytes;
+    uint64_t read_call_count;
+    uint64_t read_chunk_count;
+    uint64_t read_chunk_bytes;
+    uint64_t tensor_count;
+    uint64_t cuda_host_register_count;
+    uint64_t cuda_host_unregister_count;
+    uint64_t cuda_stream_synchronize_count;
+    uint64_t cuda_device_synchronize_count;
+    double disk_read_wall_ms;
+    double h2d_event_ms;
+    double tensor_bookkeeping_ms;
+    double model_construction_ms;
+    double lora_patch_prep_ms;
+} sd_loader_stats_t;
+
 typedef struct {
     bool is_high_noise;
     float multiplier;
@@ -855,6 +895,12 @@ SD_API const char* sd_lora_apply_mode_name(enum lora_apply_mode_t mode);
 SD_API enum lora_apply_mode_t str_to_lora_apply_mode(const char* str);
 
 SD_API void sd_cache_params_init(sd_cache_params_t* cache_params);
+SD_API void sd_loader_config_init(sd_loader_config_t* loader_config);
+SD_API bool sd_set_loader_config(const sd_loader_config_t* loader_config);
+SD_API bool sd_get_loader_config(sd_loader_config_t* loader_config);
+SD_API void sd_loader_stats_init(sd_loader_stats_t* loader_stats);
+SD_API bool sd_get_loader_stats(sd_loader_stats_t* loader_stats);
+SD_API void sd_reset_loader_stats(void);
 
 SD_API void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params);
 SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
