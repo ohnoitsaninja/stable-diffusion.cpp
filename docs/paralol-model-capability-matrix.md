@@ -55,9 +55,10 @@ Known verified paths at the time this matrix was written:
 - SDXL T2I GPU sampled latent -> GPU VAE Decode -> caller-owned image download.
 - SDXL I2I VAE Encode GPU latent -> non-strict KSampler init bridge -> isolated
   GPU VAE Decode.
-- Z-Image Turbo T2I GPU sampled latent -> GPU VAE Decode at 512 and 1024
-  resolutions. The local Turbo/Qwen pairing remains blank/white, so this is
-  handoff validation only.
+- Z-Image Turbo T2I GPU sampled latent -> GPU VAE Decode at 512x1024 with
+  `Qwen3-4B-Instruct-2507-Q4_K_M.gguf`, `res_multistep` / `simple`, CFG 1.0,
+  8 steps. The strict path produces a coherent doc-style image, with no sampler
+  bridge flags and caller-owned final download.
 - Z-Anime Base T2I strict GPU sampled latent -> GPU VAE Decode at 512 with
   `euler_a` / `beta`, CFG `4.0`, 28 steps. The output is nonblank and coherent
   enough for fork-side image-quality acceptance.

@@ -1100,6 +1100,7 @@ namespace LLM {
             bool have_vision_weight = false;
             bool llama_cpp_style    = false;
             params.num_layers       = 0;
+            int64_t detected_intermediate_size = 0;
             for (auto pair : tensor_storage_map) {
                 std::string tensor_name = pair.first;
                 if (tensor_name.find(prefix) == std::string::npos)
@@ -1127,9 +1128,17 @@ namespace LLM {
                     params.hidden_size = pair.second.ne[0];
                     params.vocab_size  = pair.second.ne[1];
                 }
-                if (contains(tensor_name, "layers.0.mlp.gate_proj.weight")) {
-                    params.intermediate_size = pair.second.ne[1];
+                if (ends_with(tensor_name, "layers.0.mlp.down_proj.weight")) {
+                    detected_intermediate_size = std::max(detected_intermediate_size, pair.second.ne[0]);
+                } else if (ends_with(tensor_name, "layers.0.mlp.gate_proj.weight")) {
+                    const int64_t gate_intermediate_size = pair.second.ne[1];
+                    if (gate_intermediate_size >= params.hidden_size) {
+                        detected_intermediate_size = std::max(detected_intermediate_size, gate_intermediate_size);
+                    }
                 }
+            }
+            if (detected_intermediate_size > 0) {
+                params.intermediate_size = detected_intermediate_size;
             }
             if (arch == LLMArch::QWEN3 && params.num_layers == 28) {  // Qwen3 2B
                 params.num_heads = 16;

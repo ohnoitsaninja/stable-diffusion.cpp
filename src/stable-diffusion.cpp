@@ -6798,6 +6798,16 @@ static bool sd_ctx_looks_z_anime(const sd_ctx_t* sd_ctx) {
     return sd_text_contains_any(sd_ctx_model_hint_text(sd_ctx), needles, sizeof(needles) / sizeof(needles[0]));
 }
 
+static bool sd_ctx_looks_z_turbo(const sd_ctx_t* sd_ctx) {
+    static const char* const needles[] = {
+        "z-image-turbo",
+        "z_image_turbo",
+        "z-image turbo",
+        "z image turbo",
+    };
+    return sd_text_contains_any(sd_ctx_model_hint_text(sd_ctx), needles, sizeof(needles) / sizeof(needles[0]));
+}
+
 enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx) {
     if (sd_ctx != nullptr && sd_ctx->sd != nullptr) {
         if (sd_version_is_anima(sd_ctx->sd->version)) {
@@ -11736,7 +11746,9 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
 
     if (sd_version_is_dit(version)) {
         capabilities->default_cfg_scale = 1.0f;
-        capabilities->default_steps = sd_version_is_z_image(version) ? 9 : 4;
+        capabilities->default_steps = sd_version_is_z_image(version)
+                                          ? (sd_ctx_looks_z_turbo(sd_ctx) ? 8u : 9u)
+                                          : 4u;
         capabilities->requires_llm = sd_version_is_flux2(version) || sd_version_is_z_image(version);
         capabilities->requires_clip_l = sd_version_is_flux(version) && !sd_version_is_flux2(version);
         capabilities->requires_t5xxl = sd_version_is_flux(version) && !sd_version_is_flux2(version);

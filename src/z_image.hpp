@@ -2,6 +2,7 @@
 #define __Z_IMAGE_HPP__
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "flux.hpp"
 #include "ggml_extend.hpp"
@@ -19,6 +20,18 @@ namespace ZImage {
     constexpr int ADALN_EMBED_DIM    = 256;
     constexpr int SEQ_MULTI_OF       = 32;
 
+    __STATIC_INLINE__ bool z_image_safe_precision_enabled() {
+        const char* disabled = std::getenv("SDCPP_DISABLE_Z_IMAGE_SAFE_PRECISION");
+        if (disabled != nullptr && disabled[0] != '\0' && disabled[0] != '0') {
+            return false;
+        }
+        const char* value = std::getenv("SDCPP_EXPERIMENTAL_Z_IMAGE_SAFE_PRECISION");
+        if (value != nullptr && value[0] != '\0') {
+            return value[0] != '0';
+        }
+        return true;
+    }
+
     struct JointAttention : public GGMLBlock {
     protected:
         int64_t head_dim;
@@ -30,12 +43,20 @@ namespace ZImage {
         JointAttention(int64_t hidden_size, int64_t head_dim, int64_t num_heads, int64_t num_kv_heads, bool qk_norm)
             : head_dim(head_dim), num_heads(num_heads), num_kv_heads(num_kv_heads), qk_norm(qk_norm) {
             blocks["qkv"] = std::make_shared<Linear>(hidden_size, (num_heads + num_kv_heads * 2) * head_dim, false);
-            float scale   = 1.f;
+            float scale          = 1.f;
+            bool force_prec_f32  = false;
 #if GGML_USE_HIP
             // Prevent NaN issues with certain ROCm setups
             scale = 1.f / 16.f;
 #endif
-            blocks["out"] = std::make_shared<Linear>(num_heads * head_dim, hidden_size, false, false, false, scale);
+            if (z_image_safe_precision_enabled()) {
+                // Z-Image/Lumina2 can overflow the CUDA f16 matmul path on the
+                // attention output projection. Keep the escape hatch while the
+                // supported Z lanes are widened beyond the validated Turbo path.
+                scale          = 1.f / 16.f;
+                force_prec_f32 = true;
+            }
+            blocks["out"] = std::make_shared<Linear>(num_heads * head_dim, hidden_size, false, false, force_prec_f32, scale);
             if (qk_norm) {
                 blocks["q_norm"] = std::make_shared<RMSNorm>(head_dim);
                 blocks["k_norm"] = std::make_shared<RMSNorm>(head_dim);
@@ -118,6 +139,9 @@ namespace ZImage {
 #ifdef SD_USE_VULKAN
             force_prec_f32 = true;
 #endif
+            if (z_image_safe_precision_enabled()) {
+                force_prec_f32 = true;
+            }
             // The purpose of the scale here is to prevent NaN issues in certain situations.
             // For example, when using CUDA but the weights are k-quants.
             blocks["w2"] = std::make_shared<Linear>(hidden_dim, dim, false, false, force_prec_f32, scale);

@@ -207,7 +207,7 @@ T2I or GPU-init I2I, batch 1, Qwen text conditioning handles, no ControlNet, no
 masks, no direct sampler reference/edit images, and no multibatch. The flow
 backend accepts the Z sampler set used by the current local models:
 
-- Z-Image Turbo: `res_multistep` / `simple`, CFG `1.0`, 9 steps by default.
+- Z-Image Turbo: `res_multistep` / `simple`, CFG `1.0`, 8 steps by default.
 - Z-Anime Base: `euler_a` / `beta`, CFG above `1.0`, 28+ steps recommended.
 - Compatibility/debug: `euler` and `res_2s` remain selectable.
 
@@ -219,6 +219,12 @@ conditioning encode, then releases the text encoder before diffusion. Set
 `SDCPP_DISABLE_Z_IMAGE_AUTO_RELEASE_TEXT_ENCODER=1` only for debugging. The
 shared escape hatch `SDCPP_DISABLE_FLOW_BACKEND_AUTO_RELEASE_TEXT_ENCODER=1`
 disables auto-release for both Flux2 and Z-Image.
+
+CUDA Z-Image uses a safe precision policy for the attention output projection
+and feed-forward output projection by default. This matches the working
+`docs/z_image.md` Turbo command on the local RTX 4080 Super; disabling it with
+`SDCPP_DISABLE_Z_IMAGE_SAFE_PRECISION=1` reproduces the previous white/NaN
+failure on the local Q4_K_M Turbo model.
 
 The Z-Image backend reports these family-specific capability fields:
 
@@ -255,9 +261,9 @@ Validated Z-Image Turbo handoff target assets:
 - VAE:
   `F:\automatic1111\Stability\Models\VAE\ae.safetensors`
 - LLM:
-  `F:\automatic1111\Stability\Models\TextEncoders\Qwen3-4B-Q5_K_M.gguf`
-- Resolution: `1024x1024`
-- Steps: `9`
+  `F:\automatic1111\Stability\Models\TextEncoders\Qwen3-4B-Instruct-2507-Q4_K_M.gguf`
+- Resolution: `512x1024`
+- Steps: `8`
 - CFG: `1.0`
 - Sampler/scheduler: `res_multistep` / `simple`
 
@@ -265,10 +271,10 @@ Expected API handoff:
 
 - Qwen conditioning handle: CUDA device-resident cross-attention tensor
 - conditioning per-step upload: false
-- sampled GPU latent: `1x16x128x128`, f32, CUDA, 1,048,576 bytes
+- sampled GPU latent: `1x16x128x64`, f32, CUDA, 524,288 bytes
 - sampler math residency: `gpu_backend_tensor`
 - sampler bridge flags: none
-- VAE decode output: `1x3x1024x1024`, f32, CUDA
+- VAE decode output: `1x3x1024x512`, f32, CUDA
 - COMFY_NORMAL VAE decode: supported
 - implicit-GEMM conv: enabled
 - tiled VAE: false
@@ -284,27 +290,38 @@ $env:SDCPP_STRICT_GPU_RESIDENT=1
 build\codex\bin\sd-latent-smoke.exe `
   --diffusion-model F:\automatic1111\Stability\Models\DiffusionModels\z-image-turbo-q4_k_m.gguf `
   --vae F:\automatic1111\Stability\Models\VAE\ae.safetensors `
-  --llm F:\automatic1111\Stability\Models\TextEncoders\Qwen3-4B-Q5_K_M.gguf `
+  --llm F:\automatic1111\Stability\Models\TextEncoders\Qwen3-4B-Instruct-2507-Q4_K_M.gguf `
+  --image build\z-debug\doc-z-turbo-qwen2507-default-safe\z_doc_default_safe.png `
+  --output build\z-debug\paralol-z-gpu-handoff-qwen2507-final\z_gpu_handoff.png `
   --sample-without-init --gpu-flow-sampler --condition-handles `
-  --z-image-text-encoder-cpu-params `
-  --strict-gpu-resident --steps 9 --cfg-scale 1.0 `
-  --sampling-method res_multistep --scheduler simple --width 1024 --height 1024 `
+  --release-text-encoder-after-conditioning --z-image-text-encoder-cpu-params `
+  --strict-gpu-resident --steps 8 --cfg-scale 1.0 `
+  --sampling-method res_multistep --scheduler simple --width 512 --height 1024 `
   --skip-estimate --gpu-latent-decode-input --gpu-decode-output `
   --download-gpu-output-buffer --dump-gpu-handle-desc
 ```
 
+Recent strict handoff smoke:
+
+- `condition_encode_ms=647`, `conditioning_storage=device_tensor`,
+  `conditioning_per_step_upload=false`
+- text encoder released before diffusion: true
+- sampler: `Res Multistep`, 8 steps, `native_cuda_philox`
+- `sampler_math_residency=gpu_backend_tensor`
+- `initial_noise_bridge_upload=false`, `output_bridge_upload=false`
+- sampled latent descriptor: CUDA latent `1x16x128x64`, 524,288 bytes
+- VAE decode graph: 313 ms, workspace 1408 MiB
+- VAE decode: `tiled=false`, `taesd=false`, `im2col=false`, `host_copies=0`
+- caller-owned image download: 10 ms
+- output:
+  `build/z-debug/paralol-z-gpu-handoff-qwen2507-final/z_gpu_handoff.png`
+
 This proves the fork-side T2I handoff contract. It does not claim direct Z
 KSampler reference/edit image inputs.
 
-Current local validation caveat: the strict handoff smoke completes with the
-local `z-image-turbo-q4_k_m.gguf` plus `Qwen3-4B-Q5_K_M.gguf` pairing, but it
-still writes a blank/white image at 512px/9 steps even after switching to
-`res_multistep` / `simple`. That means the GPU handoff path is not the source of
-the blank output; this local Turbo model/text-encoder/VAE combination is not a
-usable image-quality acceptance pair in this checkout. Keep Z-Image Turbo
-advertised as API-handoff validated, not image-quality validated, until a
-known-good Turbo/Qwen asset pair produces coherent pixels through the CLI
-compatibility path.
+The validated image-quality lane uses the exact Qwen3 2507 Q4_K_M GGUF above.
+The older local `Qwen3-4B-Q5_K_M.gguf` pairing produced blank/white output and
+is not the accepted Z-Image Turbo lane for Paralol.
 
 Validated Z-Anime Base image-quality smoke:
 
