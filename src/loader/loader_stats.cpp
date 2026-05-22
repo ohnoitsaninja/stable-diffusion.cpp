@@ -12,6 +12,39 @@ std::mutex g_loader_mutex;
 LoaderConfig g_loader_config = default_config();
 LoaderStats g_loader_stats;
 
+void add_fallback_reason_locked(LoaderFallbackReason reason) {
+    switch (reason) {
+        case LoaderFallbackReason::below_threshold:
+            g_loader_stats.fallback_below_threshold_count += 1;
+            break;
+        case LoaderFallbackReason::host_destination:
+            g_loader_stats.fallback_host_destination_count += 1;
+            break;
+        case LoaderFallbackReason::null_destination:
+            g_loader_stats.fallback_null_destination_count += 1;
+            break;
+        case LoaderFallbackReason::zip_or_indirect:
+            g_loader_stats.fallback_zip_or_indirect_count += 1;
+            break;
+        case LoaderFallbackReason::conversion_required:
+            g_loader_stats.fallback_conversion_required_count += 1;
+            break;
+        case LoaderFallbackReason::type_mismatch:
+            g_loader_stats.fallback_type_mismatch_count += 1;
+            break;
+        case LoaderFallbackReason::unsupported_backend:
+            g_loader_stats.fallback_unsupported_backend_count += 1;
+            break;
+        case LoaderFallbackReason::arena_unavailable:
+            g_loader_stats.fallback_arena_unavailable_count += 1;
+            break;
+        case LoaderFallbackReason::other:
+        case LoaderFallbackReason::count:
+            g_loader_stats.fallback_other_count += 1;
+            break;
+    }
+}
+
 }  // namespace
 
 LoaderConfig default_config() {
@@ -94,15 +127,40 @@ void add_tensor_count(uint64_t tensors) {
     g_loader_stats.tensor_count += tensors;
 }
 
+void note_fast_path(uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(g_loader_mutex);
+    g_loader_stats.fast_path_tensor_count += 1;
+    g_loader_stats.fast_path_bytes += bytes;
+    g_loader_stats.tensor_count += 1;
+}
+
 void note_pinned_bytes(uint64_t bytes) {
     std::lock_guard<std::mutex> lock(g_loader_mutex);
     g_loader_stats.pinned_bytes_peak = std::max(g_loader_stats.pinned_bytes_peak, bytes);
 }
 
 void note_fallback(uint64_t bytes) {
+    note_fallback(LoaderFallbackReason::other, bytes, bytes > 0);
+}
+
+void note_fallback(LoaderFallbackReason reason, uint64_t bytes, bool tensor_fallback) {
     std::lock_guard<std::mutex> lock(g_loader_mutex);
     g_loader_stats.fallback_count += 1;
-    g_loader_stats.fallback_bytes += bytes;
+    add_fallback_reason_locked(reason);
+    if (tensor_fallback) {
+        g_loader_stats.fallback_tensor_count += 1;
+        g_loader_stats.fallback_bytes += bytes;
+        g_loader_stats.tensor_count += 1;
+    }
+}
+
+void note_fallback_reason(LoaderFallbackReason reason) {
+    note_fallback(reason, 0, false);
+}
+
+void note_dry_run_tensor() {
+    std::lock_guard<std::mutex> lock(g_loader_mutex);
+    g_loader_stats.dry_run_tensor_count += 1;
 }
 
 void note_host_register() {

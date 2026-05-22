@@ -30,6 +30,8 @@
 #include "loader/loader_stats.h"
 #include "loader/pinned_host_arena.h"
 #include "loader/threaded_file_reader.h"
+
+#include <cuda_runtime_api.h>
 #endif
 
 #ifdef SD_USE_METAL
@@ -77,6 +79,99 @@ uint16_t read_short(uint8_t* buffer) {
     value |= buffer[0];
     return value;
 }
+
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+namespace {
+
+struct ThreadedWeightLoaderContext {
+    bool source_is_zip = false;
+    bool source_supports_direct_cuda_upload = false;
+    bool has_pinned_arena = false;
+    bool has_threaded_reader = false;
+    bool has_async_loader = false;
+    bool async_loader_available = false;
+};
+
+struct ThreadedWeightLoaderDecision {
+    bool use_fast_path = false;
+    sd::loader::LoaderFallbackReason fallback_reason = sd::loader::LoaderFallbackReason::other;
+};
+
+bool tensor_points_to_cuda_device(const ggml_tensor* tensor) {
+    if (tensor == nullptr || tensor->data == nullptr) {
+        return false;
+    }
+
+    cudaPointerAttributes attributes{};
+    cudaError_t err = cudaPointerGetAttributes(&attributes, tensor->data);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return attributes.type == cudaMemoryTypeDevice;
+}
+
+ThreadedWeightLoaderDecision should_use_threaded_weight_loader(const TensorStorage& tensor_storage,
+                                                               const ggml_tensor* dst_tensor,
+                                                               const sd::loader::LoaderConfig& config,
+                                                               const ThreadedWeightLoaderContext& context) {
+    ThreadedWeightLoaderDecision decision{};
+    if (!config.enable_threaded_loader) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::unsupported_backend;
+        return decision;
+    }
+    if (dst_tensor == nullptr) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::null_destination;
+        return decision;
+    }
+    if (dst_tensor->buffer == nullptr || ggml_backend_buffer_is_host(dst_tensor->buffer)) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::host_destination;
+        return decision;
+    }
+    if (context.source_is_zip || tensor_storage.index_in_zip >= 0) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::zip_or_indirect;
+        return decision;
+    }
+    if (!context.source_supports_direct_cuda_upload) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::zip_or_indirect;
+        return decision;
+    }
+    if (static_cast<uint64_t>(tensor_storage.nbytes_to_read()) < config.min_tensor_bytes) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::below_threshold;
+        return decision;
+    }
+    if (tensor_storage.is_f8_e4m3 ||
+        tensor_storage.is_f8_e5m2 ||
+        tensor_storage.has_f8_weight_scale ||
+        tensor_storage.is_f64 ||
+        tensor_storage.is_i64 ||
+        (tensor_storage.expected_type != GGML_TYPE_COUNT && tensor_storage.expected_type != tensor_storage.type)) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::conversion_required;
+        return decision;
+    }
+    if (tensor_storage.type != dst_tensor->type ||
+        ggml_nbytes(dst_tensor) != tensor_storage.nbytes()) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::type_mismatch;
+        return decision;
+    }
+    if (!config.enable_pinned_staging || !context.has_pinned_arena) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::arena_unavailable;
+        return decision;
+    }
+    if (!context.has_threaded_reader ||
+        !context.has_async_loader ||
+        !context.async_loader_available ||
+        !tensor_points_to_cuda_device(dst_tensor)) {
+        decision.fallback_reason = sd::loader::LoaderFallbackReason::unsupported_backend;
+        return decision;
+    }
+
+    decision.use_fast_path = true;
+    return decision;
+}
+
+}  // namespace
+#endif
 
 /*================================================= Preprocess ==================================================*/
 
@@ -1467,9 +1562,12 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
             }
         }
 
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+        const bool source_supports_direct_cuda_upload = !is_zip && ends_with(file_path, ".safetensors");
+#endif
         int n_threads = is_zip ? 1 : std::min(num_threads_to_use, (int)file_tensors.size());
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
-        if (threaded_loader_requested && !is_zip) {
+        if (threaded_loader_requested && source_supports_direct_cuda_upload) {
             n_threads = std::min(static_cast<int>(std::max<uint32_t>(1, loader_config.read_threads)),
                                  static_cast<int>(file_tensors.size()));
         }
@@ -1491,12 +1589,6 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                 std::unique_ptr<sd::loader::PinnedHostArena> pinned_arena;
                 std::unique_ptr<sd::loader::ThreadedFileReader> threaded_reader;
                 std::unique_ptr<sd::loader::AsyncWeightLoader> async_loader;
-                if (threaded_loader_requested && !is_zip) {
-                    pinned_arena = std::make_unique<sd::loader::PinnedHostArena>(loader_config);
-                    threaded_reader = std::make_unique<sd::loader::ThreadedFileReader>(
-                        sd::loader::FileReadOptions{std::max<uint32_t>(1, loader_config.read_threads), 8ull * 1024ull * 1024ull});
-                    async_loader = std::make_unique<sd::loader::AsyncWeightLoader>();
-                }
 #endif
                 if (is_zip) {
                     zip = zip_open(file_path.c_str(), 0, 'r');
@@ -1536,6 +1628,11 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     }
 
                     if (dst_tensor == nullptr) {
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                        if (threaded_loader_requested) {
+                            sd::loader::note_dry_run_tensor();
+                        }
+#endif
                         t1 = ggml_time_ms();
                         read_time_ms.fetch_add(t1 - t0);
                         continue;
@@ -1578,8 +1675,15 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     char* convert_buf = nullptr;
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
                     bool use_threaded_pinned_read = false;
+                    sd::loader::LoaderFallbackReason threaded_fallback_reason = sd::loader::LoaderFallbackReason::other;
 #endif
                     if (dst_tensor->buffer == nullptr || ggml_backend_buffer_is_host(dst_tensor->buffer)) {
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                        if (threaded_loader_requested) {
+                            sd::loader::note_fallback(sd::loader::LoaderFallbackReason::host_destination,
+                                                      static_cast<uint64_t>(tensor_storage.nbytes_to_read()));
+                        }
+#endif
                         if (tensor_storage.type == dst_tensor->type) {
                             GGML_ASSERT(ggml_nbytes(dst_tensor) == tensor_storage.nbytes());
                             if (tensor_storage.is_f64 || tensor_storage.is_i64) {
@@ -1597,33 +1701,50 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                         }
                     } else {
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
-                        const bool direct_cuda_upload_candidate =
-                            threaded_loader_requested &&
-                            !is_zip &&
-                            pinned_arena != nullptr &&
-                            threaded_reader != nullptr &&
-                            async_loader != nullptr &&
-                            async_loader->available() &&
-                            static_cast<uint64_t>(tensor_storage.nbytes_to_read()) >= loader_config.min_tensor_bytes &&
-                            tensor_storage.type == dst_tensor->type &&
-                            !tensor_storage.is_f8_e4m3 &&
-                            !tensor_storage.is_f8_e5m2 &&
-                            !tensor_storage.is_f64 &&
-                            !tensor_storage.is_i64 &&
-                            ggml_nbytes(dst_tensor) == tensor_storage.nbytes_to_read();
-                        if (direct_cuda_upload_candidate) {
+                        ThreadedWeightLoaderDecision threaded_decision{};
+                        if (threaded_loader_requested) {
+                            ThreadedWeightLoaderContext loader_context{};
+                            loader_context.source_is_zip = is_zip;
+                            loader_context.source_supports_direct_cuda_upload = source_supports_direct_cuda_upload;
+                            loader_context.has_pinned_arena = true;
+                            loader_context.has_threaded_reader = true;
+                            loader_context.has_async_loader = true;
+                            loader_context.async_loader_available = true;
+                            threaded_decision = should_use_threaded_weight_loader(tensor_storage,
+                                                                                  dst_tensor,
+                                                                                  loader_config,
+                                                                                  loader_context);
+                            if (threaded_decision.use_fast_path && pinned_arena == nullptr) {
+                                pinned_arena = std::make_unique<sd::loader::PinnedHostArena>(loader_config);
+                                threaded_reader = std::make_unique<sd::loader::ThreadedFileReader>(
+                                    sd::loader::FileReadOptions{std::max<uint32_t>(1, loader_config.read_threads), 8ull * 1024ull * 1024ull});
+                                async_loader = std::make_unique<sd::loader::AsyncWeightLoader>();
+                            }
+                            if (threaded_decision.use_fast_path) {
+                                loader_context.has_pinned_arena = pinned_arena != nullptr;
+                                loader_context.has_threaded_reader = threaded_reader != nullptr;
+                                loader_context.has_async_loader = async_loader != nullptr;
+                                loader_context.async_loader_available = async_loader != nullptr && async_loader->available();
+                                threaded_decision = should_use_threaded_weight_loader(tensor_storage,
+                                                                                      dst_tensor,
+                                                                                      loader_config,
+                                                                                      loader_context);
+                            }
+                            threaded_fallback_reason = threaded_decision.fallback_reason;
+                        }
+                        if (threaded_decision.use_fast_path) {
                             sd::loader::PinnedHostSpan span = pinned_arena->acquire(tensor_storage.nbytes_to_read());
                             if (span.data == nullptr) {
                                 async_loader->synchronize();
                                 pinned_arena->reset();
                                 span = pinned_arena->acquire(tensor_storage.nbytes_to_read());
                             }
-                            if (span.data != nullptr && (!loader_config.enable_pinned_staging || span.pinned)) {
+                            if (span.data != nullptr && span.pinned) {
                                 read_buf = static_cast<char*>(span.data);
                                 target_buf = read_buf;
                                 use_threaded_pinned_read = true;
                             } else {
-                                sd::loader::note_fallback();
+                                threaded_fallback_reason = sd::loader::LoaderFallbackReason::arena_unavailable;
                             }
                         }
                         if (!use_threaded_pinned_read) {
@@ -1631,7 +1752,8 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                             read_buf   = (char*)read_buffer.data();
                             target_buf = read_buf;
                             if (threaded_loader_requested) {
-                                sd::loader::note_fallback(static_cast<uint64_t>(tensor_storage.nbytes_to_read()));
+                                sd::loader::note_fallback(threaded_fallback_reason,
+                                                          static_cast<uint64_t>(tensor_storage.nbytes_to_read()));
                             }
                         }
 #else
@@ -1648,10 +1770,12 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
 
                     t0 = ggml_time_ms();
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+                    bool read_ok = true;
                     if (use_threaded_pinned_read) {
                         if (!threaded_reader->read(file_path, tensor_storage.offset, read_buf, nbytes_to_read)) {
                             LOG_ERROR("threaded pinned read failed: '%s'", file_path.c_str());
                             failed = true;
+                            read_ok = false;
                         }
                     } else
 #endif
@@ -1699,7 +1823,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                         t0 = ggml_time_ms();
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
                         if (use_threaded_pinned_read) {
-                            async_loader->upload(nullptr, dst_tensor, convert_buf, 0, ggml_nbytes(dst_tensor));
+                            if (read_ok && async_loader->upload(nullptr, dst_tensor, convert_buf, 0, ggml_nbytes(dst_tensor))) {
+                                sd::loader::note_fast_path(static_cast<uint64_t>(ggml_nbytes(dst_tensor)));
+                            }
                         } else
 #endif
                         {

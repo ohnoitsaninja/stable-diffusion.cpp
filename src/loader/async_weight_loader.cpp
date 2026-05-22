@@ -21,7 +21,7 @@ AsyncWeightLoader::AsyncWeightLoader() {
         stream_ = stream;
     } else {
         (void)cudaGetLastError();
-        note_fallback();
+        note_fallback_reason(LoaderFallbackReason::unsupported_backend);
     }
 #endif
 }
@@ -90,7 +90,7 @@ bool AsyncWeightLoader::upload(ggml_backend_t backend, ggml_tensor* tensor, cons
     }
 #endif
 
-    note_fallback(static_cast<uint64_t>(bytes));
+    note_fallback(LoaderFallbackReason::unsupported_backend, static_cast<uint64_t>(bytes));
     if (backend != nullptr) {
         ggml_backend_tensor_set_async(backend, tensor, data, offset, bytes);
         ggml_backend_synchronize(backend);
@@ -126,7 +126,7 @@ void AsyncWeightLoader::synchronize() {
             add_h2d(pending_bytes_, ms, event_ms);
         } else {
             (void)cudaGetLastError();
-            note_fallback(pending_bytes_);
+            note_fallback(LoaderFallbackReason::other, pending_bytes_);
         }
         pending_bytes_ = 0;
     }

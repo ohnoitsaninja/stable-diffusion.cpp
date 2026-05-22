@@ -806,6 +806,19 @@ typedef struct sd_loader_stats_t {
     double tensor_bookkeeping_ms;
     double model_construction_ms;
     double lora_patch_prep_ms;
+    uint64_t fast_path_bytes;
+    uint64_t fast_path_tensor_count;
+    uint64_t fallback_tensor_count;
+    uint64_t fallback_below_threshold_count;
+    uint64_t fallback_host_destination_count;
+    uint64_t fallback_null_destination_count;
+    uint64_t fallback_zip_or_indirect_count;
+    uint64_t fallback_conversion_required_count;
+    uint64_t fallback_type_mismatch_count;
+    uint64_t fallback_unsupported_backend_count;
+    uint64_t fallback_arena_unavailable_count;
+    uint64_t fallback_other_count;
+    uint64_t dry_run_tensor_count;
 } sd_loader_stats_t;
 
 typedef struct {

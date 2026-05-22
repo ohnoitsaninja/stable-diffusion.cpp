@@ -49,7 +49,7 @@ PinnedHostArena::PinnedHostArena(const LoaderConfig& config)
 #endif
 
     if (base_ == nullptr) {
-        note_fallback();
+        note_fallback_reason(LoaderFallbackReason::arena_unavailable);
         reserved_bytes_ = 0;
         return;
     }
@@ -94,7 +94,7 @@ bool PinnedHostArena::ensure_committed(size_t bytes) {
                                    MEM_COMMIT,
                                    PAGE_READWRITE);
     if (committed == nullptr) {
-        note_fallback();
+        note_fallback_reason(LoaderFallbackReason::arena_unavailable);
         return false;
     }
 #endif
@@ -117,7 +117,7 @@ bool PinnedHostArena::register_committed() {
         (void)cudaGetLastError();
         pinned_ = false;
         registered_bytes_ = 0;
-        note_fallback();
+        note_fallback_reason(LoaderFallbackReason::arena_unavailable);
         return false;
     }
     pinned_ = true;

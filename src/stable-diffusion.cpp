@@ -6466,30 +6466,56 @@ bool sd_get_loader_stats(sd_loader_stats_t* loader_stats) {
     if (loader_stats == nullptr) {
         return false;
     }
-    sd_loader_stats_init(loader_stats);
+    const uint32_t caller_size = loader_stats->struct_size;
+    const uint32_t copy_size = std::min<uint32_t>(caller_size, static_cast<uint32_t>(sizeof(sd_loader_stats_t)));
+    if (copy_size < sizeof(uint32_t)) {
+        return false;
+    }
+    std::memset(loader_stats, 0, copy_size);
+    loader_stats->struct_size = caller_size;
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
     const sd::loader::LoaderStats stats = sd::loader::get_stats();
-    loader_stats->disk_read_bytes = stats.disk_read_bytes;
-    loader_stats->pinned_bytes_peak = stats.pinned_bytes_peak;
-    loader_stats->h2d_bytes = stats.h2d_bytes;
-    loader_stats->disk_read_ms = stats.disk_read_ms;
-    loader_stats->h2d_ms = stats.h2d_ms;
-    loader_stats->total_model_load_ms = stats.total_model_load_ms;
-    loader_stats->fallback_count = stats.fallback_count;
-    loader_stats->fallback_bytes = stats.fallback_bytes;
-    loader_stats->read_call_count = stats.read_call_count;
-    loader_stats->read_chunk_count = stats.read_chunk_count;
-    loader_stats->read_chunk_bytes = stats.read_chunk_bytes;
-    loader_stats->tensor_count = stats.tensor_count;
-    loader_stats->cuda_host_register_count = stats.cuda_host_register_count;
-    loader_stats->cuda_host_unregister_count = stats.cuda_host_unregister_count;
-    loader_stats->cuda_stream_synchronize_count = stats.cuda_stream_synchronize_count;
-    loader_stats->cuda_device_synchronize_count = stats.cuda_device_synchronize_count;
-    loader_stats->disk_read_wall_ms = stats.disk_read_wall_ms;
-    loader_stats->h2d_event_ms = stats.h2d_event_ms;
-    loader_stats->tensor_bookkeeping_ms = stats.tensor_bookkeeping_ms;
-    loader_stats->model_construction_ms = stats.model_construction_ms;
-    loader_stats->lora_patch_prep_ms = stats.lora_patch_prep_ms;
+#define SD_COPY_LOADER_STAT(field)                                                                                     \
+    do {                                                                                                               \
+        if (copy_size >= offsetof(sd_loader_stats_t, field) + sizeof(loader_stats->field)) {                           \
+            loader_stats->field = stats.field;                                                                         \
+        }                                                                                                              \
+    } while (0)
+    SD_COPY_LOADER_STAT(disk_read_bytes);
+    SD_COPY_LOADER_STAT(pinned_bytes_peak);
+    SD_COPY_LOADER_STAT(h2d_bytes);
+    SD_COPY_LOADER_STAT(disk_read_ms);
+    SD_COPY_LOADER_STAT(h2d_ms);
+    SD_COPY_LOADER_STAT(total_model_load_ms);
+    SD_COPY_LOADER_STAT(fallback_count);
+    SD_COPY_LOADER_STAT(fallback_bytes);
+    SD_COPY_LOADER_STAT(read_call_count);
+    SD_COPY_LOADER_STAT(read_chunk_count);
+    SD_COPY_LOADER_STAT(read_chunk_bytes);
+    SD_COPY_LOADER_STAT(tensor_count);
+    SD_COPY_LOADER_STAT(cuda_host_register_count);
+    SD_COPY_LOADER_STAT(cuda_host_unregister_count);
+    SD_COPY_LOADER_STAT(cuda_stream_synchronize_count);
+    SD_COPY_LOADER_STAT(cuda_device_synchronize_count);
+    SD_COPY_LOADER_STAT(disk_read_wall_ms);
+    SD_COPY_LOADER_STAT(h2d_event_ms);
+    SD_COPY_LOADER_STAT(tensor_bookkeeping_ms);
+    SD_COPY_LOADER_STAT(model_construction_ms);
+    SD_COPY_LOADER_STAT(lora_patch_prep_ms);
+    SD_COPY_LOADER_STAT(fast_path_bytes);
+    SD_COPY_LOADER_STAT(fast_path_tensor_count);
+    SD_COPY_LOADER_STAT(fallback_tensor_count);
+    SD_COPY_LOADER_STAT(fallback_below_threshold_count);
+    SD_COPY_LOADER_STAT(fallback_host_destination_count);
+    SD_COPY_LOADER_STAT(fallback_null_destination_count);
+    SD_COPY_LOADER_STAT(fallback_zip_or_indirect_count);
+    SD_COPY_LOADER_STAT(fallback_conversion_required_count);
+    SD_COPY_LOADER_STAT(fallback_type_mismatch_count);
+    SD_COPY_LOADER_STAT(fallback_unsupported_backend_count);
+    SD_COPY_LOADER_STAT(fallback_arena_unavailable_count);
+    SD_COPY_LOADER_STAT(fallback_other_count);
+    SD_COPY_LOADER_STAT(dry_run_tensor_count);
+#undef SD_COPY_LOADER_STAT
     return true;
 #else
     return false;
