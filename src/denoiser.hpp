@@ -774,13 +774,19 @@ inline float time_snr_shift(float alpha, float t) {
 
 struct DiscreteFlowDenoiser : public Denoiser {
     float shift = 3.0f;
+    bool explicit_shift = false;
 
     DiscreteFlowDenoiser(float shift = 3.0f) {
-        set_shift(shift);
+        this->shift = shift;
     }
 
-    void set_shift(float shift) {
+    void set_shift(float shift, bool is_explicit = true) {
         this->shift = shift;
+        explicit_shift = is_explicit;
+    }
+
+    bool has_explicit_shift() const {
+        return explicit_shift;
     }
 
     float sigma_min() override {
@@ -838,6 +844,15 @@ struct FluxFlowDenoiser : public DiscreteFlowDenoiser {
 struct Flux2FlowDenoiser : public FluxFlowDenoiser {
     Flux2FlowDenoiser() = default;
 
+    float t_to_sigma(float t) override {
+        t = t + 1;
+        const float normalized = t / TIMESTEPS;
+        if (has_explicit_shift()) {
+            return time_snr_shift(shift, normalized);
+        }
+        return flux_time_shift(shift, 1.0f, normalized);
+    }
+
     float compute_empirical_mu(uint32_t n, int image_seq_len) {
         const float a1 = 8.73809524e-05f;
         const float b1 = 1.89833333f;
@@ -860,9 +875,57 @@ struct Flux2FlowDenoiser : public FluxFlowDenoiser {
     }
 
     std::vector<float> get_sigmas(uint32_t n, int image_seq_len, scheduler_t scheduler_type, SDVersion version) override {
-        float mu = compute_empirical_mu(n, image_seq_len);
-        LOG_DEBUG("Flux2FlowDenoiser: set shift to %.3f", mu);
-        set_shift(mu);
+        const char* bonsai_int1 = std::getenv("SDCPP_EXPERIMENTAL_BONSAI_GEMLITE_INT1");
+        const bool bonsai_dynamic_mu = bonsai_int1 != nullptr && bonsai_int1[0] != '\0' && bonsai_int1[0] != '0';
+        if (bonsai_dynamic_mu && scheduler_type == DISCRETE_SCHEDULER) {
+            const float mu = compute_empirical_mu(n, image_seq_len);
+            LOG_INFO("get_sigmas with Bonsai Prism-compatible Flux2 FlowMatchEuler dynamic mu %.6f", mu);
+            std::vector<float> result;
+            if (n == 0) {
+                return result;
+            }
+            result.reserve(static_cast<size_t>(n) + 1);
+            for (uint32_t i = 0; i < n; ++i) {
+                const float base_sigma = 1.0f - static_cast<float>(i) * (1.0f - 1.0f / static_cast<float>(n)) / static_cast<float>(std::max<uint32_t>(1, n - 1));
+                result.push_back(flux_time_shift(mu, 1.0f, base_sigma));
+            }
+            result.push_back(0.0f);
+            return result;
+        }
+        if (!has_explicit_shift()) {
+            float mu = compute_empirical_mu(n, image_seq_len);
+            LOG_DEBUG("Flux2FlowDenoiser: set shift to %.3f", mu);
+            set_shift(mu, false);
+        } else {
+            LOG_DEBUG("Flux2FlowDenoiser: using explicit shift %.3f", shift);
+        }
+        if (has_explicit_shift() && scheduler_type == DISCRETE_SCHEDULER) {
+            // Match Diffusers FlowMatchEulerDiscreteScheduler's default inference schedule:
+            // linearly interpolate between sigma_max and sigma_min in sigma-to-t space,
+            // convert back to normalized sigma, then apply the fixed shift again.
+            LOG_INFO("get_sigmas with Flux2 FlowMatchEulerDiscreteScheduler-compatible discrete scheduler");
+            std::vector<float> result;
+            if (n == 0) {
+                return result;
+            }
+            result.reserve(static_cast<size_t>(n) + 1);
+
+            const float max_t = sigma_max() * static_cast<float>(TIMESTEPS);
+            const float min_t = sigma_min() * static_cast<float>(TIMESTEPS);
+            if (n == 1) {
+                result.push_back(time_snr_shift(shift, max_t / static_cast<float>(TIMESTEPS)));
+                result.push_back(0.0f);
+                return result;
+            }
+            const float step = (max_t - min_t) / static_cast<float>(n - 1);
+            for (uint32_t i = 0; i < n; ++i) {
+                const float timestep = max_t - step * static_cast<float>(i);
+                const float sigma = timestep / static_cast<float>(TIMESTEPS);
+                result.push_back(time_snr_shift(shift, sigma));
+            }
+            result.push_back(0.0f);
+            return result;
+        }
         return Denoiser::get_sigmas(n, image_seq_len, scheduler_type, version);
     }
 };

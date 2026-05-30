@@ -375,6 +375,10 @@ struct FluxModel : public DiffusionModel {
         flux.set_flash_attention_enabled(enabled);
     }
 
+    void set_bonsai_gemlite_runtime(const std::shared_ptr<sd::BonsaiGemliteRuntime>& runtime) {
+        flux.set_bonsai_gemlite_runtime(runtime);
+    }
+
     void set_circular_axes(bool circular_x, bool circular_y) override {
         flux.set_circular_axes(circular_x, circular_y);
     }
@@ -498,6 +502,23 @@ struct AnimaModel : public DiffusionModel {
                                                  diffusion_params.t5_ids_backend,
                                                  tensor_or_empty(diffusion_params.t5_weights),
                                                  diffusion_params.t5_weights_backend);
+    }
+
+    std::unique_ptr<GgmlBackendTensorResource> preprocess_text_embeds_to_backend_resource(
+        int n_threads,
+        const sd::Tensor<float>& context = {},
+        const GgmlBackendTensorResource* context_resource = nullptr,
+        const sd::Tensor<int32_t>& t5_ids = {},
+        const GgmlBackendTensorResource* t5_ids_resource = nullptr,
+        const sd::Tensor<float>& t5_weights = {},
+        const GgmlBackendTensorResource* t5_weights_resource = nullptr) {
+        return anima.preprocess_text_embeds_to_backend_resource(n_threads,
+                                                               context,
+                                                               context_resource,
+                                                               t5_ids,
+                                                               t5_ids_resource,
+                                                               t5_weights,
+                                                               t5_weights_resource);
     }
 };
 

@@ -20,15 +20,19 @@
 #include "vae.hpp"
 
 #include "latent-preview.h"
+#include "lens_staged_pipeline.hpp"
 #include "name_conversion.h"
 
 #if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
 #include "loader/loader_stats.h"
+#include "loader/threaded_file_reader.h"
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -37,9 +41,39 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
+#include <memory>
 #include <new>
+#include <numeric>
+#include <optional>
 #include <sstream>
+#include <set>
 #include <unordered_map>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
+#if defined(SD_USE_CUDA) && defined(__has_include)
+#if __has_include(<cuda_profiler_api.h>)
+#include <cuda_profiler_api.h>
+#define SD_BONSAI_HAS_CUDA_PROFILER 1
+#endif
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define SD_BONSAI_HAS_NVTX 1
+#endif
+#endif
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 const char* sd_preview_name(enum preview_t preview);
 
@@ -74,6 +108,7 @@ const char* model_version_to_str[] = {
     "Z-Image",
     "Ovis Image",
     "Marigold IID",
+    "Lens Turbo",
 };
 
 const char* sampling_methods_str[] = {
@@ -108,6 +143,7 @@ static bool sample_method_uses_step_noise(enum sample_method_t sample_method);
 static bool sample_method_uses_brownian_step_noise(enum sample_method_t sample_method);
 static uint32_t sampler_step_noise_count_for_nonfinal_steps(enum sample_method_t sample_method, uint32_t nonfinal_step_count);
 static uint32_t sampler_step_noise_count_for_sigmas(enum sample_method_t sample_method, const std::vector<float>& sigmas);
+static std::string sd_lower_ascii(std::string value);
 
 void calculate_alphas_cumprod(float* alphas_cumprod,
                               float linear_start = 0.00085f,
@@ -184,15 +220,75 @@ static bool trace_euler_parity_stats_enabled() {
         return true;
     }
     const char* tensor_value = std::getenv("SDCPP_TRACE_EULER_PARITY_TENSORS");
-    return tensor_value != nullptr && tensor_value[0] != '\0' && tensor_value[0] != '0';
+    if (tensor_value != nullptr && tensor_value[0] != '\0' && tensor_value[0] != '0') {
+        return true;
+    }
+    const char* bonsai_value = std::getenv("SDCPP_BONSAI_DUMP_TENSORS");
+    return bonsai_value != nullptr && bonsai_value[0] != '\0' && bonsai_value[0] != '0';
 }
 
-static bool trace_euler_parity_tensors_enabled() {
-    const char* value = std::getenv("SDCPP_TRACE_EULER_PARITY_TENSORS");
+static bool profile_bonsai_generation_enabled() {
+    const char* value = std::getenv("SDCPP_PROFILE_BONSAI_GENERATION");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static bool bonsai_profile_range_enabled() {
+    const char* value = std::getenv("SDCPP_BONSAI_PROFILE_RANGE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+class ScopedBonsaiProfileRange {
+public:
+    ScopedBonsaiProfileRange(const char* name, bool active, bool profiler_range = false)
+        : active_(active), profiler_range_(active && profiler_range) {
+        if (!active_) {
+            return;
+        }
+#if defined(SD_BONSAI_HAS_CUDA_PROFILER)
+        if (profiler_range_) {
+            cudaProfilerStart();
+        }
+#endif
+#if defined(SD_BONSAI_HAS_NVTX)
+        nvtxRangePushA(name != nullptr ? name : "bonsai");
+#else
+        (void)name;
+#endif
+    }
+
+    ~ScopedBonsaiProfileRange() {
+        if (!active_) {
+            return;
+        }
+#if defined(SD_BONSAI_HAS_CUDA_PROFILER)
+        if (profiler_range_) {
+            cudaProfilerStop();
+        }
+#endif
+#if defined(SD_BONSAI_HAS_NVTX)
+        nvtxRangePop();
+#endif
+    }
+
+private:
+    bool active_ = false;
+    bool profiler_range_ = false;
+};
+
+static bool trace_euler_parity_tensors_enabled() {
+    const char* value = std::getenv("SDCPP_TRACE_EULER_PARITY_TENSORS");
+    if (value != nullptr && value[0] != '\0' && value[0] != '0') {
+        return true;
+    }
+    const char* bonsai_value = std::getenv("SDCPP_BONSAI_DUMP_TENSORS");
+    return bonsai_value != nullptr && bonsai_value[0] != '\0' && bonsai_value[0] != '0';
+}
+
 static std::filesystem::path trace_euler_parity_tensor_dir() {
+    const char* bonsai_value = std::getenv("SDCPP_BONSAI_DUMP_DIR");
+    if (bonsai_value != nullptr && bonsai_value[0] != '\0') {
+        return std::filesystem::path(bonsai_value);
+    }
     const char* value = std::getenv("SDCPP_TRACE_EULER_PARITY_TENSOR_DIR");
     if (value != nullptr && value[0] != '\0') {
         return std::filesystem::path(value);
@@ -374,6 +470,89 @@ static uint64_t parity_tensor_checksum(const sd::Tensor<float>& tensor) {
     return checksum;
 }
 
+struct TensorFiniteSummary {
+    int64_t count = 0;
+    int64_t finite_count = 0;
+    int64_t nan_count = 0;
+    int64_t inf_count = 0;
+    float min_value = std::numeric_limits<float>::infinity();
+    float max_value = -std::numeric_limits<float>::infinity();
+    double mean = 0.0;
+    double stddev = 0.0;
+    double mean_abs = 0.0;
+};
+
+static TensorFiniteSummary summarize_tensor_finite_values(const sd::Tensor<float>& tensor) {
+    TensorFiniteSummary summary;
+    if (tensor.empty()) {
+        return summary;
+    }
+    summary.count = tensor.numel();
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    double abs_sum = 0.0;
+    for (int64_t i = 0; i < summary.count; ++i) {
+        const float value = tensor[i];
+        if (std::isnan(value)) {
+            summary.nan_count++;
+            continue;
+        }
+        if (!std::isfinite(value)) {
+            summary.inf_count++;
+            continue;
+        }
+        summary.min_value = std::min(summary.min_value, value);
+        summary.max_value = std::max(summary.max_value, value);
+        sum += static_cast<double>(value);
+        sum_sq += static_cast<double>(value) * static_cast<double>(value);
+        abs_sum += std::abs(static_cast<double>(value));
+        summary.finite_count++;
+    }
+    if (summary.finite_count > 0) {
+        const double denom = static_cast<double>(summary.finite_count);
+        summary.mean = sum / denom;
+        summary.stddev = std::sqrt(std::max(0.0, sum_sq / denom - summary.mean * summary.mean));
+        summary.mean_abs = abs_sum / denom;
+    } else {
+        summary.min_value = 0.0f;
+        summary.max_value = 0.0f;
+    }
+    return summary;
+}
+
+static bool bonsai_nan_fail_fast_enabled() {
+    const char* enabled = std::getenv("SDCPP_EXPERIMENTAL_BONSAI_GEMLITE_INT1");
+    if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0') {
+        return false;
+    }
+    const char* allow = std::getenv("SDCPP_BONSAI_ALLOW_NAN_CONTINUE");
+    return !(allow != nullptr && allow[0] != '\0' && allow[0] != '0');
+}
+
+static bool bonsai_abort_if_nonfinite_tensor(const char* label, int step, const sd::Tensor<float>& tensor) {
+    if (!bonsai_nan_fail_fast_enabled() || tensor.empty()) {
+        return false;
+    }
+    const TensorFiniteSummary summary = summarize_tensor_finite_values(tensor);
+    if (summary.nan_count == 0 && summary.inf_count == 0) {
+        return false;
+    }
+    LOG_ERROR("[BonsaiFailFast] tensor=%s step=%d shape=%s count=%" PRId64 " finite=%" PRId64 " nan=%" PRId64 " inf=%" PRId64 " min=%.9g max=%.9g mean=%.9g std=%.9g mean_abs=%.9g; aborting before VAE decode",
+              label != nullptr ? label : "tensor",
+              step,
+              sd::tensor_shape_to_string(tensor.shape()).c_str(),
+              summary.count,
+              summary.finite_count,
+              summary.nan_count,
+              summary.inf_count,
+              static_cast<double>(summary.min_value),
+              static_cast<double>(summary.max_value),
+              summary.mean,
+              summary.stddev,
+              summary.mean_abs);
+    return true;
+}
+
 static std::vector<int64_t> parity_export_shape_for_tensor(const char* label, const sd::Tensor<float>& tensor, const char** out_layout) {
     if (out_layout != nullptr) {
         *out_layout = "explicit_shape_order";
@@ -534,36 +713,21 @@ static void log_tensor_stats_for_parity(const char* prefix, const char* label, c
         return;
     }
 
-    const int64_t count = tensor.numel();
-    double sum = 0.0;
-    double sum_sq = 0.0;
-    double abs_sum = 0.0;
-    float min_value = std::numeric_limits<float>::infinity();
-    float max_value = -std::numeric_limits<float>::infinity();
-    for (int64_t i = 0; i < count; ++i) {
-        const float value = tensor[i];
-        min_value = std::min(min_value, value);
-        max_value = std::max(max_value, value);
-        sum += static_cast<double>(value);
-        sum_sq += static_cast<double>(value) * static_cast<double>(value);
-        abs_sum += std::abs(static_cast<double>(value));
-    }
+    const TensorFiniteSummary summary = summarize_tensor_finite_values(tensor);
     const uint64_t checksum = parity_tensor_checksum(tensor);
-    const double denom = count > 0 ? static_cast<double>(count) : 1.0;
-    const double mean = sum / denom;
-    const double variance = std::max(0.0, sum_sq / denom - mean * mean);
-    const double stddev = std::sqrt(variance);
-    const double mean_abs = abs_sum / denom;
-    LOG_INFO("%s %s stats dtype=f32 shape=%s numel=%" PRId64 " min=%.9g max=%.9g mean=%.9g std=%.9g mean_abs=%.9g checksum=0x%016" PRIx64,
+    LOG_INFO("%s %s stats dtype=f32 shape=%s numel=%" PRId64 " finite=%" PRId64 " nan=%" PRId64 " inf=%" PRId64 " min=%.9g max=%.9g mean=%.9g std=%.9g mean_abs=%.9g checksum=0x%016" PRIx64,
              tag,
              name,
              sd::tensor_shape_to_string(tensor.shape()).c_str(),
-             count,
-             static_cast<double>(min_value),
-             static_cast<double>(max_value),
-             mean,
-             stddev,
-             mean_abs,
+             summary.count,
+             summary.finite_count,
+             summary.nan_count,
+             summary.inf_count,
+             static_cast<double>(summary.min_value),
+             static_cast<double>(summary.max_value),
+             summary.mean,
+             summary.stddev,
+             summary.mean_abs,
              checksum);
     maybe_dump_tensor_for_euler_parity(tag, name, tensor, checksum);
 }
@@ -632,6 +796,10 @@ static std::unique_ptr<GgmlBackendTensorResource> sd_copy_gpu_resource_to_backen
                                                                                   const GgmlBackendTensorResource* src,
                                                                                   ggml_backend_t dst_backend,
                                                                                   const char* name);
+static std::unique_ptr<GgmlBackendTensorResource> sd_upload_tensor_to_backend_resource(sd_ctx_t* sd_ctx,
+                                                                                       const sd::Tensor<float>& tensor,
+                                                                                       const char* name,
+                                                                                       ggml_backend_t requested_backend);
 
 static void log_backend_tensor_stats_for_parity(const char* label, const GgmlBackendTensorResource* resource) {
     if (!trace_euler_parity_stats_enabled()) {
@@ -1409,6 +1577,34 @@ public:
             use_tae = true;
         }
 
+        std::string model_family_hint = sd_lower_ascii(SAFE_STR(std::getenv("SDCPP_MODEL_FAMILY_HINT")));
+        if (model_family_hint.empty()) {
+            std::string path_hint;
+            auto append_hint_path = [&](const char* path) {
+                if (strlen(SAFE_STR(path)) == 0) {
+                    return;
+                }
+                if (!path_hint.empty()) {
+                    path_hint.push_back(' ');
+                }
+                path_hint += path;
+            };
+            append_hint_path(sd_ctx_params->model_path);
+            append_hint_path(sd_ctx_params->diffusion_model_path);
+            append_hint_path(sd_ctx_params->vae_path);
+            path_hint = sd_lower_ascii(std::move(path_hint));
+            if (path_hint.find("lens") != std::string::npos) {
+                model_family_hint = "lens";
+            }
+        }
+        if (model_family_hint == "lens" || model_family_hint == "lens-turbo" || model_family_hint == "lens_turbo") {
+            model_loader.force_version(VERSION_LENS);
+        } else if (model_family_hint == "bonsai" || model_family_hint == "bonsai-int1" ||
+                   model_family_hint == "flux2" || model_family_hint == "flux2-klein" ||
+                   model_family_hint == "flux2_klein") {
+            model_loader.force_version(VERSION_FLUX2_KLEIN);
+        }
+
         model_loader.convert_tensors_name();
 
         version = model_loader.get_sd_version();
@@ -1570,6 +1766,19 @@ public:
                                                                   tensor_storage_map,
                                                                   version,
                                                                   sd_ctx_params->chroma_use_dit_mask);
+                    if (env_flag_enabled("SDCPP_EXPERIMENTAL_BONSAI_GEMLITE_INT1")) {
+                        const std::string bonsai_pack_path = SAFE_STR(sd_ctx_params->diffusion_model_path);
+                        if (!bonsai_pack_path.empty()) {
+                            std::string bonsai_error;
+                            auto bonsai_runtime = sd::BonsaiGemliteRuntime::load_from_pack(bonsai_pack_path, bonsai_error);
+                            if (!bonsai_runtime) {
+                                LOG_ERROR("Bonsai GemLite INT1 runtime load failed: %s", bonsai_error.c_str());
+                                return false;
+                            }
+                            std::dynamic_pointer_cast<FluxModel>(diffusion_model)->set_bonsai_gemlite_runtime(bonsai_runtime);
+                            LOG_INFO("Bonsai GemLite INT1 runtime attached to Flux2 diffusion model");
+                        }
+                    }
                 } else if (sd_version_is_wan(version)) {
                     cond_stage_model = std::make_shared<T5CLIPEmbedder>(clip_backend,
                                                                         offload_params_to_cpu,
@@ -1916,6 +2125,13 @@ public:
         ignore_tensors.insert("model.diffusion_model.__x0__");
         ignore_tensors.insert("model.diffusion_model.__32x32__");
         ignore_tensors.insert("model.diffusion_model.__index_timestep_zero__");
+        if (env_flag_enabled("SDCPP_EXPERIMENTAL_BONSAI_GEMLITE_INT1")) {
+            for (const auto& kv : tensors) {
+                if (ggml_ext_bonsai_replaces_internal_linear_name(kv.first)) {
+                    ignore_tensors.insert(kv.first);
+                }
+            }
+        }
 
         if (vae_decode_only) {
             ignore_tensors.insert("cond_stage_model.");
@@ -2980,6 +3196,16 @@ public:
             return x;
         }
 
+        if (trace_euler_parity_stats_enabled()) {
+            log_sigma_schedule_for_parity("cpu_sampler", sigmas);
+            std::vector<std::vector<float>> parity_timesteps;
+            parity_timesteps.reserve(static_cast<size_t>(steps));
+            for (size_t i = 0; i < steps; ++i) {
+                parity_timesteps.push_back(prepare_sample_timesteps(sigmas[i], shifted_timestep));
+            }
+            log_timestep_schedule_for_parity("cpu_sampler", parity_timesteps);
+        }
+
         sd::Tensor<float> x_t        = !noise.empty()
                                            ? denoiser->noise_scaling(sigmas[0], noise, init_latent)
                                            : init_latent;
@@ -2989,6 +3215,9 @@ public:
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::Tensor<float> {
             const bool trace_controlnet = env_flag_enabled("SDCPP_TRACE_CONTROLNET");
             const int64_t step_start_ms = trace_controlnet ? ggml_time_ms() : 0;
+            const int step_index        = std::max(0, step - 1);
+            const bool trace_this_step  = trace_euler_parity_tensors_enabled();
+            char parity_label[128];
             if (step == 1 || step == -1) {
                 pretty_progress(0, (int)steps, 0);
             }
@@ -3006,6 +3235,17 @@ public:
             sd::Tensor<float> timesteps_tensor({static_cast<int64_t>(timesteps_vec.size())}, timesteps_vec);
             sd::Tensor<float> guidance_tensor({1}, std::vector<float>{guidance.distilled_guidance});
             sd::Tensor<float> noised_input = x * c_in;
+            if (trace_this_step) {
+                snprintf(parity_label, sizeof(parity_label), "cpu_sampler_step%d_latent_start", step_index);
+                log_tensor_stats_for_parity("[SamplerParity]", parity_label, x);
+                snprintf(parity_label, sizeof(parity_label), "cpu_sampler_step%d_timestep", step_index);
+                log_tensor_stats_for_parity("[SamplerParity]", parity_label, timesteps_tensor);
+                snprintf(parity_label, sizeof(parity_label), "cpu_sampler_step%d_model_input", step_index);
+                log_tensor_stats_for_parity("[SamplerParity]", parity_label, noised_input);
+            }
+            if (step == 1) {
+                log_tensor_stats_for_parity("[SamplerParity]", "cpu_sampler_step1_noised_input", noised_input);
+            }
             if (!denoise_mask.empty() && version == VERSION_WAN2_2_TI2V) {
                 noised_input = noised_input * denoise_mask + init_latent * (1.0f - denoise_mask);
             }
@@ -3084,6 +3324,9 @@ public:
                     LOG_ERROR("diffusion model compute failed");
                     return sd::Tensor<float>();
                 }
+                if (bonsai_abort_if_nonfinite_tensor(pass_name != nullptr ? pass_name : "model_output", step, output_opt)) {
+                    return sd::Tensor<float>();
+                }
                 if (trace_controlnet) {
                     LOG_INFO("[Denoise] step=%d pass=%s unet_compute=%" PRId64 "ms backend_controls=%zu host_controls=%zu",
                              step,
@@ -3102,6 +3345,13 @@ public:
                 if (cond_out.empty()) {
                     return {};
                 }
+                if (trace_this_step) {
+                    snprintf(parity_label, sizeof(parity_label), "cpu_sampler_step%d_cond_model_output", step_index);
+                    log_tensor_stats_for_parity("[SamplerParity]", parity_label, cond_out);
+                }
+                if (step == 1) {
+                    log_tensor_stats_for_parity("[SamplerParity]", "cpu_sampler_step1_cond_model_output", cond_out);
+                }
             } else {
                 GGML_ASSERT(!id_cond.empty());
                 cond_out = run_condition(id_cond,
@@ -3109,6 +3359,9 @@ public:
                                          cond.c_concat.empty() ? nullptr : &cond.c_concat);
                 if (cond_out.empty()) {
                     return {};
+                }
+                if (step == 1) {
+                    log_tensor_stats_for_parity("[SamplerParity]", "cpu_sampler_step1_id_cond_model_output", cond_out);
                 }
             }
 
@@ -3168,7 +3421,27 @@ public:
             if (is_skiplayer_step && !skip_cond_out.empty()) {
                 latent_result += (cond_out - skip_cond_out) * slg_scale;
             }
+            if (step == 1) {
+                log_tensor_stats_for_parity("[SamplerParity]", "cpu_sampler_step1_cfg_model_output", latent_result);
+            }
+            if (trace_this_step) {
+                snprintf(parity_label, sizeof(parity_label), "cpu_sampler_step%d_cfg_model_output", step_index);
+                log_tensor_stats_for_parity("[SamplerParity]", parity_label, latent_result);
+            }
             denoised = latent_result * c_out + x * c_skip;
+            if (step == 1) {
+                log_tensor_stats_for_parity("[SamplerParity]", "cpu_sampler_step1_denoised", denoised);
+            }
+            if (trace_this_step) {
+                snprintf(parity_label, sizeof(parity_label), "cpu_sampler_step%d_denoised", step_index);
+                log_tensor_stats_for_parity("[SamplerParity]", parity_label, denoised);
+                if (method == EULER_SAMPLE_METHOD && step_index >= 0 && static_cast<size_t>(step_index + 1) < sigmas.size()) {
+                    sd::Tensor<float> derivative = (x - denoised) * (1.0f / sigma);
+                    sd::Tensor<float> post_update = x + derivative * (sigmas[static_cast<size_t>(step_index + 1)] - sigma);
+                    snprintf(parity_label, sizeof(parity_label), "cpu_sampler_step%d_pred_post_update", step_index);
+                    log_tensor_stats_for_parity("[SamplerParity]", parity_label, post_update);
+                }
+            }
             if (cache_runtime.spectrum_enabled) {
                 cache_runtime.spectrum.update(denoised);
             }
@@ -3209,8 +3482,19 @@ public:
 
         auto x0 = std::move(x0_opt);
         sd_sample::log_sample_cache_summary(cache_runtime, steps);
-        if (inverse_noise_scaling) {
-            x0 = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x0);
+            if (inverse_noise_scaling) {
+                x0 = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x0);
+            }
+        log_tensor_stats_for_parity("[SamplerParity]", "cpu_sampler_final_latent_before_decode", x0);
+        if (bonsai_abort_if_nonfinite_tensor("final_latent_before_decode", static_cast<int>(steps), x0)) {
+            if (control_net) {
+                control_net->free_control_ctx();
+                control_net->free_compute_buffer();
+            }
+            if (work_diffusion_model) {
+                work_diffusion_model->free_compute_buffer();
+            }
+            return {};
         }
 
         if (control_net) {
@@ -3557,6 +3841,53 @@ public:
             return {};
         };
 
+        bool batched_cfg_condition_padded = false;
+        auto pad_context_token_dim = [&](const sd::Tensor<float>& tensor,
+                                         int64_t target_tokens,
+                                         const char* name,
+                                         std::string* error) -> sd::Tensor<float> {
+            if (tensor.empty()) {
+                return {};
+            }
+            const auto shape = tensor.shape();
+            if (shape.size() != 2 && shape.size() != 3) {
+                if (error != nullptr) {
+                    *error = std::string(name != nullptr ? name : "condition") + " rank cannot be padded for batched CFG";
+                }
+                return {};
+            }
+            if (shape[1] == target_tokens) {
+                return tensor;
+            }
+            if (shape[1] > target_tokens || target_tokens <= 0) {
+                if (error != nullptr) {
+                    *error = std::string(name != nullptr ? name : "condition") + " invalid padded token target";
+                }
+                return {};
+            }
+
+            std::vector<int64_t> padded_shape = shape;
+            padded_shape[1] = target_tokens;
+            sd::Tensor<float> padded = sd::Tensor<float>::zeros(padded_shape);
+            if (shape.size() == 2) {
+                for (int64_t x0 = 0; x0 < shape[0]; ++x0) {
+                    for (int64_t x1 = 0; x1 < shape[1]; ++x1) {
+                        padded.index(x0, x1) = tensor.index(x0, x1);
+                    }
+                }
+            } else {
+                for (int64_t x0 = 0; x0 < shape[0]; ++x0) {
+                    for (int64_t x1 = 0; x1 < shape[1]; ++x1) {
+                        for (int64_t x2 = 0; x2 < shape[2]; ++x2) {
+                            padded.index(x0, x1, x2) = tensor.index(x0, x1, x2);
+                        }
+                    }
+                }
+            }
+            batched_cfg_condition_padded = true;
+            return padded;
+        };
+
         auto make_batched_cfg_condition = [&](SDCondition* out, std::string* reason) -> bool {
             if (out == nullptr) {
                 return false;
@@ -3600,10 +3931,43 @@ public:
             }
             if (cond_context.shape()[0] != uncond_context.shape()[0] ||
                 cond_context.shape()[1] != uncond_context.shape()[1]) {
-                if (reason != nullptr) {
-                    *reason = "context non-batch dimensions differ";
+                const bool allow_padded_z_context =
+                    is_z_image_flow &&
+                    !env_flag_enabled("SDCPP_DISABLE_Z_IMAGE_PADDED_BATCHED_CFG");
+                if (allow_padded_z_context &&
+                    cond_context.shape().size() == uncond_context.shape().size() &&
+                    cond_context.shape()[0] == uncond_context.shape()[0]) {
+                    const int64_t target_tokens = std::max(cond_context.shape()[1], uncond_context.shape()[1]);
+                    local_reason.clear();
+                    cond_context = pad_context_token_dim(cond_context,
+                                                         target_tokens,
+                                                         "cond context",
+                                                         &local_reason);
+                    if (!local_reason.empty()) {
+                        if (reason != nullptr) {
+                            *reason = local_reason;
+                        }
+                        return false;
+                    }
+                    local_reason.clear();
+                    uncond_context = pad_context_token_dim(uncond_context,
+                                                           target_tokens,
+                                                           "uncond context",
+                                                           &local_reason);
+                    if (!local_reason.empty()) {
+                        if (reason != nullptr) {
+                            *reason = local_reason;
+                        }
+                        return false;
+                    }
                 }
-                return false;
+                if (cond_context.shape()[0] != uncond_context.shape()[0] ||
+                    cond_context.shape()[1] != uncond_context.shape()[1]) {
+                    if (reason != nullptr) {
+                        *reason = "context non-batch dimensions differ";
+                    }
+                    return false;
+                }
             }
 
             out->c_crossattn = sd::ops::concat(cond_context, uncond_context, 2);
@@ -3652,12 +4016,46 @@ public:
         const bool cfg_batching_forced =
             env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_BATCHED_CFG") ||
             env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_EULER_BATCHED_CFG");
+        const bool z_image_cfg_batching_forced =
+            is_z_image_flow &&
+            env_flag_enabled("SDCPP_EXPERIMENTAL_Z_IMAGE_BATCHED_CFG") &&
+            !env_flag_enabled("SDCPP_DISABLE_Z_IMAGE_BATCHED_CFG");
+        const bool anima_cfg_batching_forced =
+            sd_version_is_anima(version) &&
+            env_flag_enabled("SDCPP_EXPERIMENTAL_ANIMA_BATCHED_CFG") &&
+            !env_flag_enabled("SDCPP_DISABLE_ANIMA_BATCHED_CFG");
         const bool cfg_batching_requested =
-            cfg_batching_forced && !cfg_batching_disabled;
-        const bool use_batched_cfg =
+            (cfg_batching_forced || z_image_cfg_batching_forced || anima_cfg_batching_forced) && !cfg_batching_disabled;
+        bool use_batched_cfg =
             cfg_batching_requested &&
             !uncond.empty() &&
             make_batched_cfg_condition(&batched_cfg_condition, &batched_cfg_fallback_reason);
+        std::unique_ptr<GgmlBackendTensorResource> batched_cfg_crossattn_backend;
+        std::unique_ptr<GgmlBackendTensorResource> batched_cfg_vector_backend;
+        if (use_batched_cfg) {
+            if (!batched_cfg_condition.c_crossattn.empty()) {
+                batched_cfg_crossattn_backend =
+                    sd_upload_tensor_to_backend_resource(sd_ctx,
+                                                         batched_cfg_condition.c_crossattn,
+                                                         "gpu_batched_cfg_context",
+                                                         backend);
+                if (batched_cfg_crossattn_backend == nullptr || batched_cfg_crossattn_backend->empty()) {
+                    batched_cfg_fallback_reason = "failed to upload batched CFG context to backend";
+                    use_batched_cfg = false;
+                }
+            }
+            if (use_batched_cfg && !batched_cfg_condition.c_vector.empty()) {
+                batched_cfg_vector_backend =
+                    sd_upload_tensor_to_backend_resource(sd_ctx,
+                                                         batched_cfg_condition.c_vector,
+                                                         "gpu_batched_cfg_vector",
+                                                         backend);
+                if (batched_cfg_vector_backend == nullptr || batched_cfg_vector_backend->empty()) {
+                    batched_cfg_fallback_reason = "failed to upload batched CFG vector to backend";
+                    use_batched_cfg = false;
+                }
+            }
+        }
         const bool euler_denoised_cache_requested =
             env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_EULER_DENOISED_CACHE") ||
             env_flag_enabled("SDCPP_EXPERIMENTAL_GPU_SAMPLER_DENOISED_CACHE");
@@ -3711,8 +4109,10 @@ public:
                          use_dual_branch_compute_reuse ? " with compute-buffer reuse" : "",
                          use_dual_branch_compute_reuse ? " or SDCPP_DISABLE_GPU_SAMPLER_UNET_REUSE=1 to keep dual-branch without reuse" : "");
             } else if (use_batched_cfg) {
-                LOG_INFO("GPU %s sampler backend using explicit batched CFG UNet evaluation; unset SDCPP_EXPERIMENTAL_GPU_SAMPLER_BATCHED_CFG or set SDCPP_DISABLE_GPU_SAMPLER_BATCHED_CFG=1 to use non-batched CFG",
-                         sampler_label);
+                LOG_INFO("GPU %s sampler backend using explicit batched CFG UNet evaluation%s; set SDCPP_DISABLE_GPU_SAMPLER_BATCHED_CFG=1%s to use non-batched CFG",
+                         sampler_label,
+                         batched_cfg_condition_padded ? " with padded Z-Image context" : "",
+                         is_z_image_flow ? " or SDCPP_DISABLE_Z_IMAGE_BATCHED_CFG=1" : "");
             } else {
                 if (dual_branch_disabled) {
                     LOG_INFO("GPU %s sampler backend using separate CFG UNet evaluation because dual-branch CFG is disabled",
@@ -3720,7 +4120,7 @@ public:
                 } else if (!unet_debug_boundaries.empty()) {
                     LOG_INFO("GPU %s sampler backend using separate CFG UNet evaluation because UNet boundary parity tracing is enabled",
                              sampler_label);
-                } else if (cfg_batching_forced && !use_batched_cfg) {
+                } else if (cfg_batching_requested && !use_batched_cfg) {
                     LOG_WARN("GPU %s sampler backend using separate CFG UNet evaluation%s%s",
                              sampler_label,
                              batched_cfg_fallback_reason.empty() ? "" : ": ",
@@ -4281,7 +4681,9 @@ public:
                 diffusion_params.timesteps = &batched_timesteps_tensor;
                 diffusion_params.guidance  = &guidance_tensor;
                 diffusion_params.context   = batched_cfg_condition.c_crossattn.empty() ? nullptr : &batched_cfg_condition.c_crossattn;
+                diffusion_params.context_backend = batched_cfg_crossattn_backend.get();
                 diffusion_params.y         = batched_cfg_condition.c_vector.empty() ? nullptr : &batched_cfg_condition.c_vector;
+                diffusion_params.y_backend = batched_cfg_vector_backend.get();
                 trace_unet_debug_boundaries(diffusion_params, "batched_cfg", true);
                 model_output = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params);
                 if (model_output == nullptr || model_output->empty()) {
@@ -4610,7 +5012,9 @@ public:
                         diffusion_params2.timesteps = &batched_timesteps_tensor2;
                         diffusion_params2.guidance  = &guidance_tensor2;
                         diffusion_params2.context   = batched_cfg_condition.c_crossattn.empty() ? nullptr : &batched_cfg_condition.c_crossattn;
+                        diffusion_params2.context_backend = batched_cfg_crossattn_backend.get();
                         diffusion_params2.y         = batched_cfg_condition.c_vector.empty() ? nullptr : &batched_cfg_condition.c_vector;
+                        diffusion_params2.y_backend = batched_cfg_vector_backend.get();
                         model_output2 = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         model_output2_is_batched_cfg = true;
                     } else {
@@ -4790,7 +5194,9 @@ public:
                         diffusion_params2.timesteps = &batched_timesteps_tensor2;
                         diffusion_params2.guidance  = &guidance_tensor2;
                         diffusion_params2.context   = batched_cfg_condition.c_crossattn.empty() ? nullptr : &batched_cfg_condition.c_crossattn;
+                        diffusion_params2.context_backend = batched_cfg_crossattn_backend.get();
                         diffusion_params2.y         = batched_cfg_condition.c_vector.empty() ? nullptr : &batched_cfg_condition.c_vector;
+                        diffusion_params2.y_backend = batched_cfg_vector_backend.get();
                         model_output2 = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         model_output2_is_batched_cfg = true;
                     } else {
@@ -5346,7 +5752,9 @@ public:
                         diffusion_params2.timesteps = &batched_timesteps_tensor2;
                         diffusion_params2.guidance  = &guidance_tensor2;
                         diffusion_params2.context   = batched_cfg_condition.c_crossattn.empty() ? nullptr : &batched_cfg_condition.c_crossattn;
+                        diffusion_params2.context_backend = batched_cfg_crossattn_backend.get();
                         diffusion_params2.y         = batched_cfg_condition.c_vector.empty() ? nullptr : &batched_cfg_condition.c_vector;
+                        diffusion_params2.y_backend = batched_cfg_vector_backend.get();
                         model_output2 = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         model_output2_is_batched_cfg = true;
                     } else {
@@ -5586,7 +5994,9 @@ public:
                         diffusion_params2.timesteps = &batched_timesteps_tensor2;
                         diffusion_params2.guidance  = &guidance_tensor2;
                         diffusion_params2.context   = batched_cfg_condition.c_crossattn.empty() ? nullptr : &batched_cfg_condition.c_crossattn;
+                        diffusion_params2.context_backend = batched_cfg_crossattn_backend.get();
                         diffusion_params2.y         = batched_cfg_condition.c_vector.empty() ? nullptr : &batched_cfg_condition.c_vector;
+                        diffusion_params2.y_backend = batched_cfg_vector_backend.get();
                         model_output2 = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         model_output2_is_batched_cfg = true;
                     } else {
@@ -5855,7 +6265,9 @@ public:
                         diffusion_params2.timesteps = &batched_timesteps_tensor2;
                         diffusion_params2.guidance  = &guidance_tensor2;
                         diffusion_params2.context   = batched_cfg_condition.c_crossattn.empty() ? nullptr : &batched_cfg_condition.c_crossattn;
+                        diffusion_params2.context_backend = batched_cfg_crossattn_backend.get();
                         diffusion_params2.y         = batched_cfg_condition.c_vector.empty() ? nullptr : &batched_cfg_condition.c_vector;
+                        diffusion_params2.y_backend = batched_cfg_vector_backend.get();
                         model_output2 = work_diffusion_model->compute_to_backend_resource(n_threads, diffusion_params2);
                         model_output2_is_batched_cfg = true;
                     } else {
@@ -6069,10 +6481,11 @@ public:
     void set_flow_shift(float flow_shift = INFINITY) {
         auto flow_denoiser = std::dynamic_pointer_cast<DiscreteFlowDenoiser>(denoiser);
         if (flow_denoiser) {
+            bool explicit_flow_shift = std::isfinite(flow_shift);
             if (flow_shift == INFINITY) {
                 flow_shift = default_flow_shift;
             }
-            flow_denoiser->set_shift(flow_shift);
+            flow_denoiser->set_shift(flow_shift, explicit_flow_shift);
         }
     }
 
@@ -6812,6 +7225,66 @@ struct sd_conditioning_resource_private_t {
     std::string debug_name;
 };
 
+struct sd_lens_conditioning_resource_private_t {
+    sd_lens_conditioning_handle_t handle = 0;
+    uint32_t refcount = 1;
+    uint32_t flags = 0;
+    uint32_t schema_version = 1;
+    int64_t tensor_count = 0;
+    int64_t batch = 0;
+    int64_t seq_len = 0;
+    int64_t hidden_size = 0;
+    int64_t selected_layer_count = 0;
+    int64_t feature_shapes[4][4] = {};
+    int64_t mask_shape[4] = {};
+    enum sd_tensor_dtype_t dtype = SD_DTYPE_F32;
+    uint32_t storage_flags = SD_LENS_COND_STORAGE_FLAG_CPU;
+    enum sd_backend_kind_t backend = SD_BACKEND_CPU;
+    uint64_t estimated_bytes = 0;
+    uint64_t shape_hash = 0;
+    uint64_t dtype_hash = 0;
+    uint64_t config_hash = 0;
+    bool device_resident = false;
+    bool copy_safe = true;
+    std::array<std::unique_ptr<GgmlBackendTensorResource>, 5> tensors;
+    sd_lens_cond_v1_native native_condition;
+    std::unordered_map<std::string, Tensor> runtime_tensors;
+    bool prompt_encoded = false;
+    std::string prompt_preview;
+    std::string tokenizer_dir;
+    std::string chat_current_date;
+    std::string debug_name;
+};
+
+struct sd_lens_transformer_resource_private_t {
+    sd_lens_transformer_handle_t handle = 0;
+    uint32_t refcount = 1;
+    uint32_t shard_count = 0;
+    uint32_t tensor_count = 0;
+    uint64_t estimated_bytes = 0;
+    uint32_t layers = 48;
+    uint32_t num_attention_heads = 24;
+    uint32_t attention_head_dim = 64;
+    uint32_t inner_dim = 1536;
+    uint32_t in_channels = 128;
+    uint32_t out_channels = 32;
+    uint32_t enc_hidden_dim = 2880;
+    bool metadata_only = true;
+    bool weights_loaded = false;
+    bool forward_supported = false;
+    bool host_cached = false;
+    bool gpu_resident = false;
+    uint64_t host_cached_bytes = 0;
+    struct HostTensor {
+        std::vector<int64_t> shape;
+        sd_tensor_dtype_t dtype = SD_DTYPE_F32;
+        std::vector<float> data;
+        std::vector<ggml_bf16_t> bf16_data;
+    };
+    std::unordered_map<std::string, HostTensor> host_tensors;
+    std::string debug_name;
+};
+
 struct sd_ctx_params_snapshot_t {
     sd_ctx_params_t params{};
     std::string model_path;
@@ -6837,10 +7310,20 @@ struct sd_ctx_t {
     std::unordered_map<sd_gpu_handle_t, std::shared_ptr<sd_gpu_resource_private_t>> gpu_resources;
     sd_conditioning_handle_t next_conditioning_handle = 1;
     std::unordered_map<sd_conditioning_handle_t, std::shared_ptr<sd_conditioning_resource_private_t>> conditioning_resources;
+    sd_lens_conditioning_handle_t next_lens_conditioning_handle = 1;
+    std::unordered_map<sd_lens_conditioning_handle_t, std::shared_ptr<sd_lens_conditioning_resource_private_t>> lens_conditioning_resources;
+    sd_lens_transformer_handle_t next_lens_transformer_handle = 1;
+    std::unordered_map<sd_lens_transformer_handle_t, std::shared_ptr<sd_lens_transformer_resource_private_t>> lens_transformer_resources;
     sd_ctx_params_snapshot_t init_params;
     sd_ctx_t* vae_decode_bridge_ctx = nullptr;
     bool vae_encode_used = false;
+    bool lens_conditioning_only = false;
+    sd_bonsai_generation_timing_t last_bonsai_generation_timing = {};
 };
+
+static sd_lens_conditioning_handle_t g_next_detached_lens_conditioning_handle = 1;
+static std::unordered_map<sd_lens_conditioning_handle_t, std::shared_ptr<sd_lens_conditioning_resource_private_t>>
+    g_detached_lens_conditioning_resources;
 
 static std::shared_ptr<sd_conditioning_resource_private_t> sd_conditioning_lookup(sd_ctx_t* sd_ctx,
                                                                                   sd_conditioning_handle_t handle);
@@ -6962,6 +7445,14 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
     return sd_ctx;
 }
 
+sd_ctx_t* new_sd_ctx_lens_conditioning_only(void) {
+    sd_ctx_t* sd_ctx = new (std::nothrow) sd_ctx_t();
+    if (sd_ctx != nullptr) {
+        sd_ctx->lens_conditioning_only = true;
+    }
+    return sd_ctx;
+}
+
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
     if (sd_ctx == nullptr) {
         return;
@@ -6971,6 +7462,9 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
         sd_ctx->vae_decode_bridge_ctx = nullptr;
     }
     sd_ctx->gpu_resources.clear();
+    sd_ctx->conditioning_resources.clear();
+    sd_ctx->lens_conditioning_resources.clear();
+    sd_ctx->lens_transformer_resources.clear();
     if (sd_ctx->sd != nullptr) {
         delete sd_ctx->sd;
         sd_ctx->sd = nullptr;
@@ -7781,6 +8275,254 @@ static bool sd_condition_merge_extra_crossattn_into_context(SDCondition& conditi
     return true;
 }
 
+static bool read_le_u16(const std::vector<uint8_t>& bytes, size_t offset, uint16_t* out) {
+    if (out == nullptr || offset + 2 > bytes.size()) {
+        return false;
+    }
+    *out = static_cast<uint16_t>(bytes[offset]) |
+           (static_cast<uint16_t>(bytes[offset + 1]) << 8);
+    return true;
+}
+
+static bool read_le_u32(const std::vector<uint8_t>& bytes, size_t offset, uint32_t* out) {
+    if (out == nullptr || offset + 4 > bytes.size()) {
+        return false;
+    }
+    *out = static_cast<uint32_t>(bytes[offset]) |
+           (static_cast<uint32_t>(bytes[offset + 1]) << 8) |
+           (static_cast<uint32_t>(bytes[offset + 2]) << 16) |
+           (static_cast<uint32_t>(bytes[offset + 3]) << 24);
+    return true;
+}
+
+static std::optional<std::vector<int64_t>> parse_numpy_shape_header(const std::string& header) {
+    const size_t shape_pos = header.find("'shape'");
+    if (shape_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const size_t open = header.find('(', shape_pos);
+    const size_t close = header.find(')', open == std::string::npos ? shape_pos : open);
+    if (open == std::string::npos || close == std::string::npos || close <= open) {
+        return std::nullopt;
+    }
+    std::vector<int64_t> shape;
+    std::string current;
+    for (size_t i = open + 1; i < close; ++i) {
+        const char ch = header[i];
+        if (std::isdigit(static_cast<unsigned char>(ch))) {
+            current.push_back(ch);
+        } else if (!current.empty()) {
+            shape.push_back(std::strtoll(current.c_str(), nullptr, 10));
+            current.clear();
+        }
+    }
+    if (!current.empty()) {
+        shape.push_back(std::strtoll(current.c_str(), nullptr, 10));
+    }
+    if (shape.empty()) {
+        return std::nullopt;
+    }
+    return shape;
+}
+
+static std::optional<sd::Tensor<float>> load_bonsai_conditioning_npy(const char* path) {
+    if (path == nullptr || path[0] == '\0') {
+        return std::nullopt;
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY could not open '%s'", path);
+        return std::nullopt;
+    }
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (bytes.size() < 16 || std::memcmp(bytes.data(), "\x93NUMPY", 6) != 0) {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY is not a valid NPY file: '%s'", path);
+        return std::nullopt;
+    }
+    const uint8_t major = bytes[6];
+    size_t header_offset = 0;
+    size_t data_offset = 0;
+    size_t header_len = 0;
+    if (major == 1) {
+        uint16_t len16 = 0;
+        if (!read_le_u16(bytes, 8, &len16)) {
+            return std::nullopt;
+        }
+        header_offset = 10;
+        header_len = len16;
+    } else if (major == 2 || major == 3) {
+        uint32_t len32 = 0;
+        if (!read_le_u32(bytes, 8, &len32)) {
+            return std::nullopt;
+        }
+        header_offset = 12;
+        header_len = len32;
+    } else {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY unsupported NPY version: %u", static_cast<unsigned>(major));
+        return std::nullopt;
+    }
+    data_offset = header_offset + header_len;
+    if (data_offset > bytes.size()) {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY truncated header: '%s'", path);
+        return std::nullopt;
+    }
+    const std::string header(reinterpret_cast<const char*>(bytes.data() + header_offset), header_len);
+    if (header.find("'descr': '<f4'") == std::string::npos &&
+        header.find("\"descr\": \"<f4\"") == std::string::npos &&
+        header.find("'descr': '|f4'") == std::string::npos) {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY requires float32 NPY, header=%s", header.c_str());
+        return std::nullopt;
+    }
+    if (header.find("fortran_order': True") != std::string::npos ||
+        header.find("fortran_order\": true") != std::string::npos) {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY requires C-order NPY, header=%s", header.c_str());
+        return std::nullopt;
+    }
+    auto shape_opt = parse_numpy_shape_header(header);
+    if (!shape_opt.has_value()) {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY failed to parse shape, header=%s", header.c_str());
+        return std::nullopt;
+    }
+    const std::vector<int64_t>& shape = *shape_opt;
+    int64_t token_count = 0;
+    int64_t dim_count = 0;
+    if (shape.size() == 3 && shape[0] == 1) {
+        token_count = shape[1];
+        dim_count = shape[2];
+    } else if (shape.size() == 2) {
+        token_count = shape[0];
+        dim_count = shape[1];
+    } else {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY unsupported shape=%s",
+                  sd::tensor_shape_to_string(shape).c_str());
+        return std::nullopt;
+    }
+    if (token_count <= 0 || dim_count <= 0) {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY invalid shape=%s",
+                  sd::tensor_shape_to_string(shape).c_str());
+        return std::nullopt;
+    }
+    const size_t element_count = static_cast<size_t>(token_count * dim_count);
+    const size_t byte_count = element_count * sizeof(float);
+    if (data_offset + byte_count > bytes.size()) {
+        LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY truncated data: expected=%zu available=%zu path=%s",
+                  byte_count,
+                  bytes.size() - data_offset,
+                  path);
+        return std::nullopt;
+    }
+    std::vector<float> data(element_count);
+    std::memcpy(data.data(), bytes.data() + data_offset, byte_count);
+    LOG_WARN("SDCPP_BONSAI_CONDITIONING_NPY overriding Bonsai conditioning from '%s' shape=%s as tensor=[%" PRId64 ", %" PRId64 "]",
+             path,
+             sd::tensor_shape_to_string(shape).c_str(),
+             dim_count,
+             token_count);
+    return sd::Tensor<float>({dim_count, token_count}, std::move(data));
+}
+
+static std::optional<sd::Tensor<float>> load_bonsai_noise_npy(const char* path, const std::vector<int64_t>& target_shape) {
+    if (path == nullptr || path[0] == '\0') {
+        return std::nullopt;
+    }
+    if (target_shape.size() != 4) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY target latent shape must be rank 4, got %s",
+                  sd::tensor_shape_to_string(target_shape).c_str());
+        return std::nullopt;
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY could not open '%s'", path);
+        return std::nullopt;
+    }
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (bytes.size() < 16 || std::memcmp(bytes.data(), "\x93NUMPY", 6) != 0) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY is not a valid NPY file: '%s'", path);
+        return std::nullopt;
+    }
+    const uint8_t major = bytes[6];
+    size_t header_offset = 0;
+    size_t data_offset = 0;
+    size_t header_len = 0;
+    if (major == 1) {
+        uint16_t len16 = 0;
+        if (!read_le_u16(bytes, 8, &len16)) {
+            return std::nullopt;
+        }
+        header_offset = 10;
+        header_len = len16;
+    } else if (major == 2 || major == 3) {
+        uint32_t len32 = 0;
+        if (!read_le_u32(bytes, 8, &len32)) {
+            return std::nullopt;
+        }
+        header_offset = 12;
+        header_len = len32;
+    } else {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY unsupported NPY version: %u", static_cast<unsigned>(major));
+        return std::nullopt;
+    }
+    data_offset = header_offset + header_len;
+    if (data_offset > bytes.size()) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY truncated header: '%s'", path);
+        return std::nullopt;
+    }
+    const std::string header(reinterpret_cast<const char*>(bytes.data() + header_offset), header_len);
+    if (header.find("'descr': '<f4'") == std::string::npos &&
+        header.find("\"descr\": \"<f4\"") == std::string::npos &&
+        header.find("'descr': '|f4'") == std::string::npos) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY requires float32 NPY, header=%s", header.c_str());
+        return std::nullopt;
+    }
+    if (header.find("fortran_order': True") != std::string::npos ||
+        header.find("fortran_order\": true") != std::string::npos) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY requires C-order NPY, header=%s", header.c_str());
+        return std::nullopt;
+    }
+    auto shape_opt = parse_numpy_shape_header(header);
+    if (!shape_opt.has_value()) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY failed to parse shape, header=%s", header.c_str());
+        return std::nullopt;
+    }
+    const std::vector<int64_t>& shape = *shape_opt;
+    if (shape.size() != 4 || shape[0] != 1) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY expects NCHW [1,C,H,W], got %s",
+                  sd::tensor_shape_to_string(shape).c_str());
+        return std::nullopt;
+    }
+    const int64_t w = target_shape[0];
+    const int64_t h = target_shape[1];
+    const int64_t c = target_shape[2];
+    const int64_t n = target_shape[3];
+    if (n != 1 || shape[1] != c || shape[2] != h || shape[3] != w) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY shape mismatch: npy=%s target=%s",
+                  sd::tensor_shape_to_string(shape).c_str(),
+                  sd::tensor_shape_to_string(target_shape).c_str());
+        return std::nullopt;
+    }
+    const size_t element_count = static_cast<size_t>(shape[0] * shape[1] * shape[2] * shape[3]);
+    const size_t byte_count = element_count * sizeof(float);
+    if (data_offset + byte_count > bytes.size()) {
+        LOG_ERROR("SDCPP_BONSAI_NOISE_NPY truncated data: expected=%zu available=%zu path=%s",
+                  byte_count,
+                  bytes.size() - data_offset,
+                  path);
+        return std::nullopt;
+    }
+    const float* raw = reinterpret_cast<const float*>(bytes.data() + data_offset);
+    // The Flux2/Bonsai graph immediately passes the raw latent through DiT::patchify.
+    // For patch_size=1 that path expects the tensor backing store in channel-major
+    // NCHW order so the image-token stream becomes Python/Flux2Pipeline's packed
+    // [H*W, C] latent. Do not rewrite this to generic WHCN storage: it makes CPU
+    // debug dumps look superficially aligned while scrambling the transformer input.
+    std::vector<float> data(raw, raw + element_count);
+    LOG_WARN("SDCPP_BONSAI_NOISE_NPY overriding Bonsai sampler noise from '%s' npy_shape=%s target=%s",
+             path,
+             sd::tensor_shape_to_string(shape).c_str(),
+             sd::tensor_shape_to_string(target_shape).c_str());
+    return sd::Tensor<float>(target_shape, std::move(data));
+}
+
 static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_ctx_t* sd_ctx,
                                                                             const sd_img_gen_params_t* sd_img_gen_params,
                                                                             GenerationRequest* request,
@@ -7805,6 +8547,19 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     }
     if (cond.c_concat.empty()) {
         cond.c_concat = latents->concat_latent;  // TODO: optimize
+    }
+    const char* bonsai_enabled = std::getenv("SDCPP_EXPERIMENTAL_BONSAI_GEMLITE_INT1");
+    if (sd_version_is_flux2(sd_ctx->sd->version) &&
+        bonsai_enabled != nullptr && bonsai_enabled[0] != '\0' && bonsai_enabled[0] != '0') {
+        const char* override_npy = std::getenv("SDCPP_BONSAI_CONDITIONING_NPY");
+        if (override_npy != nullptr && override_npy[0] != '\0') {
+            auto override = load_bonsai_conditioning_npy(override_npy);
+            if (!override.has_value()) {
+                LOG_ERROR("SDCPP_BONSAI_CONDITIONING_NPY override failed");
+                return std::nullopt;
+            }
+            cond.c_crossattn = std::move(*override);
+        }
     }
 
     SDCondition uncond;
@@ -7902,7 +8657,7 @@ static bool sd_lora_file_is_diffusion_only_for_preencoded_conditioning(const cha
         file_path = file_path.substr(std::strlen(high_noise_tag));
     }
 
-    std::ifstream file(file_path, std::ios::binary);
+    std::ifstream file(std::filesystem::u8path(file_path), std::ios::binary);
     if (!file) {
         reason = "could not open LoRA file";
         return false;
@@ -7935,7 +8690,8 @@ static bool sd_lora_file_is_diffusion_only_for_preencoded_conditioning(const cha
     }
 
     if (!contains_token("diffusion_model.") &&
-        !contains_token("model.diffusion_model.")) {
+        !contains_token("model.diffusion_model.") &&
+        !contains_token("lora_unet_blocks_")) {
         reason = "LoRA does not look like a diffusion-model LoRA";
         return false;
     }
@@ -9092,6 +9848,99 @@ static bool sd_experimental_wan_qwen_vae_gpu_enabled() {
     return StableDiffusionGGML::env_flag_enabled("SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU");
 }
 
+static bool sd_wan_qwen_vae_gpu_decode_disabled() {
+    return StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_WAN_QWEN_VAE_GPU") ||
+           StableDiffusionGGML::env_flag_enabled("SDCPP_FORCE_WAN_QWEN_VAE_BRIDGE");
+}
+
+static bool sd_wan_qwen_vae_gpu_decode_enabled(SDVersion version) {
+    if (!(sd_version_is_qwen_image(version) || sd_version_is_anima(version)) ||
+        sd_wan_qwen_vae_gpu_decode_disabled()) {
+        return false;
+    }
+    // In Paralol's Anima/Qwen lanes, the model backend gate is the authoritative
+    // signal that this context is using the experimental all-GPU flow path. Keep
+    // the older explicit VAE env as an opt-in too, but do not require both.
+    return sd_experimental_wan_qwen_vae_gpu_enabled() ||
+           sd_experimental_flow_text_backend_enabled(version);
+}
+
+static bool sd_lens_pack_vae_latent_shape(int64_t n,
+                                          int64_t c,
+                                          int64_t h,
+                                          int64_t w,
+                                          uint64_t* input_elements,
+                                          uint64_t* output_elements) {
+    if (n != 1 || c != 32 || h <= 0 || w <= 0 || (h % 2) != 0 || (w % 2) != 0) {
+        return false;
+    }
+    constexpr uint64_t max_i64 = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    const uint64_t un = static_cast<uint64_t>(n);
+    const uint64_t uc = static_cast<uint64_t>(c);
+    const uint64_t uh = static_cast<uint64_t>(h);
+    const uint64_t uw = static_cast<uint64_t>(w);
+    if (un > max_i64 / uc || un * uc > max_i64 / uh || un * uc * uh > max_i64 / uw) {
+        return false;
+    }
+    const uint64_t in_count = un * uc * uh * uw;
+    const uint64_t out_count = un * static_cast<uint64_t>(128) * (uh / 2) * (uw / 2);
+    if (input_elements != nullptr) {
+        *input_elements = in_count;
+    }
+    if (output_elements != nullptr) {
+        *output_elements = out_count;
+    }
+    return in_count == out_count;
+}
+
+static sd::Tensor<float> sd_lens_pack_vae_latent_tensor(const sd::Tensor<float>& lens_latent) {
+    if (lens_latent.empty() || lens_latent.dim() != 4) {
+        return {};
+    }
+    const int64_t w = lens_latent.shape()[0];
+    const int64_t h = lens_latent.shape()[1];
+    const int64_t c = lens_latent.shape()[2];
+    const int64_t n = lens_latent.shape()[3];
+    uint64_t input_elements = 0;
+    uint64_t output_elements = 0;
+    if (!sd_lens_pack_vae_latent_shape(n, c, h, w, &input_elements, &output_elements) ||
+        static_cast<uint64_t>(lens_latent.numel()) != input_elements ||
+        output_elements > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return {};
+    }
+
+    sd::Tensor<float> packed({w / 2, h / 2, 128, n});
+    const float* src = lens_latent.data();
+    float* dst = packed.data();
+    for (int64_t bi = 0; bi < n; ++bi) {
+        for (int64_t ci = 0; ci < c; ++ci) {
+            for (int64_t py = 0; py < h / 2; ++py) {
+                for (int64_t px = 0; px < w / 2; ++px) {
+                    for (int64_t oy = 0; oy < 2; ++oy) {
+                        for (int64_t ox = 0; ox < 2; ++ox) {
+                            const int64_t src_x = px * 2 + ox;
+                            const int64_t src_y = py * 2 + oy;
+                            const int64_t packed_c = ci * 4 + oy * 2 + ox;
+                            const uint64_t src_idx =
+                                static_cast<uint64_t>(src_x) +
+                                static_cast<uint64_t>(w) * (static_cast<uint64_t>(src_y) +
+                                static_cast<uint64_t>(h) * (static_cast<uint64_t>(ci) +
+                                static_cast<uint64_t>(c) * static_cast<uint64_t>(bi)));
+                            const uint64_t dst_idx =
+                                static_cast<uint64_t>(px) +
+                                static_cast<uint64_t>(w / 2) * (static_cast<uint64_t>(py) +
+                                static_cast<uint64_t>(h / 2) * (static_cast<uint64_t>(packed_c) +
+                                static_cast<uint64_t>(128) * static_cast<uint64_t>(bi)));
+                            dst[dst_idx] = src[src_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return packed;
+}
+
 static bool sd_gpu_resource_is_cuda(const sd_gpu_resource_private_t& resource) {
     return resource.tensor != nullptr &&
            !resource.tensor->empty() &&
@@ -9105,6 +9954,9 @@ static uint32_t expected_diffusion_latent_channels(SDVersion version) {
     }
     if (sd_version_is_flux2(version)) {
         return 128;
+    }
+    if (sd_version_is_lens(version)) {
+        return 32;
     }
     if (sd_version_is_flux(version) ||
         sd_version_is_z_image(version) ||
@@ -9126,13 +9978,13 @@ static bool sd_model_supports_true_gpu_latent_decode(SDVersion version) {
            sd_version_is_flux(version) ||
            sd_version_is_flux2(version) ||
            sd_version_is_z_image(version) ||
-           ((sd_version_is_qwen_image(version) || sd_version_is_anima(version)) &&
-            sd_experimental_wan_qwen_vae_gpu_enabled());
+           sd_version_is_lens(version) ||
+           sd_wan_qwen_vae_gpu_decode_enabled(version);
 }
 
 static bool sd_model_uses_gpu_latent_decode_bridge(SDVersion version) {
     return (sd_version_is_qwen_image(version) || sd_version_is_anima(version)) &&
-           !sd_experimental_wan_qwen_vae_gpu_enabled();
+           !sd_wan_qwen_vae_gpu_decode_enabled(version);
 }
 
 static bool sd_model_supports_gpu_latent_decode(SDVersion version) {
@@ -9145,6 +9997,15 @@ static bool sd_gpu_latent_shape_is_supported(SDVersion version, const sd_gpu_res
         return false;
     }
     ggml_tensor* tensor = resource.tensor->tensor;
+    if (sd_version_is_lens(version)) {
+        // Public Lens sampler latents are 1x32xHxW, but the Lens VAE consumes the
+        // packed 1x128x(H/2)x(W/2) representation. sd_cpu_latent_upload performs
+        // that packing before registering the GPU resource.
+        return tensor != nullptr &&
+               tensor->type == GGML_TYPE_F32 &&
+               tensor->ne[2] == 128 &&
+               tensor->ne[3] == 1;
+    }
     const uint32_t expected_channels = expected_diffusion_latent_channels(version);
     return tensor != nullptr &&
            tensor->type == GGML_TYPE_F32 &&
@@ -9495,8 +10356,7 @@ static bool prepare_normal_vae_run(sd_ctx_t* sd_ctx,
     } else {
         sd_ctx->sd->first_stage_model->set_comfy_normal_enabled(false);
         const bool wan_qwen_gpu_vae =
-            sd_experimental_wan_qwen_vae_gpu_enabled() &&
-            (sd_version_is_qwen_image(sd_ctx->sd->version) || sd_version_is_anima(sd_ctx->sd->version));
+            sd_wan_qwen_vae_gpu_decode_enabled(sd_ctx->sd->version);
         const bool use_direct_conv = wan_qwen_gpu_vae || !sd_version_is_anima(sd_ctx->sd->version);
         sd_ctx->sd->first_stage_model->set_conv2d_direct_enabled(use_direct_conv);
         if (!use_direct_conv) {
@@ -9745,6 +10605,9 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     }
 
     int64_t t0                    = ggml_time_ms();
+    sd_ctx->last_bonsai_generation_timing = {};
+    sd_ctx->last_bonsai_generation_timing.struct_size = sizeof(sd_bonsai_generation_timing_t);
+    sd_ctx->last_bonsai_generation_timing.version = 1;
     sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
     GenerationRequest request(sd_ctx, sd_img_gen_params);
     LOG_INFO("generate_image %dx%d", request.width, request.height);
@@ -9756,6 +10619,9 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
 
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
+    const bool profile_bonsai = profile_bonsai_generation_enabled();
+    const bool profile_range = bonsai_profile_range_enabled();
+    int64_t latent_prepare_start = ggml_time_ms();
     SamplePlan plan(sd_ctx, sd_img_gen_params, request);
     auto latents_opt = prepare_image_generation_latents(sd_ctx,
                                                         sd_img_gen_params,
@@ -9765,19 +10631,40 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         return nullptr;
     }
     ImageGenerationLatents latents = std::move(*latents_opt);
+    int64_t latent_prepare_end = ggml_time_ms();
+    if (profile_bonsai) {
+        LOG_INFO("[BonsaiTiming] latent_prepare_ms=%" PRId64, latent_prepare_end - latent_prepare_start);
+    }
+    sd_ctx->last_bonsai_generation_timing.latent_prepare_ms = static_cast<double>(latent_prepare_end - latent_prepare_start);
 
-    auto embeds_opt = prepare_image_generation_embeds(sd_ctx,
-                                                      sd_img_gen_params,
-                                                      &request,
-                                                      &plan,
-                                                      &latents);
+    int64_t text_encode_start = ggml_time_ms();
+    std::optional<ImageGenerationEmbeds> embeds_opt;
+    {
+        ScopedBonsaiProfileRange text_profile("bonsai.text_encode", profile_range);
+        embeds_opt = prepare_image_generation_embeds(sd_ctx,
+                                                     sd_img_gen_params,
+                                                     &request,
+                                                     &plan,
+                                                     &latents);
+    }
     if (!embeds_opt.has_value()) {
         return nullptr;
     }
     ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+    int64_t text_encode_end = ggml_time_ms();
+    if (profile_bonsai) {
+        LOG_INFO("[BonsaiTiming] text_encode_ms=%" PRId64, text_encode_end - text_encode_start);
+    }
+    sd_ctx->last_bonsai_generation_timing.text_encode_ms = static_cast<double>(text_encode_end - text_encode_start);
+    log_tensor_stats_for_parity("[SamplerParity]", "generate_image_cond_crossattn", embeds.cond.c_crossattn);
+    log_tensor_stats_for_parity("[SamplerParity]", "generate_image_cond_vector", embeds.cond.c_vector);
+    log_tensor_stats_for_parity("[SamplerParity]", "generate_image_uncond_crossattn", embeds.uncond.c_crossattn);
+    log_tensor_stats_for_parity("[SamplerParity]", "generate_image_uncond_vector", embeds.uncond.c_vector);
 
     std::vector<sd::Tensor<float>> final_latents;
     int64_t denoise_start = ggml_time_ms();
+    {
+    ScopedBonsaiProfileRange denoise_profile_range("bonsai.denoise", profile_range, true);
     for (int b = 0; b < request.batch_count; b++) {
         int64_t sampling_start = ggml_time_ms();
         int64_t cur_seed       = request.seed + b;
@@ -9786,6 +10673,16 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         sd_ctx->sd->rng->manual_seed(cur_seed);
         sd_ctx->sd->sampler_rng->manual_seed(cur_seed);
         sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd_ctx->sd->rng);
+        const char* bonsai_noise_npy = std::getenv("SDCPP_BONSAI_NOISE_NPY");
+        if (sd_version_is_flux2(sd_ctx->sd->version) &&
+            bonsai_noise_npy != nullptr && bonsai_noise_npy[0] != '\0') {
+            auto override_noise = load_bonsai_noise_npy(bonsai_noise_npy, noise.shape());
+            if (!override_noise.has_value()) {
+                LOG_ERROR("SDCPP_BONSAI_NOISE_NPY override failed");
+                return nullptr;
+            }
+            noise = std::move(*override_noise);
+        }
 
         sd::Tensor<float> x_0 = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
                                                    true,
@@ -9829,17 +10726,36 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         }
         return nullptr;
     }
+    }
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
     int64_t denoise_end = ggml_time_ms();
+    sd_ctx->last_bonsai_generation_timing.transformer_denoise_ms = static_cast<double>(denoise_end - denoise_start);
     LOG_INFO("generating %" PRId64 " latent images completed, taking %.2fs",
              final_latents.size(),
              (denoise_end - denoise_start) * 1.0f / 1000);
 
-    auto result = decode_image_outputs(sd_ctx, request, final_latents);
+    int64_t vae_decode_start = ggml_time_ms();
+    sd_image_t* result = nullptr;
+    {
+        ScopedBonsaiProfileRange vae_profile("bonsai.vae_decode", profile_range);
+        result = decode_image_outputs(sd_ctx, request, final_latents);
+    }
+    int64_t vae_decode_end = ggml_time_ms();
     if (result == nullptr) {
         return nullptr;
+    }
+    sd_ctx->last_bonsai_generation_timing.vae_decode_ms = static_cast<double>(vae_decode_end - vae_decode_start);
+    sd_ctx->last_bonsai_generation_timing.total_without_png_ms = static_cast<double>(vae_decode_end - t0);
+    if (profile_bonsai) {
+        LOG_INFO("[BonsaiTiming] transformer_denoise_ms=%" PRId64
+                 " vae_decode_ms=%" PRId64
+                 " total_without_png_ms=%" PRId64
+                 " includes_model_load=false",
+                 denoise_end - denoise_start,
+                 vae_decode_end - vae_decode_start,
+                 vae_decode_end - t0);
     }
 
     sd_ctx->sd->lora_stat();
@@ -9847,6 +10763,17 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     int64_t t1 = ggml_time_ms();
     LOG_INFO("generate_image completed in %.2fs", (t1 - t0) * 1.0f / 1000);
     return result;
+}
+
+SD_API bool sd_bonsai_get_last_generation_timing(sd_ctx_t* sd_ctx, sd_bonsai_generation_timing_t* out_timing) {
+    if (sd_ctx == nullptr || out_timing == nullptr || out_timing->struct_size < sizeof(sd_bonsai_generation_timing_t)) {
+        return false;
+    }
+    sd_bonsai_generation_timing_t timing = sd_ctx->last_bonsai_generation_timing;
+    timing.struct_size = sizeof(sd_bonsai_generation_timing_t);
+    timing.version = 1;
+    *out_timing = timing;
+    return true;
 }
 
 SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
@@ -10691,6 +11618,119 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
                  text_encoder_release_ms);
     }
 
+    SDCondition sampler_cond = embeds.cond;
+    SDCondition sampler_uncond = embeds.uncond;
+    std::unique_ptr<GgmlBackendTensorResource> anima_positive_preprocessed_context;
+    std::unique_ptr<GgmlBackendTensorResource> anima_negative_preprocessed_context;
+    const GgmlBackendTensorResource* sampler_positive_crossattn_backend =
+        positive_condition_resource != nullptr ? positive_condition_resource->crossattn_backend.get() : nullptr;
+    const GgmlBackendTensorResource* sampler_positive_vector_backend =
+        positive_condition_resource != nullptr ? positive_condition_resource->vector_backend.get() : nullptr;
+    const GgmlBackendTensorResource* sampler_positive_t5_ids_backend =
+        positive_condition_resource != nullptr ? positive_condition_resource->t5_ids_backend.get() : nullptr;
+    const GgmlBackendTensorResource* sampler_positive_t5_weights_backend =
+        positive_condition_resource != nullptr ? positive_condition_resource->t5_weights_backend.get() : nullptr;
+    const GgmlBackendTensorResource* sampler_negative_crossattn_backend =
+        negative_condition_resource != nullptr ? negative_condition_resource->crossattn_backend.get() : nullptr;
+    const GgmlBackendTensorResource* sampler_negative_vector_backend =
+        negative_condition_resource != nullptr ? negative_condition_resource->vector_backend.get() : nullptr;
+    const GgmlBackendTensorResource* sampler_negative_t5_ids_backend =
+        negative_condition_resource != nullptr ? negative_condition_resource->t5_ids_backend.get() : nullptr;
+    const GgmlBackendTensorResource* sampler_negative_t5_weights_backend =
+        negative_condition_resource != nullptr ? negative_condition_resource->t5_weights_backend.get() : nullptr;
+    int64_t anima_precompute_t5_ms = 0;
+    bool anima_precomputed_t5 = false;
+    const bool sampler_positive_has_t5 =
+        !sampler_cond.c_t5_ids.empty() || sampler_positive_t5_ids_backend != nullptr;
+    const bool sampler_negative_has_t5 =
+        !sampler_uncond.c_t5_ids.empty() || sampler_negative_t5_ids_backend != nullptr;
+    if (sd_version_is_anima(sd_ctx->sd->version) &&
+        !StableDiffusionGGML::env_flag_enabled("SDCPP_DISABLE_ANIMA_PRECOMPUTED_T5") &&
+        (sampler_positive_has_t5 || sampler_negative_has_t5)) {
+        auto anima_model = std::dynamic_pointer_cast<AnimaModel>(sd_ctx->sd->diffusion_model);
+        if (anima_model == nullptr) {
+            LOG_ERROR("%s Anima T5 precompute requested but diffusion model is not AnimaModel", name);
+            return false;
+        }
+
+        auto normalize_preprocessed_context = [](sd::Tensor<float> tensor) -> sd::Tensor<float> {
+            while (!tensor.empty() && tensor.dim() > 3 && tensor.shape().back() == 1) {
+                tensor.squeeze_(static_cast<size_t>(tensor.dim() - 1));
+            }
+            return tensor;
+        };
+
+        auto preprocess_condition = [&](SDCondition& condition,
+                                        const char* label,
+                                        const GgmlBackendTensorResource* context_backend,
+                                        const GgmlBackendTensorResource* t5_ids_backend,
+                                        const GgmlBackendTensorResource* t5_weights_backend,
+                                        std::unique_ptr<GgmlBackendTensorResource>* out_context_backend,
+                                        const GgmlBackendTensorResource** sampler_context_backend,
+                                        const GgmlBackendTensorResource** sampler_t5_ids_backend,
+                                        const GgmlBackendTensorResource** sampler_t5_weights_backend) -> bool {
+            if (condition.c_t5_ids.empty() && t5_ids_backend == nullptr) {
+                return true;
+            }
+            const int64_t t_pre0 = ggml_time_ms();
+            auto preprocessed = anima_model->preprocess_text_embeds_to_backend_resource(sd_ctx->sd->n_threads,
+                                                                                        condition.c_crossattn,
+                                                                                        context_backend,
+                                                                                        condition.c_t5_ids,
+                                                                                        t5_ids_backend,
+                                                                                        condition.c_t5_weights,
+                                                                                        t5_weights_backend);
+            const int64_t t_pre1 = ggml_time_ms();
+            anima_precompute_t5_ms += t_pre1 - t_pre0;
+            if (preprocessed == nullptr || preprocessed->empty()) {
+                LOG_ERROR("%s failed Anima %s T5 adapter precompute", name, label != nullptr ? label : "condition");
+                return false;
+            }
+            sd::Tensor<float> preprocessed_host = normalize_preprocessed_context(sd::make_sd_tensor_from_ggml<float>(preprocessed->tensor));
+            if (preprocessed_host.empty()) {
+                LOG_ERROR("%s failed to materialize Anima %s preprocessed context", name, label != nullptr ? label : "condition");
+                return false;
+            }
+            condition.c_crossattn = std::move(preprocessed_host);
+            condition.c_t5_ids = {};
+            condition.c_t5_weights = {};
+            *sampler_context_backend = preprocessed.get();
+            *sampler_t5_ids_backend = nullptr;
+            *sampler_t5_weights_backend = nullptr;
+            *out_context_backend = std::move(preprocessed);
+            LOG_INFO("%s Anima %s T5 adapter precomputed once for sampler: context_shape=%s precompute_ms=%" PRId64,
+                     name,
+                     label != nullptr ? label : "condition",
+                     sd::tensor_shape_to_string(condition.c_crossattn.shape()).c_str(),
+                     t_pre1 - t_pre0);
+            return true;
+        };
+
+        if (!preprocess_condition(sampler_cond,
+                                  "positive",
+                                  sampler_positive_crossattn_backend,
+                                  sampler_positive_t5_ids_backend,
+                                  sampler_positive_t5_weights_backend,
+                                  &anima_positive_preprocessed_context,
+                                  &sampler_positive_crossattn_backend,
+                                  &sampler_positive_t5_ids_backend,
+                                  &sampler_positive_t5_weights_backend)) {
+            return false;
+        }
+        if (!preprocess_condition(sampler_uncond,
+                                  "negative",
+                                  sampler_negative_crossattn_backend,
+                                  sampler_negative_t5_ids_backend,
+                                  sampler_negative_t5_weights_backend,
+                                  &anima_negative_preprocessed_context,
+                                  &sampler_negative_crossattn_backend,
+                                  &sampler_negative_t5_ids_backend,
+                                  &sampler_negative_t5_weights_backend)) {
+            return false;
+        }
+        anima_precomputed_t5 = true;
+    }
+
     int64_t init_start = ggml_time_ms();
     LatentBackendGraphRunner latent_runner(sd_ctx->sd->backend);
     std::vector<int64_t> latent_shape;
@@ -10801,16 +11841,16 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
                                                               sd_ctx->sd->diffusion_model,
                                                               plan.sample_method,
                                                               std::move(x_resource),
-                                                              embeds.cond,
-                                                              positive_condition_resource != nullptr ? positive_condition_resource->crossattn_backend.get() : nullptr,
-                                                              positive_condition_resource != nullptr ? positive_condition_resource->vector_backend.get() : nullptr,
-                                                              positive_condition_resource != nullptr ? positive_condition_resource->t5_ids_backend.get() : nullptr,
-                                                              positive_condition_resource != nullptr ? positive_condition_resource->t5_weights_backend.get() : nullptr,
-                                                              embeds.uncond,
-                                                              negative_condition_resource != nullptr ? negative_condition_resource->crossattn_backend.get() : nullptr,
-                                                              negative_condition_resource != nullptr ? negative_condition_resource->vector_backend.get() : nullptr,
-                                                              negative_condition_resource != nullptr ? negative_condition_resource->t5_ids_backend.get() : nullptr,
-                                                              negative_condition_resource != nullptr ? negative_condition_resource->t5_weights_backend.get() : nullptr,
+                                                              sampler_cond,
+                                                              sampler_positive_crossattn_backend,
+                                                              sampler_positive_vector_backend,
+                                                              sampler_positive_t5_ids_backend,
+                                                              sampler_positive_t5_weights_backend,
+                                                              sampler_uncond,
+                                                              sampler_negative_crossattn_backend,
+                                                              sampler_negative_vector_backend,
+                                                              sampler_negative_t5_ids_backend,
+                                                              sampler_negative_t5_weights_backend,
                                                               request.guidance,
                                                               request.seed,
                                                               plan.eta,
@@ -10850,7 +11890,7 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
     *out_gpu_latent = handle;
     int64_t t1 = ggml_time_ms();
     const std::string latent_shape_text = sd::tensor_shape_to_string(latent_shape);
-    LOG_INFO("[Timing] %s latent_prepare_ms=%" PRId64 " ref_latent_backend_upload_ms=%" PRId64 " ref_latents=%zu ref_latents_backend=%s ref_latents_per_step_upload=false %s_ms=%" PRId64 " text_encoder_release_ms=%" PRId64 " text_encoder_released_before_diffusion=%s init_backend_ms=%" PRId64 " denoise_ms=%" PRId64 " total_ms=%" PRId64 " sampler_math_residency=gpu_backend_tensor init_latent=%s init_bridge_download=false initial_noise=%s noise_backend=%s noise_seed=%" PRId64 " noise_shape=%s initial_noise_bridge_upload=%s output_bridge_upload=false condition_input=%s conditioning_storage=%s conditioning_per_step_upload=%s strict_gpu_resident_exception=%s",
+    LOG_INFO("[Timing] %s latent_prepare_ms=%" PRId64 " ref_latent_backend_upload_ms=%" PRId64 " ref_latents=%zu ref_latents_backend=%s ref_latents_per_step_upload=false %s_ms=%" PRId64 " text_encoder_release_ms=%" PRId64 " text_encoder_released_before_diffusion=%s anima_t5_precomputed=%s anima_t5_precompute_ms=%" PRId64 " init_backend_ms=%" PRId64 " denoise_ms=%" PRId64 " total_ms=%" PRId64 " sampler_math_residency=gpu_backend_tensor init_latent=%s init_bridge_download=false initial_noise=%s noise_backend=%s noise_seed=%" PRId64 " noise_shape=%s initial_noise_bridge_upload=%s output_bridge_upload=false condition_input=%s conditioning_storage=%s conditioning_per_step_upload=%s strict_gpu_resident_exception=%s",
              name,
              latent_prepare_end - latent_prepare_start,
              ref_latent_backend_upload_ms,
@@ -10860,6 +11900,8 @@ static bool sd_sample_latent_gpu_euler_backend_true(sd_ctx_t* sd_ctx,
              condition_end - condition_start,
              text_encoder_release_ms,
              text_encoder_released ? "true" : "false",
+             anima_precomputed_t5 ? "true" : "false",
+             anima_precompute_t5_ms,
              init_end - init_start,
              sampling_end - sampling_start,
              t1 - t0,
@@ -11491,7 +12533,15 @@ SD_API sd_image_t* sd_decode_latent(sd_ctx_t* sd_ctx,
     }
 
     int64_t t0              = ggml_time_ms();
-    sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(*tensor);
+    sd::Tensor<float> decode_input = *tensor;
+    if (sd_version_is_lens(sd_ctx->sd->version)) {
+        decode_input = sd_lens_pack_vae_latent_tensor(*tensor);
+        if (decode_input.empty()) {
+            LOG_ERROR("sd_decode_latent Lens path expected a batch-1 32-channel latent with even spatial dimensions");
+            return nullptr;
+        }
+    }
+    sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(decode_input);
     int64_t t1              = ggml_time_ms();
     if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
         sd_ctx->sd->first_stage_model->free_params_buffer();
@@ -11569,7 +12619,15 @@ SD_API sd_image_t* sd_decode_latent_normal(sd_ctx_t* sd_ctx,
             return nullptr;
         }
         int64_t t0 = ggml_time_ms();
-        sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(*tensor);
+        sd::Tensor<float> decode_input = *tensor;
+        if (sd_version_is_lens(sd_ctx->sd->version)) {
+            decode_input = sd_lens_pack_vae_latent_tensor(*tensor);
+            if (decode_input.empty()) {
+                LOG_ERROR("sd_decode_latent_normal Lens compatibility fallback expected a batch-1 32-channel latent with even spatial dimensions");
+                return nullptr;
+            }
+        }
+        sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(decode_input);
         int64_t t1 = ggml_time_ms();
         if (sd_ctx->sd->free_params_immediately && sd_ctx->sd->first_stage_model != nullptr) {
             sd_ctx->sd->first_stage_model->free_params_buffer();
@@ -11924,6 +12982,9 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
     capabilities->supports_qwen_image_qwen_conditioning_gpu_resident =
         capabilities->supports_qwen_image_qwen_conditioning &&
         capabilities->supports_conditioning_gpu_resident;
+    capabilities->supports_lens_text_conditioning = sd_ctx == nullptr || sd_ctx->lens_conditioning_only || sd_ctx->sd == nullptr;
+    capabilities->supports_lens_conditioning_handles = sd_ctx != nullptr;
+    capabilities->supports_lens_conditioning_gpu_resident = false;
     capabilities->supports_conditioning_per_step_upload_fallback =
         capabilities->supports_conditioning_handles &&
         !capabilities->supports_conditioning_gpu_resident;
@@ -11961,6 +13022,9 @@ static sd_model_family_t sd_model_family_from_version(SDVersion version) {
     if (sd_version_is_anima(version)) {
         return SD_MODEL_FAMILY_ANIMA;
     }
+    if (sd_version_is_lens(version)) {
+        return SD_MODEL_FAMILY_LENS;
+    }
     if (sd_version_is_marigold_iid(version)) {
         return SD_MODEL_FAMILY_MARIGOLD_IID;
     }
@@ -11989,6 +13053,8 @@ static const char* sd_model_family_name(sd_model_family_t family) {
             return "qwen_image";
         case SD_MODEL_FAMILY_ANIMA:
             return "anima";
+        case SD_MODEL_FAMILY_LENS:
+            return "lens";
         case SD_MODEL_FAMILY_MARIGOLD_IID:
             return "marigold_iid";
         case SD_MODEL_FAMILY_UNKNOWN:
@@ -12036,6 +13102,34 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
     capabilities->strict_gpu_sample_is_true_resident = false;
 
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        if (sd_ctx != nullptr && sd_ctx->lens_conditioning_only) {
+            capabilities->family = SD_MODEL_FAMILY_LENS;
+            std::snprintf(capabilities->family_name,
+                          sizeof(capabilities->family_name),
+                          "%s",
+                          sd_model_family_name(capabilities->family));
+            capabilities->latent_channels = 32;
+            capabilities->default_cfg_scale = 1.0f;
+            capabilities->default_steps = 4;
+            capabilities->supports_text_to_image = true;
+            capabilities->supports_image_to_image = false;
+            capabilities->supports_vae_encode = false;
+            capabilities->supports_lens_model_load = true;
+            capabilities->supports_lens_text_conditioning = true;
+            capabilities->supports_lens_conditioning_handles = true;
+            capabilities->supports_lens_conditioning_gpu_resident = false;
+            capabilities->supports_lens_flow_sampler = true;
+            capabilities->supports_lens_gpu_latent_output = false;
+            capabilities->supports_lens_vae_decode_gpu = false;
+            capabilities->supports_lens_external_flow_replay = true;
+            capabilities->supports_lens_speed_mode_bf16_resident = true;
+            capabilities->supports_lens_i2i = false;
+            capabilities->supports_lens_controlnet = false;
+            capabilities->supports_lens_masks = false;
+            capabilities->supports_lens_reference = false;
+            capabilities->supports_lens_edit = false;
+            capabilities->supports_lens_multibatch = false;
+        }
         return true;
     }
 
@@ -12173,6 +13267,41 @@ SD_API bool sd_get_model_pipeline_capabilities(sd_ctx_t* sd_ctx, sd_model_pipeli
     }
     if (sd_version_is_anima(version)) {
         capabilities->supports_anima_vae_decode_bridge = capabilities->supports_gpu_latent_decode_bridge;
+    }
+    if (sd_version_is_lens(version)) {
+        capabilities->default_cfg_scale = 1.0f;
+        capabilities->default_steps = 4;
+        capabilities->latent_channels = 32;
+        capabilities->supports_text_to_image = true;
+        capabilities->supports_image_to_image = false;
+        capabilities->supports_gpu_sample_bridge_output = false;
+        capabilities->supports_gpu_latent_decode = true;
+        capabilities->supports_gpu_image_output = true;
+        capabilities->supports_gpu_latent_decode_bridge = false;
+        capabilities->supports_gpu_image_output_bridge = false;
+        capabilities->supports_vae_encode = false;
+        capabilities->supports_flux2_vae_decode_gpu = false;
+        capabilities->supports_flux2_vae_bf16_or_compact_storage = false;
+        capabilities->supports_vae_encode_gpu_output = false;
+        capabilities->supports_reference_images = false;
+        capabilities->supports_edit_mode = false;
+        capabilities->supports_edit_reference_conditioning = false;
+        capabilities->supports_comfy_reference_vae_encode = false;
+        capabilities->supports_lens_model_load = true;
+        capabilities->supports_lens_text_conditioning = true;
+        capabilities->supports_lens_conditioning_handles = true;
+        capabilities->supports_lens_conditioning_gpu_resident = false;
+        capabilities->supports_lens_flow_sampler = true;
+        capabilities->supports_lens_gpu_latent_output = false;
+        capabilities->supports_lens_vae_decode_gpu = true;
+        capabilities->supports_lens_external_flow_replay = true;
+        capabilities->supports_lens_speed_mode_bf16_resident = true;
+        capabilities->supports_lens_i2i = false;
+        capabilities->supports_lens_controlnet = false;
+        capabilities->supports_lens_masks = false;
+        capabilities->supports_lens_reference = false;
+        capabilities->supports_lens_edit = false;
+        capabilities->supports_lens_multibatch = false;
     }
     if (sd_version_is_marigold_iid(version)) {
         capabilities->latent_channels = 8;
@@ -12470,6 +13599,2514 @@ SD_API bool sd_gpu_tensor_download(sd_ctx_t* sd_ctx,
     return true;
 }
 
+static constexpr int SD_LENS_CONDITIONING_FEATURE_COUNT = 4;
+static constexpr int SD_LENS_CONDITIONING_TENSOR_COUNT = 5;
+
+static const std::array<const char*, SD_LENS_CONDITIONING_TENSOR_COUNT>& sd_lens_conditioning_tensor_names() {
+    static const std::array<const char*, SD_LENS_CONDITIONING_TENSOR_COUNT> names = {
+        "feature_0",
+        "feature_1",
+        "feature_2",
+        "feature_3",
+        "attention_mask",
+    };
+    return names;
+}
+
+static void sd_lens_hash_combine(uint64_t& hash, uint64_t value) {
+    hash ^= value;
+    hash *= 1099511628211ull;
+}
+
+static uint64_t sd_lens_hash_init() {
+    return 1469598103934665603ull;
+}
+
+static bool sd_lens_dtype_from_ggml(ggml_type type, sd_tensor_dtype_t* out_dtype) {
+    if (out_dtype == nullptr) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_F32:
+            *out_dtype = SD_DTYPE_F32;
+            return true;
+        case GGML_TYPE_F16:
+            *out_dtype = SD_DTYPE_F16;
+            return true;
+        case GGML_TYPE_BF16:
+            *out_dtype = SD_DTYPE_BF16;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool sd_lens_expected_dtype_matches(sd_tensor_dtype_t expected, sd_tensor_dtype_t actual) {
+    switch (expected) {
+        case SD_DTYPE_F32:
+        case SD_DTYPE_F16:
+        case SD_DTYPE_BF16:
+            return expected == actual;
+        default:
+            return false;
+    }
+}
+
+static std::unique_ptr<GgmlBackendTensorResource> sd_lens_alloc_cpu_tensor(const TensorStorage& storage) {
+    auto resource = std::make_unique<GgmlBackendTensorResource>();
+    ggml_init_params params;
+    params.mem_size = static_cast<size_t>(2 * ggml_tensor_overhead());
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    resource->ctx = ggml_init(params);
+    if (resource->ctx == nullptr) {
+        return nullptr;
+    }
+    resource->tensor = ggml_new_tensor(resource->ctx, storage.type, storage.n_dims, storage.ne);
+    if (resource->tensor == nullptr) {
+        return nullptr;
+    }
+    ggml_set_name(resource->tensor, storage.name.c_str());
+    resource->buffer = ggml_backend_alloc_ctx_tensors_from_buft(resource->ctx, ggml_backend_cpu_buffer_type());
+    if (resource->buffer == nullptr || resource->tensor->data == nullptr) {
+        return nullptr;
+    }
+    return resource;
+}
+
+static bool sd_lens_feature_logical_shape(const TensorStorage& storage,
+                                          int64_t* out_batch,
+                                          int64_t* out_seq_len,
+                                          int64_t* out_hidden) {
+    if (out_batch == nullptr || out_seq_len == nullptr || out_hidden == nullptr) {
+        return false;
+    }
+    if (storage.n_dims < 2 || storage.n_dims > 4) {
+        return false;
+    }
+    if (storage.n_dims == 4 && storage.ne[3] != 1) {
+        return false;
+    }
+    const int64_t hidden = storage.ne[0];
+    const int64_t seq_len = storage.ne[1];
+    const int64_t batch = storage.n_dims >= 3 ? storage.ne[2] : 1;
+    if (batch <= 0 || seq_len <= 0 || hidden <= 0) {
+        return false;
+    }
+    *out_batch = batch;
+    *out_seq_len = seq_len;
+    *out_hidden = hidden;
+    return true;
+}
+
+static bool sd_lens_mask_shape_matches(const TensorStorage& storage, int64_t batch, int64_t seq_len, int64_t out_shape[4]) {
+    if (out_shape == nullptr || storage.n_dims < 1 || storage.n_dims > 4) {
+        return false;
+    }
+    const int64_t mask_seq = storage.ne[0];
+    const int64_t mask_batch = storage.n_dims >= 2 ? storage.ne[1] : 1;
+    const int64_t dim2 = storage.n_dims >= 3 ? storage.ne[2] : 1;
+    const int64_t dim3 = storage.n_dims >= 4 ? storage.ne[3] : 1;
+    if (mask_batch != batch || mask_seq != seq_len || dim2 != 1 || dim3 != 1) {
+        return false;
+    }
+    out_shape[0] = batch;
+    out_shape[1] = seq_len;
+    out_shape[2] = 1;
+    out_shape[3] = 1;
+    return true;
+}
+
+static bool sd_lens_mask_dtype_supported(ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_I32;
+}
+
+static std::shared_ptr<sd_lens_conditioning_resource_private_t> sd_lens_conditioning_lookup(sd_ctx_t* sd_ctx,
+                                                                                            sd_lens_conditioning_handle_t handle) {
+    if (sd_ctx == nullptr || handle == 0) {
+        return nullptr;
+    }
+    auto it = sd_ctx->lens_conditioning_resources.find(handle);
+    if (it == sd_ctx->lens_conditioning_resources.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+static bool sd_lens_conditioning_fill_desc(const sd_lens_conditioning_resource_private_t& resource,
+                                           sd_lens_conditioning_desc_t* desc) {
+    if (desc == nullptr) {
+        return false;
+    }
+    *desc = {};
+    desc->struct_size = sizeof(sd_lens_conditioning_desc_t);
+    desc->version = SD_VAE_API_VERSION;
+    desc->handle = resource.handle;
+    desc->flags = resource.flags;
+    desc->refcount = resource.refcount;
+    desc->schema_version = resource.schema_version;
+    desc->tensor_count = resource.tensor_count;
+    desc->batch = resource.batch;
+    desc->seq_len = resource.seq_len;
+    desc->hidden_size = resource.hidden_size;
+    desc->selected_layer_count = resource.selected_layer_count;
+    for (int i = 0; i < SD_LENS_CONDITIONING_FEATURE_COUNT; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            desc->feature_shapes[i][j] = resource.feature_shapes[i][j];
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        desc->mask_shape[i] = resource.mask_shape[i];
+    }
+    desc->dtype = resource.dtype;
+    desc->storage_flags = resource.storage_flags;
+    desc->backend = resource.backend;
+    desc->estimated_bytes = resource.estimated_bytes;
+    desc->shape_hash = resource.shape_hash;
+    desc->dtype_hash = resource.dtype_hash;
+    desc->config_hash = resource.config_hash;
+    desc->device_resident = resource.device_resident;
+    desc->copy_safe = resource.copy_safe;
+    std::snprintf(desc->debug_name, sizeof(desc->debug_name), "%s", resource.debug_name.c_str());
+    return true;
+}
+
+SD_API void sd_lens_conditioning_options_init(sd_lens_conditioning_options_t* options) {
+    if (options == nullptr) {
+        return;
+    }
+    *options = {};
+    options->struct_size = sizeof(sd_lens_conditioning_options_t);
+    options->version = SD_VAE_API_VERSION;
+    options->expected_schema_version = 1;
+    options->expected_batch = 1;
+    options->expected_seq_len = -1;
+    options->expected_hidden_size = -1;
+    options->expected_selected_layer_count = -1;
+    options->expected_tensor_count = 5;
+    options->expected_dtype = SD_DTYPE_F32;
+    options->expected_storage_flags = 0;
+    options->expected_shape_hash = 0;
+    options->expected_dtype_hash = 0;
+    options->expected_config_hash = 0;
+}
+
+SD_API void sd_lens_conditioning_desc_init(sd_lens_conditioning_desc_t* desc) {
+    if (desc == nullptr) {
+        return;
+    }
+    *desc = {};
+    desc->struct_size = sizeof(sd_lens_conditioning_desc_t);
+    desc->version = SD_VAE_API_VERSION;
+}
+
+SD_API bool sd_lens_conditioning_load(sd_ctx_t* sd_ctx,
+                                      const char* file_path,
+                                      const sd_lens_conditioning_options_t* options,
+                                      sd_lens_conditioning_handle_t* out_handle,
+                                      sd_lens_conditioning_desc_t* out_desc) {
+    if (out_handle != nullptr) {
+        *out_handle = 0;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_conditioning_desc_init(out_desc);
+    }
+    if (sd_ctx == nullptr) {
+        LOG_ERROR("sd_lens_conditioning_load requires a valid context");
+        return false;
+    }
+    if (file_path == nullptr || file_path[0] == '\0') {
+        LOG_ERROR("sd_lens_conditioning_load requires a non-empty lens_cond_v1 file path");
+        return false;
+    }
+
+    sd_lens_conditioning_options_t resolved_options;
+    if (options != nullptr) {
+        resolved_options = *options;
+    } else {
+        sd_lens_conditioning_options_init(&resolved_options);
+    }
+    if (resolved_options.expected_schema_version != 0 && resolved_options.expected_schema_version != 1) {
+        LOG_ERROR("sd_lens_conditioning_load expected schema version %u is not supported", resolved_options.expected_schema_version);
+        return false;
+    }
+    if (resolved_options.expected_tensor_count > 0 &&
+        resolved_options.expected_tensor_count != SD_LENS_CONDITIONING_TENSOR_COUNT) {
+        LOG_ERROR("sd_lens_conditioning_load expected tensor count %" PRId64 " does not match lens_cond_v1 count %d",
+                  resolved_options.expected_tensor_count,
+                  SD_LENS_CONDITIONING_TENSOR_COUNT);
+        return false;
+    }
+    if (resolved_options.expected_selected_layer_count > 0 &&
+        resolved_options.expected_selected_layer_count != SD_LENS_CONDITIONING_FEATURE_COUNT) {
+        LOG_ERROR("sd_lens_conditioning_load expected selected layer count %" PRId64 " does not match lens_cond_v1 count %d",
+                  resolved_options.expected_selected_layer_count,
+                  SD_LENS_CONDITIONING_FEATURE_COUNT);
+        return false;
+    }
+    if ((resolved_options.expected_storage_flags & ~static_cast<uint32_t>(SD_LENS_COND_STORAGE_FLAG_CPU)) != 0) {
+        LOG_ERROR("sd_lens_conditioning_load currently supports CPU-resident Lens conditioning only");
+        return false;
+    }
+
+    ModelLoader loader;
+    if (!loader.init_from_file(file_path)) {
+        LOG_ERROR("sd_lens_conditioning_load failed to inspect lens conditioning file '%s'", file_path);
+        return false;
+    }
+
+    auto& storage_map = loader.get_tensor_storage_map();
+    if (storage_map.size() != SD_LENS_CONDITIONING_TENSOR_COUNT) {
+        LOG_ERROR("sd_lens_conditioning_load expected exactly %d tensors in '%s', found %zu",
+                  SD_LENS_CONDITIONING_TENSOR_COUNT,
+                  file_path,
+                  storage_map.size());
+        return false;
+    }
+
+    std::array<TensorStorage, SD_LENS_CONDITIONING_TENSOR_COUNT> storages;
+    const auto& tensor_names = sd_lens_conditioning_tensor_names();
+    for (int i = 0; i < SD_LENS_CONDITIONING_TENSOR_COUNT; ++i) {
+        auto it = storage_map.find(tensor_names[i]);
+        if (it == storage_map.end()) {
+            LOG_ERROR("sd_lens_conditioning_load missing required tensor '%s' in '%s'", tensor_names[i], file_path);
+            return false;
+        }
+        storages[i] = it->second;
+    }
+
+    sd_tensor_dtype_t feature_dtype = SD_DTYPE_F32;
+    if (!sd_lens_dtype_from_ggml(storages[0].type, &feature_dtype)) {
+        LOG_ERROR("sd_lens_conditioning_load feature_0 has unsupported dtype '%s'", ggml_type_name(storages[0].type));
+        return false;
+    }
+    if (!sd_lens_expected_dtype_matches(resolved_options.expected_dtype, feature_dtype)) {
+        LOG_ERROR("sd_lens_conditioning_load feature dtype '%s' does not match expected dtype %d",
+                  ggml_type_name(storages[0].type),
+                  static_cast<int>(resolved_options.expected_dtype));
+        return false;
+    }
+
+    int64_t batch = 0;
+    int64_t seq_len = 0;
+    int64_t hidden = 0;
+    int64_t feature_shapes[SD_LENS_CONDITIONING_FEATURE_COUNT][4] = {};
+    for (int i = 0; i < SD_LENS_CONDITIONING_FEATURE_COUNT; ++i) {
+        sd_tensor_dtype_t current_dtype = SD_DTYPE_F32;
+        if (!sd_lens_dtype_from_ggml(storages[i].type, &current_dtype) || current_dtype != feature_dtype) {
+            LOG_ERROR("sd_lens_conditioning_load tensor '%s' dtype '%s' does not match feature_0",
+                      tensor_names[i],
+                      ggml_type_name(storages[i].type));
+            return false;
+        }
+        int64_t current_batch = 0;
+        int64_t current_seq_len = 0;
+        int64_t current_hidden = 0;
+        if (!sd_lens_feature_logical_shape(storages[i], &current_batch, &current_seq_len, &current_hidden)) {
+            LOG_ERROR("sd_lens_conditioning_load tensor '%s' has unsupported feature shape %s",
+                      tensor_names[i],
+                      storages[i].to_string().c_str());
+            return false;
+        }
+        if (i == 0) {
+            batch = current_batch;
+            seq_len = current_seq_len;
+            hidden = current_hidden;
+        } else if (current_batch != batch || current_seq_len != seq_len || current_hidden != hidden) {
+            LOG_ERROR("sd_lens_conditioning_load tensor '%s' shape does not match feature_0", tensor_names[i]);
+            return false;
+        }
+        feature_shapes[i][0] = current_batch;
+        feature_shapes[i][1] = current_seq_len;
+        feature_shapes[i][2] = current_hidden;
+        feature_shapes[i][3] = 1;
+    }
+
+    if (resolved_options.expected_batch > 0 && resolved_options.expected_batch != batch) {
+        LOG_ERROR("sd_lens_conditioning_load batch %" PRId64 " does not match expected batch %" PRId64,
+                  batch,
+                  resolved_options.expected_batch);
+        return false;
+    }
+    if (resolved_options.expected_seq_len > 0 && resolved_options.expected_seq_len != seq_len) {
+        LOG_ERROR("sd_lens_conditioning_load seq_len %" PRId64 " does not match expected seq_len %" PRId64,
+                  seq_len,
+                  resolved_options.expected_seq_len);
+        return false;
+    }
+    if (resolved_options.expected_hidden_size > 0 && resolved_options.expected_hidden_size != hidden) {
+        LOG_ERROR("sd_lens_conditioning_load hidden_size %" PRId64 " does not match expected hidden_size %" PRId64,
+                  hidden,
+                  resolved_options.expected_hidden_size);
+        return false;
+    }
+
+    int64_t mask_shape[4] = {};
+    if (!sd_lens_mask_dtype_supported(storages[4].type)) {
+        LOG_ERROR("sd_lens_conditioning_load attention_mask has unsupported dtype '%s'", ggml_type_name(storages[4].type));
+        return false;
+    }
+    if (!sd_lens_mask_shape_matches(storages[4], batch, seq_len, mask_shape)) {
+        LOG_ERROR("sd_lens_conditioning_load attention_mask shape is incompatible with feature shape");
+        return false;
+    }
+
+    uint64_t shape_hash = sd_lens_hash_init();
+    uint64_t dtype_hash = sd_lens_hash_init();
+    for (int i = 0; i < SD_LENS_CONDITIONING_FEATURE_COUNT; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            sd_lens_hash_combine(shape_hash, static_cast<uint64_t>(feature_shapes[i][j]));
+        }
+        sd_lens_hash_combine(dtype_hash, static_cast<uint64_t>(storages[i].type));
+    }
+    for (int i = 0; i < 4; ++i) {
+        sd_lens_hash_combine(shape_hash, static_cast<uint64_t>(mask_shape[i]));
+    }
+    sd_lens_hash_combine(dtype_hash, static_cast<uint64_t>(storages[4].type));
+
+    if (resolved_options.expected_shape_hash != 0 && resolved_options.expected_shape_hash != shape_hash) {
+        LOG_ERROR("sd_lens_conditioning_load shape hash mismatch");
+        return false;
+    }
+    if (resolved_options.expected_dtype_hash != 0 && resolved_options.expected_dtype_hash != dtype_hash) {
+        LOG_ERROR("sd_lens_conditioning_load dtype hash mismatch");
+        return false;
+    }
+    if (resolved_options.expected_config_hash != 0) {
+        LOG_ERROR("sd_lens_conditioning_load cannot validate non-zero config hash until lens_cond_v1 metadata parsing is implemented");
+        return false;
+    }
+
+    auto resource = std::make_shared<sd_lens_conditioning_resource_private_t>();
+    std::map<std::string, ggml_tensor*> tensors;
+    for (int i = 0; i < SD_LENS_CONDITIONING_TENSOR_COUNT; ++i) {
+        resource->tensors[i] = sd_lens_alloc_cpu_tensor(storages[i]);
+        if (resource->tensors[i] == nullptr || resource->tensors[i]->empty()) {
+            LOG_ERROR("sd_lens_conditioning_load failed to allocate host tensor '%s'", tensor_names[i]);
+            return false;
+        }
+        tensors[tensor_names[i]] = resource->tensors[i]->tensor;
+    }
+    const int n_threads = sd_ctx->sd != nullptr ? sd_ctx->sd->n_threads : 1;
+    if (!loader.load_tensors(tensors, {}, n_threads, false)) {
+        LOG_ERROR("sd_lens_conditioning_load failed to load tensor payloads from '%s'", file_path);
+        return false;
+    }
+
+    resource->handle = sd_ctx->next_lens_conditioning_handle++;
+    resource->schema_version = 1;
+    resource->tensor_count = SD_LENS_CONDITIONING_TENSOR_COUNT;
+    resource->batch = batch;
+    resource->seq_len = seq_len;
+    resource->hidden_size = hidden;
+    resource->selected_layer_count = SD_LENS_CONDITIONING_FEATURE_COUNT;
+    resource->dtype = feature_dtype;
+    resource->storage_flags = SD_LENS_COND_STORAGE_FLAG_CPU;
+    resource->backend = SD_BACKEND_CPU;
+    resource->shape_hash = shape_hash;
+    resource->dtype_hash = dtype_hash;
+    resource->config_hash = 0;
+    resource->device_resident = false;
+    resource->copy_safe = true;
+    resource->debug_name = std::filesystem::path(file_path).filename().string();
+    if (resource->debug_name.empty()) {
+        resource->debug_name = "lens_cond_v1";
+    }
+    for (int i = 0; i < SD_LENS_CONDITIONING_FEATURE_COUNT; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            resource->feature_shapes[i][j] = feature_shapes[i][j];
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        resource->mask_shape[i] = mask_shape[i];
+    }
+    uint64_t estimated_bytes = 0;
+    for (int i = 0; i < SD_LENS_CONDITIONING_TENSOR_COUNT; ++i) {
+        estimated_bytes += static_cast<uint64_t>(ggml_nbytes(resource->tensors[i]->tensor));
+    }
+    resource->estimated_bytes = estimated_bytes;
+
+    sd_ctx->lens_conditioning_resources[resource->handle] = resource;
+    if (out_handle != nullptr) {
+        *out_handle = resource->handle;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_conditioning_fill_desc(*resource, out_desc);
+    }
+    return true;
+}
+
+SD_API bool sd_lens_conditioning_release(sd_ctx_t* sd_ctx, sd_lens_conditioning_handle_t handle) {
+    if (sd_ctx == nullptr) {
+        LOG_ERROR("sd_lens_conditioning_release requires a valid context");
+        return false;
+    }
+    if (handle == 0) {
+        LOG_ERROR("sd_lens_conditioning_release requires a non-zero lens conditioning handle");
+        return false;
+    }
+    auto resource = sd_lens_conditioning_lookup(sd_ctx, handle);
+    if (resource == nullptr || resource->refcount == 0) {
+        return false;
+    }
+    resource->refcount -= 1;
+    if (resource->refcount == 0) {
+        sd_ctx->lens_conditioning_resources.erase(handle);
+    }
+    return true;
+}
+
+SD_API bool sd_lens_conditioning_get_desc(sd_ctx_t* sd_ctx,
+                                          sd_lens_conditioning_handle_t handle,
+                                          sd_lens_conditioning_desc_t* out_desc) {
+    if (out_desc != nullptr) {
+        sd_lens_conditioning_desc_init(out_desc);
+    }
+    if (sd_ctx == nullptr) {
+        LOG_ERROR("sd_lens_conditioning_get_desc requires a valid context");
+        return false;
+    }
+    if (handle == 0) {
+        LOG_ERROR("sd_lens_conditioning_get_desc requires a non-zero lens conditioning handle");
+        return false;
+    }
+    auto resource = sd_lens_conditioning_lookup(sd_ctx, handle);
+    if (resource == nullptr) {
+        return false;
+    }
+    return sd_lens_conditioning_fill_desc(*resource, out_desc);
+}
+
+static void sd_lens_transformer_fill_desc(const sd_lens_transformer_resource_private_t& resource,
+                                          sd_lens_transformer_desc_t* desc) {
+    if (desc == nullptr) {
+        return;
+    }
+    sd_lens_transformer_desc_init(desc);
+    desc->handle = resource.handle;
+    desc->refcount = resource.refcount;
+    desc->shard_count = resource.shard_count;
+    desc->tensor_count = resource.tensor_count;
+    desc->estimated_bytes = resource.estimated_bytes;
+    desc->layers = resource.layers;
+    desc->num_attention_heads = resource.num_attention_heads;
+    desc->attention_head_dim = resource.attention_head_dim;
+    desc->inner_dim = resource.inner_dim;
+    desc->in_channels = resource.in_channels;
+    desc->out_channels = resource.out_channels;
+    desc->enc_hidden_dim = resource.enc_hidden_dim;
+    desc->metadata_only = resource.metadata_only;
+    desc->weights_loaded = resource.weights_loaded;
+    desc->forward_supported = resource.forward_supported;
+    desc->host_cached = resource.host_cached;
+    desc->gpu_resident = resource.gpu_resident;
+    desc->host_cached_bytes = resource.host_cached_bytes;
+    std::snprintf(desc->debug_name, sizeof(desc->debug_name), "%s", resource.debug_name.c_str());
+}
+
+static std::shared_ptr<sd_lens_transformer_resource_private_t> sd_lens_transformer_lookup(sd_ctx_t* sd_ctx,
+                                                                                          sd_lens_transformer_handle_t handle) {
+    if (sd_ctx == nullptr || handle == 0) {
+        return nullptr;
+    }
+    auto it = sd_ctx->lens_transformer_resources.find(handle);
+    if (it == sd_ctx->lens_transformer_resources.end()) {
+        LOG_ERROR("Lens transformer handle %" PRIu64 " was not found", handle);
+        return nullptr;
+    }
+    return it->second;
+}
+
+static bool sd_lens_transformer_expected_matches(const sd_lens_transformer_options_t& options,
+                                                 const sd_lens_transformer_resource_private_t& resource) {
+    auto check_u32 = [](uint32_t expected, uint32_t actual, const char* name) {
+        if (expected != 0 && expected != actual) {
+            LOG_ERROR("Lens transformer %s %u does not match expected %u", name, actual, expected);
+            return false;
+        }
+        return true;
+    };
+    return check_u32(options.expected_layers, resource.layers, "layers") &&
+           check_u32(options.expected_num_attention_heads, resource.num_attention_heads, "num_attention_heads") &&
+           check_u32(options.expected_attention_head_dim, resource.attention_head_dim, "attention_head_dim") &&
+           check_u32(options.expected_inner_dim, resource.inner_dim, "inner_dim") &&
+           check_u32(options.expected_in_channels, resource.in_channels, "in_channels") &&
+           check_u32(options.expected_out_channels, resource.out_channels, "out_channels") &&
+           check_u32(options.expected_enc_hidden_dim, resource.enc_hidden_dim, "enc_hidden_dim");
+}
+
+static uint64_t sd_lens_available_system_memory_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return static_cast<uint64_t>(status.ullAvailPhys);
+    }
+#endif
+    return 0;
+}
+
+static bool sd_lens_parse_transformer_config(const std::filesystem::path& config_path,
+                                             sd_lens_transformer_resource_private_t& resource) {
+    if (!std::filesystem::exists(config_path)) {
+        return true;
+    }
+    std::ifstream in(config_path);
+    if (!in) {
+        LOG_ERROR("failed to open Lens transformer config '%s'", config_path.string().c_str());
+        return false;
+    }
+    nlohmann::json config;
+    try {
+        in >> config;
+    } catch (const std::exception& e) {
+        LOG_ERROR("failed to parse Lens transformer config '%s': %s", config_path.string().c_str(), e.what());
+        return false;
+    }
+    auto get_u32 = [&](const char* key, uint32_t fallback) -> uint32_t {
+        if (!config.contains(key) || !config[key].is_number_integer()) {
+            return fallback;
+        }
+        return static_cast<uint32_t>(config[key].get<int64_t>());
+    };
+    resource.layers = get_u32("num_layers", resource.layers);
+    resource.num_attention_heads = get_u32("num_attention_heads", resource.num_attention_heads);
+    resource.attention_head_dim = get_u32("attention_head_dim", resource.attention_head_dim);
+    resource.inner_dim = get_u32("inner_dim", resource.num_attention_heads * resource.attention_head_dim);
+    resource.in_channels = get_u32("in_channels", resource.in_channels);
+    resource.out_channels = get_u32("out_channels", resource.out_channels);
+    resource.enc_hidden_dim = get_u32("enc_hidden_dim", resource.enc_hidden_dim);
+    if (resource.inner_dim == 0) {
+        resource.inner_dim = resource.num_attention_heads * resource.attention_head_dim;
+    }
+    return true;
+}
+
+static std::vector<std::filesystem::path> sd_lens_transformer_safetensor_files(const std::filesystem::path& path) {
+    std::vector<std::filesystem::path> files;
+    if (std::filesystem::is_regular_file(path)) {
+        if (path.extension() == ".safetensors") {
+            files.push_back(path);
+        }
+        return files;
+    }
+    if (!std::filesystem::is_directory(path)) {
+        return files;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const auto& file = entry.path();
+        if (file.extension() == ".safetensors") {
+            files.push_back(file);
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+struct sd_lens_safetensor_entry_t {
+    std::string dtype;
+    std::vector<int64_t> shape;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+};
+
+static bool sd_lens_parse_safetensor_entry(const std::string& name,
+                                           const nlohmann::json& info,
+                                           sd_lens_safetensor_entry_t& out) {
+    if (!info.contains("dtype") || !info.contains("shape") || !info.contains("data_offsets")) {
+        LOG_ERROR("Lens transformer safetensor entry '%s' is missing dtype, shape, or data_offsets", name.c_str());
+        return false;
+    }
+    out.dtype = info.at("dtype").get<std::string>();
+    out.shape.clear();
+    for (const auto& dim_json : info.at("shape")) {
+        const int64_t dim = dim_json.get<int64_t>();
+        if (dim <= 0) {
+            LOG_ERROR("invalid Lens transformer tensor shape for '%s'", name.c_str());
+            return false;
+        }
+        out.shape.push_back(dim);
+    }
+    out.begin = info.at("data_offsets").at(0).get<uint64_t>();
+    out.end = info.at("data_offsets").at(1).get<uint64_t>();
+    if (out.end < out.begin) {
+        LOG_ERROR("invalid Lens transformer tensor offsets for '%s'", name.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool sd_lens_is_mxfp8_aux_tensor(const std::string& name) {
+    return ends_with(name, ".weight_scale") || ends_with(name, ".comfy_quant");
+}
+
+static std::string sd_lens_mxfp8_scale_name_for_weight(const std::string& weight_name) {
+    constexpr const char* suffix = ".weight";
+    if (ends_with(weight_name, suffix)) {
+        return weight_name.substr(0, weight_name.size() - std::strlen(suffix)) + ".weight_scale";
+    }
+    return weight_name + "_scale";
+}
+
+static float sd_lens_mxfp8_e8m0_to_f32(uint8_t x) {
+    if (x == 0) {
+        return 0.0f;
+    }
+    const uint32_t bits = static_cast<uint32_t>(x) << 23;
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static float sd_lens_mxfp8_e4m3fn_to_f32(uint8_t x) {
+    const bool negative = (x & 0x80u) != 0;
+    const uint8_t magnitude = static_cast<uint8_t>(x & 0x7fu);
+    if (magnitude == 0) {
+        return negative ? -0.0f : 0.0f;
+    }
+    const int exp = static_cast<int>((magnitude >> 3) & 0x0fu);
+    const int mant = static_cast<int>(magnitude & 0x07u);
+    float value = 0.0f;
+    if (exp == 0) {
+        value = std::ldexp(static_cast<float>(mant), -9);
+    } else if (exp == 0x0f && mant == 0x07) {
+        value = std::numeric_limits<float>::quiet_NaN();
+    } else {
+        value = std::ldexp(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
+    }
+    return negative ? -value : value;
+}
+
+static size_t sd_lens_mxfp8_blocked_scale_index(int64_t rows, int64_t blocks, int64_t row, int64_t block_col) {
+    const int64_t col_block_count = (blocks + 3) / 4;
+    const int64_t rb = row / 128;
+    const int64_t inner_row = row % 128;
+    const int64_t row_quad = inner_row / 32;
+    const int64_t inner32 = inner_row % 32;
+    const int64_t cb = block_col / 4;
+    const int64_t inner_col = block_col % 4;
+    const int64_t flat_block = rb * col_block_count + cb;
+    const int64_t linear = (flat_block * 32 + inner32) * 16 + row_quad * 4 + inner_col;
+    return static_cast<size_t>(linear);
+}
+
+static bool sd_lens_dequantize_mxfp8_block32_to_bf16(const std::string& name,
+                                                     const sd_lens_safetensor_entry_t& weight_entry,
+                                                     const sd_lens_safetensor_entry_t& scale_entry,
+                                                     const std::vector<uint8_t>& weight_bytes,
+                                                     const std::vector<uint8_t>& scale_bytes,
+                                                     std::vector<ggml_bf16_t>& out_bf16) {
+    if (weight_entry.shape.size() != 2) {
+        LOG_ERROR("Lens MXFP8 tensor '%s' must be rank-2, got rank %zu", name.c_str(), weight_entry.shape.size());
+        return false;
+    }
+    const int64_t rows = weight_entry.shape[0];
+    const int64_t cols = weight_entry.shape[1];
+    if (cols <= 0 || cols % 32 != 0) {
+        LOG_ERROR("Lens MXFP8 tensor '%s' has unsupported cols=%" PRId64 " (expected multiple of 32)",
+                  name.c_str(),
+                  cols);
+        return false;
+    }
+    const int64_t blocks = cols / 32;
+    const int64_t padded_rows = ((rows + 127) / 128) * 128;
+    const int64_t padded_cols = ((blocks + 3) / 4) * 4;
+    if (scale_entry.dtype != "U8" || scale_entry.shape.size() != 2 ||
+        scale_entry.shape[0] != padded_rows || scale_entry.shape[1] != padded_cols) {
+        LOG_ERROR("Lens MXFP8 tensor '%s' has incompatible scale tensor dtype/shape", name.c_str());
+        return false;
+    }
+    const uint64_t elements = static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
+    if (weight_bytes.size() != elements || scale_bytes.size() != static_cast<size_t>(padded_rows * padded_cols)) {
+        LOG_ERROR("Lens MXFP8 tensor '%s' byte count mismatch during dequant", name.c_str());
+        return false;
+    }
+    out_bf16.resize(static_cast<size_t>(elements));
+    size_t out_index = 0;
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t b = 0; b < blocks; ++b) {
+            const uint8_t scale_byte = scale_bytes[sd_lens_mxfp8_blocked_scale_index(rows, blocks, r, b)];
+            const float scale = sd_lens_mxfp8_e8m0_to_f32(scale_byte);
+            for (int64_t i = 0; i < 32; ++i) {
+                const float decoded = sd_lens_mxfp8_e4m3fn_to_f32(weight_bytes[out_index]) * scale;
+                if (!std::isfinite(decoded)) {
+                    LOG_ERROR("Lens MXFP8 tensor '%s' dequantized a non-finite value at flat index %zu",
+                              name.c_str(),
+                              out_index);
+                    return false;
+                }
+                out_bf16[out_index] = ggml_fp32_to_bf16(decoded);
+                ++out_index;
+            }
+        }
+    }
+    return true;
+}
+
+static bool sd_lens_transformer_cache_host_weights(const std::vector<std::filesystem::path>& files,
+                                                   sd_lens_transformer_resource_private_t& resource,
+                                                   uint64_t max_resident_weight_bytes) {
+    resource.host_tensors.clear();
+    resource.host_cached_bytes = 0;
+    if (max_resident_weight_bytes > 0 && resource.estimated_bytes > max_resident_weight_bytes) {
+        LOG_ERROR("sd_lens_transformer_load estimated payload %" PRIu64 " exceeds host cache byte cap %" PRIu64,
+                  resource.estimated_bytes,
+                  max_resident_weight_bytes);
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+    const sd::loader::LoaderConfig loader_config = sd::loader::get_config();
+    const bool threaded_loader_requested = loader_config.enable_threaded_loader;
+    std::unique_ptr<sd::loader::ThreadedFileReader> threaded_reader;
+    if (threaded_loader_requested) {
+        threaded_reader = std::make_unique<sd::loader::ThreadedFileReader>(
+            sd::loader::FileReadOptions{
+                std::max<uint32_t>(1, loader_config.read_threads),
+                8ull * 1024ull * 1024ull});
+    }
+#endif
+    for (const auto& file : files) {
+        std::ifstream in(file, std::ios::binary);
+        if (!in) {
+            LOG_ERROR("failed to open Lens safetensors shard '%s'", file.string().c_str());
+            resource.host_tensors.clear();
+            return false;
+        }
+        uint64_t header_size = 0;
+        in.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
+        if (!in || header_size == 0 || header_size > 256ull * 1024ull * 1024ull) {
+            LOG_ERROR("invalid Lens safetensors header size in '%s'", file.string().c_str());
+            resource.host_tensors.clear();
+            return false;
+        }
+        std::string header(static_cast<size_t>(header_size), '\0');
+        in.read(header.data(), static_cast<std::streamsize>(header.size()));
+        if (!in) {
+            LOG_ERROR("failed to read Lens safetensors header in '%s'", file.string().c_str());
+            resource.host_tensors.clear();
+            return false;
+        }
+        nlohmann::json json;
+        try {
+            json = nlohmann::json::parse(header);
+        } catch (const std::exception& e) {
+            LOG_ERROR("failed to parse Lens safetensors header '%s': %s", file.string().c_str(), e.what());
+            resource.host_tensors.clear();
+            return false;
+        }
+        const uint64_t payload_offset = sizeof(uint64_t) + header_size;
+        std::unordered_map<std::string, sd_lens_safetensor_entry_t> entries;
+        entries.reserve(json.size());
+        for (const auto& item : json.items()) {
+            const std::string name = item.key();
+            if (name == "__metadata__") {
+                continue;
+            }
+            sd_lens_safetensor_entry_t entry;
+            if (!sd_lens_parse_safetensor_entry(name, item.value(), entry)) {
+                resource.host_tensors.clear();
+                return false;
+            }
+            entries.emplace(name, std::move(entry));
+        }
+        auto read_payload = [&](const std::string& tensor_name,
+                                uint64_t begin,
+                                uint64_t bytes,
+                                void* read_dst) -> bool {
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+            bool threaded_read = false;
+            if (threaded_loader_requested && threaded_reader != nullptr &&
+                bytes >= loader_config.min_tensor_bytes) {
+                threaded_read = threaded_reader->read(
+                    file.string(),
+                    payload_offset + begin,
+                    read_dst,
+                    static_cast<size_t>(bytes));
+                if (!threaded_read) {
+                    LOG_ERROR("threaded Lens transformer tensor read failed for '%s'", tensor_name.c_str());
+                    return false;
+                }
+            } else if (threaded_loader_requested) {
+                sd::loader::note_fallback(
+                    sd::loader::LoaderFallbackReason::below_threshold,
+                    bytes,
+                    true);
+            }
+            if (!threaded_read)
+#endif
+            {
+                in.seekg(static_cast<std::streamoff>(payload_offset + begin));
+                in.read(reinterpret_cast<char*>(read_dst), static_cast<std::streamsize>(bytes));
+                if (!in) {
+                    LOG_ERROR("failed to read Lens transformer tensor '%s'", tensor_name.c_str());
+                    return false;
+                }
+            }
+#if defined(SD_CUDA_THREADED_WEIGHT_LOADER) && defined(SD_USE_CUDA)
+            if (threaded_loader_requested) {
+                sd::loader::add_tensor_count(1);
+            }
+#endif
+            return true;
+        };
+        for (const auto& item : json.items()) {
+            const std::string name = item.key();
+            if (name == "__metadata__") {
+                continue;
+            }
+            if (sd_lens_is_mxfp8_aux_tensor(name)) {
+                continue;
+            }
+            const auto entry_it = entries.find(name);
+            if (entry_it == entries.end()) {
+                LOG_ERROR("Lens transformer host cache failed to find parsed tensor '%s'", name.c_str());
+                resource.host_tensors.clear();
+                return false;
+            }
+            const auto& entry = entry_it->second;
+            const std::string& dtype = entry.dtype;
+            const bool source_bf16 = dtype == "BF16";
+            const bool source_mxfp8 = dtype == "F8_E4M3";
+            if (dtype != "F32" && !source_bf16 && !source_mxfp8) {
+                LOG_ERROR("Lens transformer host cache currently supports F32/BF16 and Comfy MXFP8 block32 tensor '%s' "
+                          "(dtype=%s)",
+                          name.c_str(),
+                          dtype.c_str());
+                resource.host_tensors.clear();
+                return false;
+            }
+            sd_lens_transformer_resource_private_t::HostTensor tensor;
+            tensor.dtype = (source_bf16 || source_mxfp8) ? SD_DTYPE_BF16 : SD_DTYPE_F32;
+            uint64_t elements = 1;
+            for (const int64_t dim : entry.shape) {
+                tensor.shape.push_back(dim);
+                if (elements > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(dim)) {
+                    resource.host_tensors.clear();
+                    return false;
+                }
+                elements *= static_cast<uint64_t>(dim);
+            }
+            const uint64_t begin = entry.begin;
+            const uint64_t end = entry.end;
+            const uint64_t source_element_bytes = source_mxfp8 ? sizeof(uint8_t)
+                                                                : (source_bf16 ? sizeof(ggml_bf16_t) : sizeof(float));
+            if (end - begin != elements * source_element_bytes) {
+                LOG_ERROR("Lens transformer tensor byte count mismatch for '%s'", name.c_str());
+                resource.host_tensors.clear();
+                return false;
+            }
+            const uint64_t tensor_bytes = end - begin;
+            if (source_mxfp8) {
+                const std::string scale_name = sd_lens_mxfp8_scale_name_for_weight(name);
+                const auto scale_it = entries.find(scale_name);
+                if (scale_it == entries.end()) {
+                    LOG_ERROR("Lens MXFP8 tensor '%s' is missing scale tensor '%s'", name.c_str(), scale_name.c_str());
+                    resource.host_tensors.clear();
+                    return false;
+                }
+                const auto& scale_entry = scale_it->second;
+                const uint64_t scale_bytes_count = scale_entry.end - scale_entry.begin;
+                std::vector<uint8_t> weight_bytes(static_cast<size_t>(tensor_bytes));
+                std::vector<uint8_t> scale_bytes(static_cast<size_t>(scale_bytes_count));
+                if (!read_payload(name, begin, tensor_bytes, weight_bytes.data()) ||
+                    !read_payload(scale_name, scale_entry.begin, scale_bytes_count, scale_bytes.data())) {
+                    resource.host_tensors.clear();
+                    return false;
+                }
+                if (!sd_lens_dequantize_mxfp8_block32_to_bf16(
+                        name,
+                        entry,
+                        scale_entry,
+                        weight_bytes,
+                        scale_bytes,
+                        tensor.bf16_data)) {
+                    resource.host_tensors.clear();
+                    return false;
+                }
+            } else {
+                if (source_bf16) {
+                    tensor.bf16_data.resize(static_cast<size_t>(elements));
+                } else {
+                    tensor.data.resize(static_cast<size_t>(elements));
+                }
+                void* read_dst = source_bf16
+                                     ? static_cast<void*>(tensor.bf16_data.data())
+                                     : static_cast<void*>(tensor.data.data());
+                if (!read_payload(name, begin, tensor_bytes, read_dst)) {
+                    resource.host_tensors.clear();
+                    return false;
+                }
+            }
+            resource.host_cached_bytes += (source_bf16 || source_mxfp8)
+                                              ? static_cast<uint64_t>(tensor.bf16_data.size() * sizeof(ggml_bf16_t))
+                                              : static_cast<uint64_t>(tensor.data.size() * sizeof(float));
+            resource.host_tensors.emplace(name, std::move(tensor));
+        }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (resource.host_tensors.empty()) {
+        LOG_ERROR("sd_lens_transformer_load host cache loaded no tensors");
+        return false;
+    }
+    resource.host_cached = true;
+    resource.gpu_resident = false;
+    resource.metadata_only = false;
+    resource.weights_loaded = true;
+    resource.forward_supported = true;
+    LOG_INFO("Lens transformer host cache loaded %zu tensors, %.2f GiB in %.2fs",
+             resource.host_tensors.size(),
+             static_cast<double>(resource.host_cached_bytes) / (1024.0 * 1024.0 * 1024.0),
+             std::chrono::duration<double>(t1 - t0).count());
+    return true;
+}
+
+SD_API void sd_lens_transformer_options_init(sd_lens_transformer_options_t* options) {
+    if (options == nullptr) {
+        return;
+    }
+    *options = {};
+    options->struct_size = sizeof(sd_lens_transformer_options_t);
+    options->version = SD_VAE_API_VERSION;
+    options->expected_layers = 48;
+    options->expected_num_attention_heads = 24;
+    options->expected_attention_head_dim = 64;
+    options->expected_inner_dim = 1536;
+    options->expected_in_channels = 128;
+    options->expected_out_channels = 32;
+    options->expected_enc_hidden_dim = 2880;
+    options->max_loaded_layers = 0;
+    options->max_resident_weight_bytes = 0;
+    options->min_free_system_memory_bytes = 0;
+    options->metadata_only = true;
+    options->allow_unsafe_large_allocations = false;
+}
+
+SD_API void sd_lens_transformer_desc_init(sd_lens_transformer_desc_t* desc) {
+    if (desc == nullptr) {
+        return;
+    }
+    *desc = {};
+    desc->struct_size = sizeof(sd_lens_transformer_desc_t);
+    desc->version = SD_VAE_API_VERSION;
+}
+
+SD_API bool sd_lens_transformer_load(sd_ctx_t* sd_ctx,
+                                     const char* transformer_path,
+                                     const sd_lens_transformer_options_t* options,
+                                     sd_lens_transformer_handle_t* out_handle,
+                                     sd_lens_transformer_desc_t* out_desc) {
+    if (out_handle != nullptr) {
+        *out_handle = 0;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_transformer_desc_init(out_desc);
+    }
+    if (sd_ctx == nullptr || transformer_path == nullptr || transformer_path[0] == '\0') {
+        LOG_ERROR("sd_lens_transformer_load requires a context and transformer path");
+        return false;
+    }
+    sd_lens_transformer_options_t resolved;
+    if (options != nullptr) {
+        resolved = *options;
+    } else {
+        sd_lens_transformer_options_init(&resolved);
+    }
+    std::filesystem::path root(transformer_path);
+    auto files = sd_lens_transformer_safetensor_files(root);
+    if (files.empty()) {
+        LOG_ERROR("sd_lens_transformer_load found no safetensors files under '%s'", transformer_path);
+        return false;
+    }
+
+    auto resource = std::make_shared<sd_lens_transformer_resource_private_t>();
+    resource->metadata_only = true;
+    resource->weights_loaded = false;
+    resource->forward_supported = false;
+    resource->debug_name = root.filename().string();
+    if (resource->debug_name.empty()) {
+        resource->debug_name = "lens-transformer";
+    }
+    const std::filesystem::path config_path = std::filesystem::is_directory(root)
+                                                  ? root / "config.json"
+                                                  : root.parent_path() / "config.json";
+    if (std::filesystem::exists(config_path)) {
+        if (!sd_lens_parse_transformer_config(config_path, *resource)) {
+            return false;
+        }
+    } else if (std::filesystem::is_regular_file(root)) {
+        LOG_WARN("Lens transformer config '%s' not found for standalone transformer file; using Lens-Turbo defaults",
+                 config_path.string().c_str());
+    } else {
+        LOG_ERROR("Lens transformer config '%s' not found", config_path.string().c_str());
+        return false;
+    }
+
+    ModelLoader loader;
+    for (const auto& file : files) {
+        if (!loader.init_from_file(file.string())) {
+            LOG_ERROR("sd_lens_transformer_load failed to inspect shard '%s'", file.string().c_str());
+            return false;
+        }
+    }
+    auto& storage_map = loader.get_tensor_storage_map();
+    resource->shard_count = static_cast<uint32_t>(files.size());
+    resource->tensor_count = static_cast<uint32_t>(storage_map.size());
+    for (const auto& [_, storage] : storage_map) {
+        resource->estimated_bytes += static_cast<uint64_t>(storage.nbytes_to_read());
+    }
+
+    auto require_tensor = [&](const char* name) {
+        if (storage_map.find(name) == storage_map.end()) {
+            LOG_ERROR("sd_lens_transformer_load missing required tensor '%s'", name);
+            return false;
+        }
+        return true;
+    };
+    if (!require_tensor("img_in.weight") ||
+        !require_tensor("txt_in.weight") ||
+        !require_tensor("transformer_blocks.0.attn.img_qkv.weight") ||
+        !require_tensor("transformer_blocks.0.attn.txt_qkv.weight") ||
+        !require_tensor("transformer_blocks.0.img_mlp.w1.weight") ||
+        !require_tensor("transformer_blocks.47.txt_mlp.w3.weight") ||
+        !require_tensor("norm_out.linear.weight") ||
+        !require_tensor("proj_out.weight")) {
+        return false;
+    }
+    if (!sd_lens_transformer_expected_matches(resolved, *resource)) {
+        return false;
+    }
+    if (!resolved.metadata_only) {
+        if (!resolved.allow_unsafe_large_allocations) {
+            LOG_ERROR("sd_lens_transformer_load metadata_only=false refused without allow_unsafe_large_allocations; "
+                      "estimated transformer payload is %" PRIu64 " bytes",
+                      resource->estimated_bytes);
+            return false;
+        }
+        if (resolved.max_resident_weight_bytes > 0 && resource->estimated_bytes > resolved.max_resident_weight_bytes) {
+            LOG_ERROR("sd_lens_transformer_load estimated payload %" PRIu64 " exceeds max_resident_weight_bytes %" PRIu64,
+                      resource->estimated_bytes,
+                      resolved.max_resident_weight_bytes);
+            return false;
+        }
+        const uint64_t available = sd_lens_available_system_memory_bytes();
+        if (resolved.min_free_system_memory_bytes > 0 && available > 0 && available < resolved.min_free_system_memory_bytes) {
+            LOG_ERROR("sd_lens_transformer_load free system memory %" PRIu64 " is below requested guard %" PRIu64,
+                      available,
+                      resolved.min_free_system_memory_bytes);
+            return false;
+        }
+        if (!sd_lens_transformer_cache_host_weights(files, *resource, resolved.max_resident_weight_bytes)) {
+            return false;
+        }
+    }
+
+    resource->handle = sd_ctx->next_lens_transformer_handle++;
+    sd_ctx->lens_transformer_resources[resource->handle] = resource;
+    if (out_handle != nullptr) {
+        *out_handle = resource->handle;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_transformer_fill_desc(*resource, out_desc);
+    }
+    return true;
+}
+
+SD_API bool sd_lens_transformer_get_desc(sd_ctx_t* sd_ctx,
+                                         sd_lens_transformer_handle_t handle,
+                                         sd_lens_transformer_desc_t* out_desc) {
+    if (out_desc != nullptr) {
+        sd_lens_transformer_desc_init(out_desc);
+    }
+    auto resource = sd_lens_transformer_lookup(sd_ctx, handle);
+    if (resource == nullptr) {
+        return false;
+    }
+    sd_lens_transformer_fill_desc(*resource, out_desc);
+    return true;
+}
+
+SD_API bool sd_lens_transformer_release(sd_ctx_t* sd_ctx, sd_lens_transformer_handle_t handle) {
+    auto resource = sd_lens_transformer_lookup(sd_ctx, handle);
+    if (resource == nullptr || resource->refcount == 0) {
+        return false;
+    }
+    resource->refcount -= 1;
+    if (resource->refcount == 0) {
+        sd_ctx->lens_transformer_resources.erase(handle);
+    }
+    return true;
+}
+
+SD_API bool sd_lens_transformer_copy_tensor_f32(sd_ctx_t* sd_ctx,
+                                                sd_lens_transformer_handle_t handle,
+                                                const char* tensor_name,
+                                                int64_t* out_shape,
+                                                uint32_t shape_capacity,
+                                                uint32_t* out_rank,
+                                                float* out_data,
+                                                uint64_t out_data_capacity,
+                                                uint64_t* out_elements) {
+    if (out_rank != nullptr) {
+        *out_rank = 0;
+    }
+    if (out_elements != nullptr) {
+        *out_elements = 0;
+    }
+    auto resource = sd_lens_transformer_lookup(sd_ctx, handle);
+    if (resource == nullptr || tensor_name == nullptr || tensor_name[0] == '\0') {
+        LOG_ERROR("sd_lens_transformer_copy_tensor_f32 requires a valid context, handle, and tensor name");
+        return false;
+    }
+    if (!resource->host_cached) {
+        LOG_ERROR("sd_lens_transformer_copy_tensor_f32 requires a host-cached Lens transformer context");
+        return false;
+    }
+    auto it = resource->host_tensors.find(tensor_name);
+    if (it == resource->host_tensors.end()) {
+        LOG_ERROR("Lens transformer cached tensor '%s' was not found", tensor_name);
+        return false;
+    }
+    const auto& tensor = it->second;
+    const uint64_t elements = tensor.dtype == SD_DTYPE_BF16
+                                  ? static_cast<uint64_t>(tensor.bf16_data.size())
+                                  : static_cast<uint64_t>(tensor.data.size());
+    if (shape_capacity < tensor.shape.size() || out_shape == nullptr) {
+        LOG_ERROR("sd_lens_transformer_copy_tensor_f32 shape buffer is too small for '%s'", tensor_name);
+        return false;
+    }
+    for (size_t i = 0; i < tensor.shape.size(); ++i) {
+        out_shape[i] = tensor.shape[i];
+    }
+    if (out_data == nullptr) {
+        if (out_rank != nullptr) {
+            *out_rank = static_cast<uint32_t>(tensor.shape.size());
+        }
+        if (out_elements != nullptr) {
+            *out_elements = elements;
+        }
+        return true;
+    }
+    if (out_data_capacity < elements) {
+        LOG_ERROR("sd_lens_transformer_copy_tensor_f32 data buffer is too small for '%s'", tensor_name);
+        return false;
+    }
+    if (tensor.dtype == SD_DTYPE_BF16) {
+        ggml_bf16_to_fp32_row(
+            tensor.bf16_data.data(),
+            out_data,
+            static_cast<int64_t>(tensor.bf16_data.size()));
+    } else {
+        std::memcpy(out_data, tensor.data.data(), tensor.data.size() * sizeof(float));
+    }
+    if (out_rank != nullptr) {
+        *out_rank = static_cast<uint32_t>(tensor.shape.size());
+    }
+    if (out_elements != nullptr) {
+        *out_elements = elements;
+    }
+    return true;
+}
+
+SD_API bool sd_lens_transformer_borrow_tensor_f32(sd_ctx_t* sd_ctx,
+                                                  sd_lens_transformer_handle_t handle,
+                                                  const char* tensor_name,
+                                                  int64_t* out_shape,
+                                                  uint32_t shape_capacity,
+                                                  uint32_t* out_rank,
+                                                  const float** out_data,
+                                                  uint64_t* out_elements) {
+    if (out_rank != nullptr) {
+        *out_rank = 0;
+    }
+    if (out_elements != nullptr) {
+        *out_elements = 0;
+    }
+    if (out_data != nullptr) {
+        *out_data = nullptr;
+    }
+    auto resource = sd_lens_transformer_lookup(sd_ctx, handle);
+    if (resource == nullptr || tensor_name == nullptr || tensor_name[0] == '\0') {
+        LOG_ERROR("sd_lens_transformer_borrow_tensor_f32 requires a valid context, handle, and tensor name");
+        return false;
+    }
+    if (!resource->host_cached) {
+        LOG_ERROR("sd_lens_transformer_borrow_tensor_f32 requires a host-cached Lens transformer context");
+        return false;
+    }
+    auto it = resource->host_tensors.find(tensor_name);
+    if (it == resource->host_tensors.end()) {
+        LOG_ERROR("Lens transformer cached tensor '%s' was not found", tensor_name);
+        return false;
+    }
+    auto& tensor = it->second;
+    if (tensor.dtype == SD_DTYPE_BF16 && tensor.data.empty() && !tensor.bf16_data.empty()) {
+        tensor.data.resize(tensor.bf16_data.size());
+        ggml_bf16_to_fp32_row(
+            tensor.bf16_data.data(),
+            tensor.data.data(),
+            static_cast<int64_t>(tensor.bf16_data.size()));
+    }
+    if (shape_capacity < tensor.shape.size() || out_shape == nullptr || out_data == nullptr) {
+        LOG_ERROR("sd_lens_transformer_borrow_tensor_f32 output buffers are too small for '%s'", tensor_name);
+        return false;
+    }
+    for (size_t i = 0; i < tensor.shape.size(); ++i) {
+        out_shape[i] = tensor.shape[i];
+    }
+    if (out_rank != nullptr) {
+        *out_rank = static_cast<uint32_t>(tensor.shape.size());
+    }
+    if (out_elements != nullptr) {
+        *out_elements = static_cast<uint64_t>(tensor.data.size());
+    }
+    *out_data = tensor.data.data();
+    return true;
+}
+
+SD_API bool sd_lens_transformer_borrow_tensor_data(sd_ctx_t* sd_ctx,
+                                                   sd_lens_transformer_handle_t handle,
+                                                   const char* tensor_name,
+                                                   int64_t* out_shape,
+                                                   uint32_t shape_capacity,
+                                                   uint32_t* out_rank,
+                                                   const void** out_data,
+                                                   uint64_t* out_elements,
+                                                   sd_tensor_dtype_t* out_dtype) {
+    if (out_rank != nullptr) {
+        *out_rank = 0;
+    }
+    if (out_elements != nullptr) {
+        *out_elements = 0;
+    }
+    if (out_data != nullptr) {
+        *out_data = nullptr;
+    }
+    auto resource = sd_lens_transformer_lookup(sd_ctx, handle);
+    if (resource == nullptr || tensor_name == nullptr || tensor_name[0] == '\0') {
+        LOG_ERROR("sd_lens_transformer_borrow_tensor_data requires a valid context, handle, and tensor name");
+        return false;
+    }
+    if (!resource->host_cached) {
+        LOG_ERROR("sd_lens_transformer_borrow_tensor_data requires a host-cached Lens transformer context");
+        return false;
+    }
+    auto it = resource->host_tensors.find(tensor_name);
+    if (it == resource->host_tensors.end()) {
+        LOG_ERROR("Lens transformer cached tensor '%s' was not found", tensor_name);
+        return false;
+    }
+    const auto& tensor = it->second;
+    if (shape_capacity < tensor.shape.size() || out_shape == nullptr || out_data == nullptr || out_dtype == nullptr) {
+        LOG_ERROR("sd_lens_transformer_borrow_tensor_data output buffers are too small for '%s'", tensor_name);
+        return false;
+    }
+    for (size_t i = 0; i < tensor.shape.size(); ++i) {
+        out_shape[i] = tensor.shape[i];
+    }
+    if (out_rank != nullptr) {
+        *out_rank = static_cast<uint32_t>(tensor.shape.size());
+    }
+    *out_dtype = tensor.dtype;
+    if (tensor.dtype == SD_DTYPE_BF16) {
+        *out_data = tensor.bf16_data.data();
+        if (out_elements != nullptr) {
+            *out_elements = static_cast<uint64_t>(tensor.bf16_data.size());
+        }
+    } else {
+        *out_data = tensor.data.data();
+        if (out_elements != nullptr) {
+            *out_elements = static_cast<uint64_t>(tensor.data.size());
+        }
+    }
+    return *out_data != nullptr;
+}
+
+SD_API void sd_lens_schedule_options_init(sd_lens_schedule_options_t* options) {
+    if (options == nullptr) {
+        return;
+    }
+    *options = {};
+    options->struct_size = sizeof(sd_lens_schedule_options_t);
+    options->version = SD_VAE_API_VERSION;
+    options->steps = 4;
+    options->image_seq_len = 4096;
+    options->num_train_timesteps = 1000;
+    options->base_image_seq_len = 256;
+    options->max_image_seq_len = 4096;
+    options->base_shift = 0.5f;
+    options->max_shift = 1.15f;
+    options->shift = 3.0f;
+    options->mu = 0.0f;
+    options->has_mu = false;
+    options->use_dynamic_shifting = true;
+}
+
+SD_API void sd_lens_schedule_desc_init(sd_lens_schedule_desc_t* desc) {
+    if (desc == nullptr) {
+        return;
+    }
+    *desc = {};
+    desc->struct_size = sizeof(sd_lens_schedule_desc_t);
+    desc->version = SD_VAE_API_VERSION;
+}
+
+static float sd_lens_calculate_shift(int image_seq_len,
+                                     int base_seq_len,
+                                     int max_seq_len,
+                                     float base_shift,
+                                     float max_shift) {
+    if (max_seq_len == base_seq_len) {
+        return max_shift;
+    }
+    const float m = (max_shift - base_shift) / static_cast<float>(max_seq_len - base_seq_len);
+    const float b = base_shift - m * static_cast<float>(base_seq_len);
+    return static_cast<float>(image_seq_len) * m + b;
+}
+
+static float sd_lens_compute_empirical_mu(int image_seq_len, int steps) {
+    const float a1 = 8.73809524e-05f;
+    const float b1 = 1.89833333f;
+    const float a2 = 0.00016927f;
+    const float b2 = 0.45666666f;
+    if (image_seq_len > 4300) {
+        return a2 * static_cast<float>(image_seq_len) + b2;
+    }
+    const float m_200 = a2 * static_cast<float>(image_seq_len) + b2;
+    const float m_10 = a1 * static_cast<float>(image_seq_len) + b1;
+    const float a = (m_200 - m_10) / 190.0f;
+    const float b = m_200 - 200.0f * a;
+    return a * static_cast<float>(steps) + b;
+}
+
+static float sd_lens_flow_time_shift(float mu, float sigma, float t) {
+    if (t <= 0.0f) {
+        return 0.0f;
+    }
+    if (t >= 1.0f) {
+        return 1.0f;
+    }
+    const float exp_mu = ::expf(mu);
+    return exp_mu / (exp_mu + ::powf((1.0f / t - 1.0f), sigma));
+}
+
+SD_API bool sd_lens_turbo_build_schedule(const sd_lens_schedule_options_t* options,
+                                         float* out_sigmas,
+                                         uint32_t sigmas_capacity,
+                                         float* out_timesteps,
+                                         uint32_t timesteps_capacity,
+                                         sd_lens_schedule_desc_t* out_desc) {
+    sd_lens_schedule_options_t resolved;
+    if (options != nullptr) {
+        resolved = *options;
+    } else {
+        sd_lens_schedule_options_init(&resolved);
+    }
+    if (out_desc != nullptr) {
+        sd_lens_schedule_desc_init(out_desc);
+    }
+    if (resolved.steps <= 0 || resolved.steps > 10000) {
+        LOG_ERROR("sd_lens_turbo_build_schedule requires steps in [1, 10000], got %d", resolved.steps);
+        return false;
+    }
+    if (resolved.num_train_timesteps <= 0) {
+        LOG_ERROR("sd_lens_turbo_build_schedule requires positive num_train_timesteps");
+        return false;
+    }
+    if (resolved.image_seq_len <= 0) {
+        LOG_ERROR("sd_lens_turbo_build_schedule requires positive image_seq_len");
+        return false;
+    }
+    const uint32_t steps = static_cast<uint32_t>(resolved.steps);
+    const uint32_t sigma_count = steps + 1;
+    if (out_sigmas == nullptr || out_timesteps == nullptr ||
+        sigmas_capacity < sigma_count || timesteps_capacity < steps) {
+        LOG_ERROR("sd_lens_turbo_build_schedule received insufficient output buffers");
+        return false;
+    }
+    const float mu = resolved.has_mu
+                         ? resolved.mu
+                         : sd_lens_compute_empirical_mu(resolved.image_seq_len, resolved.steps);
+    for (uint32_t i = 0; i < steps; ++i) {
+        float sigma = 1.0f;
+        if (steps > 1) {
+            const float t = static_cast<float>(i) / static_cast<float>(steps - 1);
+            sigma = 1.0f + (1.0f / static_cast<float>(steps) - 1.0f) * t;
+        }
+        if (resolved.use_dynamic_shifting) {
+            sigma = sd_lens_flow_time_shift(mu, 1.0f, sigma);
+        } else {
+            sigma = resolved.shift * sigma / (1.0f + (resolved.shift - 1.0f) * sigma);
+        }
+        out_sigmas[i] = sigma;
+        out_timesteps[i] = sigma * static_cast<float>(resolved.num_train_timesteps);
+    }
+    out_sigmas[steps] = 0.0f;
+
+    if (out_desc != nullptr) {
+        out_desc->steps = resolved.steps;
+        out_desc->sigma_count = static_cast<int>(sigma_count);
+        out_desc->timestep_count = resolved.steps;
+        out_desc->image_seq_len = resolved.image_seq_len;
+        out_desc->mu = mu;
+        out_desc->use_dynamic_shifting = resolved.use_dynamic_shifting;
+    }
+    return true;
+}
+
+SD_API void sd_lens_external_flow_loop_desc_init(sd_lens_external_flow_loop_desc_t* desc) {
+    if (desc == nullptr) {
+        return;
+    }
+    *desc = {};
+    desc->struct_size = sizeof(sd_lens_external_flow_loop_desc_t);
+    desc->version = SD_VAE_API_VERSION;
+    desc->in_channels = 128;
+    desc->cpu_only = true;
+}
+
+SD_API bool sd_lens_run_external_flow_loop_f32(sd_ctx_t* sd_ctx,
+                                              sd_lens_conditioning_handle_t conditioning,
+                                              sd_lens_transformer_handle_t transformer,
+                                              const sd_lens_schedule_options_t* schedule_options,
+                                              const float* initial_packed_tokens_bsc,
+                                              uint64_t initial_packed_token_elements,
+                                              const float* model_outputs_bsc_by_step,
+                                              uint64_t model_output_elements,
+                                              float* out_packed_tokens_bsc,
+                                              uint64_t out_packed_token_capacity,
+                                              sd_lens_external_flow_loop_desc_t* out_desc) {
+    if (out_desc != nullptr) {
+        sd_lens_external_flow_loop_desc_init(out_desc);
+    }
+    if (sd_ctx == nullptr || initial_packed_tokens_bsc == nullptr ||
+        model_outputs_bsc_by_step == nullptr || out_packed_tokens_bsc == nullptr) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 requires a context and CPU f32 input/output buffers");
+        return false;
+    }
+
+    auto cond_resource = sd_lens_conditioning_lookup(sd_ctx, conditioning);
+    if (cond_resource == nullptr) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 requires a valid Lens precomputed-conditioning handle");
+        return false;
+    }
+    if (cond_resource->backend != SD_BACKEND_CPU || cond_resource->device_resident ||
+        cond_resource->tensor_count != SD_LENS_CONDITIONING_TENSOR_COUNT ||
+        cond_resource->selected_layer_count != SD_LENS_CONDITIONING_FEATURE_COUNT) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 currently supports CPU lens_cond_v1 precomputed conditioning only");
+        return false;
+    }
+    if (cond_resource->batch != 1) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 currently supports batch=1 conditioning only");
+        return false;
+    }
+
+    auto transformer_resource = sd_lens_transformer_lookup(sd_ctx, transformer);
+    if (transformer_resource == nullptr) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 requires a valid Lens transformer metadata handle");
+        return false;
+    }
+    if (!transformer_resource->metadata_only || transformer_resource->weights_loaded ||
+        transformer_resource->forward_supported) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 requires metadata-only transformer handles and external model outputs");
+        return false;
+    }
+    if (transformer_resource->in_channels == 0 || transformer_resource->layers == 0) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 transformer metadata is incomplete");
+        return false;
+    }
+    if (transformer_resource->enc_hidden_dim != 0 &&
+        cond_resource->hidden_size != static_cast<int64_t>(transformer_resource->enc_hidden_dim)) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 conditioning hidden size %" PRId64
+                  " does not match transformer enc_hidden_dim %u",
+                  cond_resource->hidden_size,
+                  transformer_resource->enc_hidden_dim);
+        return false;
+    }
+
+    sd_lens_schedule_options_t resolved_options;
+    if (schedule_options != nullptr) {
+        resolved_options = *schedule_options;
+    } else {
+        sd_lens_schedule_options_init(&resolved_options);
+    }
+    if (resolved_options.steps <= 0 || resolved_options.image_seq_len <= 0) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 requires positive steps and image_seq_len");
+        return false;
+    }
+    const uint64_t channels = static_cast<uint64_t>(transformer_resource->in_channels);
+    const uint64_t image_seq_len = static_cast<uint64_t>(resolved_options.image_seq_len);
+    if (image_seq_len > std::numeric_limits<uint64_t>::max() / channels) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 packed token shape overflow");
+        return false;
+    }
+    const uint64_t packed_elements = image_seq_len * channels;
+    const uint64_t steps = static_cast<uint64_t>(resolved_options.steps);
+    if (packed_elements > 0 && steps > std::numeric_limits<uint64_t>::max() / packed_elements) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 model output element count overflow");
+        return false;
+    }
+    const uint64_t expected_model_output_elements = packed_elements * steps;
+    if (initial_packed_token_elements != packed_elements ||
+        model_output_elements != expected_model_output_elements ||
+        out_packed_token_capacity < packed_elements) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 expected initial=%" PRIu64
+                  " model_outputs=%" PRIu64 " out_capacity>=%" PRIu64
+                  " for steps=%d image_seq_len=%d channels=%" PRIu64,
+                  packed_elements,
+                  expected_model_output_elements,
+                  packed_elements,
+                  resolved_options.steps,
+                  resolved_options.image_seq_len,
+                  channels);
+        return false;
+    }
+
+    std::vector<float> sigmas(static_cast<size_t>(resolved_options.steps + 1), 0.0f);
+    std::vector<float> timesteps(static_cast<size_t>(resolved_options.steps), 0.0f);
+    sd_lens_schedule_desc_t schedule_desc;
+    sd_lens_schedule_desc_init(&schedule_desc);
+    if (!sd_lens_turbo_build_schedule(&resolved_options,
+                                      sigmas.data(),
+                                      static_cast<uint32_t>(sigmas.size()),
+                                      timesteps.data(),
+                                      static_cast<uint32_t>(timesteps.size()),
+                                      &schedule_desc)) {
+        LOG_ERROR("sd_lens_run_external_flow_loop_f32 failed to build Lens schedule");
+        return false;
+    }
+
+    std::vector<float> current(static_cast<size_t>(packed_elements), 0.0f);
+    for (uint64_t i = 0; i < packed_elements; ++i) {
+        const float value = initial_packed_tokens_bsc[i];
+        if (!std::isfinite(value)) {
+            LOG_ERROR("sd_lens_run_external_flow_loop_f32 initial packed token buffer contains non-finite values");
+            return false;
+        }
+        current[static_cast<size_t>(i)] = value;
+    }
+
+    for (int step = 0; step < resolved_options.steps; ++step) {
+        const float dt = sigmas[static_cast<size_t>(step + 1)] - sigmas[static_cast<size_t>(step)];
+        const uint64_t step_offset = packed_elements * static_cast<uint64_t>(step);
+        for (uint64_t i = 0; i < packed_elements; ++i) {
+            const float model_value = model_outputs_bsc_by_step[step_offset + i];
+            if (!std::isfinite(model_value)) {
+                LOG_ERROR("sd_lens_run_external_flow_loop_f32 model output contains non-finite values at step %d", step);
+                return false;
+            }
+            current[static_cast<size_t>(i)] += dt * model_value;
+        }
+    }
+
+    double sum = 0.0;
+    float max_abs = 0.0f;
+    for (uint64_t i = 0; i < packed_elements; ++i) {
+        const float value = current[static_cast<size_t>(i)];
+        if (!std::isfinite(value)) {
+            LOG_ERROR("sd_lens_run_external_flow_loop_f32 produced non-finite output");
+            return false;
+        }
+        const float abs_value = std::fabs(value);
+        max_abs = std::max(max_abs, abs_value);
+        sum += static_cast<double>(abs_value);
+        out_packed_tokens_bsc[i] = value;
+    }
+
+    if (out_desc != nullptr) {
+        out_desc->steps = resolved_options.steps;
+        out_desc->image_seq_len = resolved_options.image_seq_len;
+        out_desc->in_channels = transformer_resource->in_channels;
+        out_desc->packed_token_elements = packed_elements;
+        out_desc->model_output_elements = model_output_elements;
+        out_desc->first_sigma = sigmas.front();
+        out_desc->last_sigma = sigmas.back();
+        out_desc->max_abs = max_abs;
+        out_desc->mean_abs = packed_elements == 0 ? 0.0f : static_cast<float>(sum / static_cast<double>(packed_elements));
+        out_desc->used_precomputed_conditioning = true;
+        out_desc->used_external_model_output = true;
+        out_desc->native_transformer_forward = false;
+        out_desc->cpu_only = true;
+    }
+    return true;
+}
+
+SD_API void sd_lens_vae_latent_desc_init(sd_lens_vae_latent_desc_t* desc) {
+    if (desc == nullptr) {
+        return;
+    }
+    *desc = {};
+    desc->struct_size = sizeof(sd_lens_vae_latent_desc_t);
+    desc->version = SD_VAE_API_VERSION;
+    desc->dtype = SD_DTYPE_F32;
+    desc->layout = SD_LAYOUT_NCHW;
+    desc->patch_size_h = 2;
+    desc->patch_size_w = 2;
+}
+
+SD_API bool sd_lens_pack_vae_latent_f32(const float* lens_latent_nchw,
+                                        uint64_t lens_latent_elements,
+                                        int64_t n,
+                                        int64_t c,
+                                        int64_t h,
+                                        int64_t w,
+                                        float* packed_latent_nchw,
+                                        uint64_t packed_latent_capacity,
+                                        sd_lens_vae_latent_desc_t* out_desc) {
+    if (out_desc != nullptr) {
+        sd_lens_vae_latent_desc_init(out_desc);
+    }
+    uint64_t input_elements = 0;
+    uint64_t output_elements = 0;
+    if (lens_latent_nchw == nullptr || packed_latent_nchw == nullptr ||
+        !sd_lens_pack_vae_latent_shape(n, c, h, w, &input_elements, &output_elements) ||
+        lens_latent_elements != input_elements ||
+        packed_latent_capacity < output_elements) {
+        LOG_ERROR("sd_lens_pack_vae_latent_f32 expected NCHW f32 input shape 1x32xHxW with even H/W and sufficient output capacity");
+        return false;
+    }
+
+    for (int64_t bi = 0; bi < n; ++bi) {
+        for (int64_t ci = 0; ci < c; ++ci) {
+            for (int64_t py = 0; py < h / 2; ++py) {
+                for (int64_t px = 0; px < w / 2; ++px) {
+                    for (int64_t oy = 0; oy < 2; ++oy) {
+                        for (int64_t ox = 0; ox < 2; ++ox) {
+                            const int64_t src_x = px * 2 + ox;
+                            const int64_t src_y = py * 2 + oy;
+                            const int64_t packed_c = ci * 4 + oy * 2 + ox;
+                            const uint64_t src_idx =
+                                static_cast<uint64_t>(bi) * static_cast<uint64_t>(c) * static_cast<uint64_t>(h) * static_cast<uint64_t>(w) +
+                                static_cast<uint64_t>(ci) * static_cast<uint64_t>(h) * static_cast<uint64_t>(w) +
+                                static_cast<uint64_t>(src_y) * static_cast<uint64_t>(w) +
+                                static_cast<uint64_t>(src_x);
+                            const uint64_t dst_idx =
+                                static_cast<uint64_t>(bi) * static_cast<uint64_t>(128) * static_cast<uint64_t>(h / 2) * static_cast<uint64_t>(w / 2) +
+                                static_cast<uint64_t>(packed_c) * static_cast<uint64_t>(h / 2) * static_cast<uint64_t>(w / 2) +
+                                static_cast<uint64_t>(py) * static_cast<uint64_t>(w / 2) +
+                                static_cast<uint64_t>(px);
+                            packed_latent_nchw[dst_idx] = lens_latent_nchw[src_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (out_desc != nullptr) {
+        out_desc->input_n = n;
+        out_desc->input_c = c;
+        out_desc->input_h = h;
+        out_desc->input_w = w;
+        out_desc->output_n = n;
+        out_desc->output_c = 128;
+        out_desc->output_h = h / 2;
+        out_desc->output_w = w / 2;
+        out_desc->input_elements = input_elements;
+        out_desc->output_elements = output_elements;
+    }
+    return true;
+}
+
+SD_API bool sd_lens_unpack_vae_latent_f32(const float* packed_tokens_bsc,
+                                          uint64_t packed_token_elements,
+                                          int64_t n,
+                                          int64_t c,
+                                          int64_t h,
+                                          int64_t w,
+                                          float* lens_latent_nchw,
+                                          uint64_t lens_latent_capacity,
+                                          sd_lens_vae_latent_desc_t* out_desc) {
+    if (out_desc != nullptr) {
+        sd_lens_vae_latent_desc_init(out_desc);
+    }
+    uint64_t public_elements = 0;
+    uint64_t packed_elements = 0;
+    if (packed_tokens_bsc == nullptr || lens_latent_nchw == nullptr ||
+        !sd_lens_pack_vae_latent_shape(n, c, h, w, &public_elements, &packed_elements) ||
+        packed_token_elements != packed_elements ||
+        lens_latent_capacity < public_elements) {
+        LOG_ERROR("sd_lens_unpack_vae_latent_f32 expected packed BSC f32 input shape 1x(H/2*W/2)x128 and output capacity for public Lens latent 1x32xHxW with even H/W");
+        return false;
+    }
+
+    const int64_t packed_h = h / 2;
+    const int64_t packed_w = w / 2;
+    for (int64_t bi = 0; bi < n; ++bi) {
+        for (int64_t py = 0; py < packed_h; ++py) {
+            for (int64_t px = 0; px < packed_w; ++px) {
+                const int64_t token = py * packed_w + px;
+                for (int64_t ci = 0; ci < c; ++ci) {
+                    for (int64_t oy = 0; oy < 2; ++oy) {
+                        for (int64_t ox = 0; ox < 2; ++ox) {
+                            const int64_t packed_c = ci * 4 + oy * 2 + ox;
+                            const int64_t dst_y = py * 2 + oy;
+                            const int64_t dst_x = px * 2 + ox;
+                            const uint64_t src_idx =
+                                static_cast<uint64_t>(bi) * static_cast<uint64_t>(packed_h * packed_w) * static_cast<uint64_t>(128) +
+                                static_cast<uint64_t>(token) * static_cast<uint64_t>(128) +
+                                static_cast<uint64_t>(packed_c);
+                            const uint64_t dst_idx =
+                                static_cast<uint64_t>(bi) * static_cast<uint64_t>(c) * static_cast<uint64_t>(h) * static_cast<uint64_t>(w) +
+                                static_cast<uint64_t>(ci) * static_cast<uint64_t>(h) * static_cast<uint64_t>(w) +
+                                static_cast<uint64_t>(dst_y) * static_cast<uint64_t>(w) +
+                                static_cast<uint64_t>(dst_x);
+                            lens_latent_nchw[dst_idx] = packed_tokens_bsc[src_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (out_desc != nullptr) {
+        out_desc->input_n = n;
+        out_desc->input_c = 128;
+        out_desc->input_h = packed_h;
+        out_desc->input_w = packed_w;
+        out_desc->output_n = n;
+        out_desc->output_c = c;
+        out_desc->output_h = h;
+        out_desc->output_w = w;
+        out_desc->input_elements = packed_elements;
+        out_desc->output_elements = public_elements;
+    }
+    return true;
+}
+
+static bool sd_lens_conditioning_register_native(sd_ctx_t* sd_ctx,
+                                                 sd_lens_cond_v1_native&& condition,
+                                                 const char* debug_name,
+                                                 const char* prompt,
+                                                 const char* tokenizer_dir,
+                                                 const char* chat_current_date,
+                                                 sd_lens_conditioning_handle_t* out_handle,
+                                                 sd_lens_conditioning_desc_t* out_desc) {
+    if (out_handle != nullptr) {
+        *out_handle = 0;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_conditioning_desc_init(out_desc);
+    }
+    if (sd_ctx == nullptr) {
+        return false;
+    }
+    if (condition.trimmed_seq_len <= 0) {
+        LOG_ERROR("sd_lens_conditioning_register_native requires a positive trimmed sequence length");
+        return false;
+    }
+
+    int64_t batch = 0;
+    int64_t seq_len = 0;
+    int64_t hidden = 0;
+    int64_t feature_shapes[SD_LENS_CONDITIONING_FEATURE_COUNT][4] = {};
+    uint64_t estimated_bytes = 0;
+    for (int i = 0; i < SD_LENS_CONDITIONING_FEATURE_COUNT; ++i) {
+        const auto& shape = condition.feature_shapes[static_cast<size_t>(i)];
+        const auto& data = condition.features[static_cast<size_t>(i)];
+        if (shape.size() != 3 || shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0) {
+            LOG_ERROR("sd_lens_conditioning_register_native feature_%d has unsupported shape", i);
+            return false;
+        }
+        const int64_t current_batch = shape[0];
+        const int64_t current_seq_len = shape[1];
+        const int64_t current_hidden = shape[2];
+        const uint64_t expected_elements =
+            static_cast<uint64_t>(current_batch) *
+            static_cast<uint64_t>(current_seq_len) *
+            static_cast<uint64_t>(current_hidden);
+        if (data.size() != expected_elements) {
+            LOG_ERROR("sd_lens_conditioning_register_native feature_%d element count mismatch: got=%zu expected=%" PRIu64,
+                      i,
+                      data.size(),
+                      expected_elements);
+            return false;
+        }
+        if (i == 0) {
+            batch = current_batch;
+            seq_len = current_seq_len;
+            hidden = current_hidden;
+        } else if (current_batch != batch || current_seq_len != seq_len || current_hidden != hidden) {
+            LOG_ERROR("sd_lens_conditioning_register_native feature_%d shape does not match feature_0", i);
+            return false;
+        }
+        feature_shapes[i][0] = current_batch;
+        feature_shapes[i][1] = current_seq_len;
+        feature_shapes[i][2] = current_hidden;
+        feature_shapes[i][3] = 1;
+        estimated_bytes += expected_elements * sizeof(float);
+    }
+
+    int64_t mask_shape[4] = {};
+    if (condition.attention_mask_shape.size() != 2 ||
+        condition.attention_mask_shape[0] != batch ||
+        condition.attention_mask_shape[1] != seq_len ||
+        condition.attention_mask.size() != static_cast<size_t>(batch * seq_len)) {
+        LOG_ERROR("sd_lens_conditioning_register_native attention_mask shape is incompatible with feature tensors");
+        return false;
+    }
+    mask_shape[0] = batch;
+    mask_shape[1] = seq_len;
+    mask_shape[2] = 1;
+    mask_shape[3] = 1;
+    estimated_bytes += static_cast<uint64_t>(condition.attention_mask.size()) * sizeof(float);
+
+    uint64_t shape_hash = sd_lens_hash_init();
+    uint64_t dtype_hash = sd_lens_hash_init();
+    for (int i = 0; i < SD_LENS_CONDITIONING_FEATURE_COUNT; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            sd_lens_hash_combine(shape_hash, static_cast<uint64_t>(feature_shapes[i][j]));
+        }
+        sd_lens_hash_combine(dtype_hash, static_cast<uint64_t>(GGML_TYPE_F32));
+    }
+    for (int i = 0; i < 4; ++i) {
+        sd_lens_hash_combine(shape_hash, static_cast<uint64_t>(mask_shape[i]));
+    }
+    sd_lens_hash_combine(dtype_hash, static_cast<uint64_t>(GGML_TYPE_F32));
+
+    auto resource = std::make_shared<sd_lens_conditioning_resource_private_t>();
+    resource->handle = sd_ctx->next_lens_conditioning_handle++;
+    resource->schema_version = 1;
+    resource->tensor_count = SD_LENS_CONDITIONING_TENSOR_COUNT;
+    resource->batch = batch;
+    resource->seq_len = seq_len;
+    resource->hidden_size = hidden;
+    resource->selected_layer_count = SD_LENS_CONDITIONING_FEATURE_COUNT;
+    resource->dtype = SD_DTYPE_F32;
+    resource->storage_flags = SD_LENS_COND_STORAGE_FLAG_CPU;
+    resource->backend = SD_BACKEND_CPU;
+    resource->shape_hash = shape_hash;
+    resource->dtype_hash = dtype_hash;
+    resource->config_hash = 0;
+    resource->estimated_bytes = estimated_bytes;
+    resource->device_resident = false;
+    resource->copy_safe = true;
+    resource->prompt_encoded = true;
+    resource->native_condition = std::move(condition);
+    try {
+        resource->runtime_tensors = sd_lens_make_transformer_condition_map(resource->native_condition);
+    } catch (const std::exception& e) {
+        LOG_ERROR("sd_lens_conditioning_register_native failed to build transformer condition map: %s", e.what());
+        return false;
+    }
+    resource->prompt_preview = prompt != nullptr ? std::string(prompt).substr(0, 120) : std::string();
+    resource->tokenizer_dir = tokenizer_dir != nullptr ? tokenizer_dir : "";
+    resource->chat_current_date = chat_current_date != nullptr ? chat_current_date : "";
+    resource->debug_name = debug_name != nullptr && debug_name[0] != '\0' ? debug_name : "lens_prompt_conditioning";
+    for (int i = 0; i < SD_LENS_CONDITIONING_FEATURE_COUNT; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            resource->feature_shapes[i][j] = feature_shapes[i][j];
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        resource->mask_shape[i] = mask_shape[i];
+    }
+
+    sd_ctx->lens_conditioning_resources[resource->handle] = resource;
+    if (out_handle != nullptr) {
+        *out_handle = resource->handle;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_conditioning_fill_desc(*resource, out_desc);
+    }
+    return true;
+}
+
+SD_API void sd_lens_conditioning_encode_options_init(sd_lens_conditioning_encode_options_t* options) {
+    if (options == nullptr) {
+        return;
+    }
+    *options = {};
+    options->struct_size = sizeof(sd_lens_conditioning_encode_options_t);
+    options->version = SD_VAE_API_VERSION;
+    options->txt_offset = 97;
+    options->max_seq_len = 128;
+    options->allow_bootstrap_oracle = false;
+}
+
+SD_API bool sd_lens_conditioning_encode_prompt(sd_ctx_t* sd_ctx,
+                                               const char* prompt,
+                                               const sd_lens_conditioning_encode_options_t* options,
+                                               sd_lens_conditioning_handle_t* out_handle,
+                                               sd_lens_conditioning_desc_t* out_desc) {
+    if (out_handle != nullptr) {
+        *out_handle = 0;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_conditioning_desc_init(out_desc);
+    }
+    if (sd_ctx == nullptr) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt requires a valid context");
+        return false;
+    }
+
+    sd_lens_conditioning_encode_options_t resolved;
+    sd_lens_conditioning_encode_options_init(&resolved);
+    if (options != nullptr) {
+        resolved = *options;
+    }
+    if (resolved.text_encoder_dir == nullptr || resolved.text_encoder_dir[0] == '\0') {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt requires text_encoder_dir");
+        return false;
+    }
+    const bool has_prompt = prompt != nullptr && prompt[0] != '\0';
+    if (!has_prompt && (!resolved.allow_bootstrap_oracle ||
+                        resolved.bootstrap_oracle_dir == nullptr ||
+                        resolved.bootstrap_oracle_dir[0] == '\0')) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt requires a prompt unless bootstrap oracle mode is explicitly allowed");
+        return false;
+    }
+    if (resolved.txt_offset != 97 || resolved.max_seq_len != 128) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt currently supports txt_offset=97 and max_seq_len=128 only");
+        return false;
+    }
+
+    sd_lens_text_encoder* encoder = sd_lens_text_encoder_create();
+    if (encoder == nullptr) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt failed to create text encoder");
+        return false;
+    }
+    auto cleanup_encoder = [&]() {
+        if (encoder != nullptr) {
+            sd_lens_text_encoder_free(encoder);
+            encoder = nullptr;
+        }
+    };
+
+    sd_lens_text_encoder_result text_result;
+    sd_lens_text_encoder_load_options load_options;
+    load_options.text_encoder_dir = resolved.text_encoder_dir;
+    bool text_encoder_loaded = false;
+    try {
+        text_encoder_loaded = sd_lens_text_encoder_load(encoder, load_options, &text_result);
+    } catch (const std::exception& e) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt text encoder load threw: %s", e.what());
+        cleanup_encoder();
+        return false;
+    } catch (...) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt text encoder load threw an unknown exception");
+        cleanup_encoder();
+        return false;
+    }
+    if (!text_encoder_loaded) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt text encoder load failed: %s", text_result.error.c_str());
+        cleanup_encoder();
+        return false;
+    }
+
+    sd_lens_cond_v1_native condition;
+    sd_lens_text_encoder_encode_options encode_options;
+    encode_options.bootstrap_oracle_dir = resolved.bootstrap_oracle_dir != nullptr ? resolved.bootstrap_oracle_dir : "";
+    encode_options.output_safetensors = resolved.optional_cond_out != nullptr ? resolved.optional_cond_out : "";
+    encode_options.output_condition = &condition;
+    encode_options.txt_offset = resolved.txt_offset;
+    encode_options.max_seq_len = resolved.max_seq_len;
+    encode_options.suppress_stdout = true;
+
+    std::string tokenizer_dir;
+    if (has_prompt) {
+        tokenizer_dir = resolved.tokenizer_dir != nullptr && resolved.tokenizer_dir[0] != '\0'
+                            ? resolved.tokenizer_dir
+                            : (std::filesystem::path(resolved.text_encoder_dir).parent_path() / "tokenizer").string();
+        sd_lens_gptoss_tokenizer tokenizer;
+        sd_lens_tokenized_prompt tokenized;
+        std::string tokenizer_error;
+        if (!tokenizer.load(tokenizer_dir, &tokenizer_error) ||
+            !tokenizer.encode_prompt(prompt,
+                                     resolved.max_seq_len,
+                                     resolved.chat_current_date != nullptr ? resolved.chat_current_date : "",
+                                     &tokenized,
+                                     &tokenizer_error)) {
+            LOG_ERROR("sd_lens_conditioning_encode_prompt tokenizer failed: %s", tokenizer_error.c_str());
+            cleanup_encoder();
+            return false;
+        }
+        encode_options.input_ids = std::move(tokenized.input_ids);
+        encode_options.attention_mask = std::move(tokenized.attention_mask);
+        encode_options.prompt = prompt;
+        encode_options.tokenizer_source = "native_gptoss_tokenizer_json";
+        encode_options.bootstrap_tokens = false;
+    }
+
+    bool text_encoder_encoded = false;
+    try {
+        text_encoder_encoded = sd_lens_text_encoder_encode(encoder, encode_options, &text_result);
+    } catch (const std::exception& e) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt text encoder encode threw: %s", e.what());
+        cleanup_encoder();
+        return false;
+    } catch (...) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt text encoder encode threw an unknown exception");
+        cleanup_encoder();
+        return false;
+    }
+    if (!text_encoder_encoded) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt text encoder encode failed: %s", text_result.error.c_str());
+        cleanup_encoder();
+        return false;
+    }
+    cleanup_encoder();
+
+    const char* debug_name = resolved.cache_key_hint != nullptr && resolved.cache_key_hint[0] != '\0'
+                                 ? resolved.cache_key_hint
+                                 : "lens_prompt_conditioning";
+    try {
+        return sd_lens_conditioning_register_native(sd_ctx,
+                                                    std::move(condition),
+                                                    debug_name,
+                                                    prompt,
+                                                    tokenizer_dir.c_str(),
+                                                    resolved.chat_current_date,
+                                                    out_handle,
+                                                    out_desc);
+    } catch (const std::exception& e) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt conditioning register threw: %s", e.what());
+        return false;
+    } catch (...) {
+        LOG_ERROR("sd_lens_conditioning_encode_prompt conditioning register threw an unknown exception");
+        return false;
+    }
+}
+
+SD_API void sd_lens_sample_options_init(sd_lens_sample_options_t* options) {
+    if (options == nullptr) {
+        return;
+    }
+    *options = {};
+    options->struct_size = sizeof(sd_lens_sample_options_t);
+    options->version = SD_VAE_API_VERSION;
+    options->width = 256;
+    options->height = 256;
+    options->steps = 4;
+    options->seed = 42;
+    options->cfg = 1.0f;
+    options->repeat_generations = 1;
+    options->persistent_blocks_memory_mib = 4096;
+    options->use_transformer_context = true;
+    options->keep_transformer_warm = false;
+    options->output_packed_vae_latent = false;
+}
+
+SD_API void sd_lens_sample_desc_init(sd_lens_sample_desc_t* desc) {
+    if (desc == nullptr) {
+        return;
+    }
+    *desc = {};
+    desc->struct_size = sizeof(sd_lens_sample_desc_t);
+    desc->version = SD_VAE_API_VERSION;
+}
+
+static bool sd_lens_sample_latent_from_resource(
+    const std::shared_ptr<sd_lens_conditioning_resource_private_t>& cond_resource,
+    const sd_lens_sample_options_t* options,
+    sd_latent_t** out_latent,
+    sd_lens_sample_desc_t* out_desc,
+    const char* api_name) {
+    if (out_latent != nullptr) {
+        *out_latent = nullptr;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_sample_desc_init(out_desc);
+    }
+    if (cond_resource == nullptr || out_latent == nullptr) {
+        LOG_ERROR("%s requires a prompt-encoded in-memory Lens conditioning resource and output latent pointer",
+                  api_name != nullptr ? api_name : "sd_lens_sample_latent");
+        return false;
+    }
+    sd_lens_sample_options_t resolved;
+    sd_lens_sample_options_init(&resolved);
+    if (options != nullptr) {
+        resolved = *options;
+    }
+    if (resolved.transformer_dir == nullptr || resolved.transformer_dir[0] == '\0') {
+        LOG_ERROR("sd_lens_sample_latent requires transformer_dir");
+        return false;
+    }
+    if (resolved.width <= 0 || resolved.height <= 0 || resolved.steps <= 0) {
+        LOG_ERROR("sd_lens_sample_latent requires positive width, height, and steps");
+        return false;
+    }
+    if (std::fabs(resolved.cfg - 1.0f) > 0.000001f) {
+        LOG_ERROR("sd_lens_sample_latent currently supports cfg=1.0 only");
+        return false;
+    }
+    if (cond_resource->runtime_tensors.empty()) {
+        LOG_ERROR("sd_lens_sample_latent requires a prompt-encoded in-memory Lens conditioning handle");
+        return false;
+    }
+
+    const std::string speed_mode = resolved.speed_mode != nullptr ? resolved.speed_mode : "";
+    std::string transformer_residency = resolved.transformer_residency != nullptr ? resolved.transformer_residency : "";
+    if (speed_mode == "bf16-resident") {
+        transformer_residency = "gpu-full-bf16";
+    } else if (transformer_residency.empty()) {
+        transformer_residency = "streaming";
+    }
+    const std::string dynamic_residency = resolved.dynamic_residency != nullptr ? resolved.dynamic_residency : "none";
+
+    sd_lens_transformer_runtime_options runtime_options;
+    runtime_options.transformer_dir = resolved.transformer_dir;
+    runtime_options.latent_npy = resolved.latent_npy != nullptr ? resolved.latent_npy : "";
+    runtime_options.packed_tokens_npy = resolved.packed_tokens_npy != nullptr ? resolved.packed_tokens_npy : "";
+    runtime_options.attention_mode = resolved.attention_mode != nullptr && resolved.attention_mode[0] != '\0'
+                                         ? resolved.attention_mode
+                                         : "regular-f32";
+    runtime_options.width = resolved.width;
+    runtime_options.height = resolved.height;
+    runtime_options.steps = resolved.steps;
+    runtime_options.seed = resolved.seed;
+    runtime_options.repeat_generations = resolved.repeat_generations > 0 ? resolved.repeat_generations : 1;
+    runtime_options.use_transformer_context = resolved.use_transformer_context;
+    runtime_options.transformer_residency = transformer_residency;
+    runtime_options.dynamic_residency = dynamic_residency;
+    runtime_options.window_blocks = resolved.window_blocks;
+    runtime_options.persistent_blocks = resolved.persistent_blocks;
+    runtime_options.persistent_blocks_memory_mib = resolved.persistent_blocks_memory_mib;
+    runtime_options.keep_transformer_warm = resolved.keep_transformer_warm;
+    runtime_options.progress_callback = sd_get_progress_callback();
+    runtime_options.progress_callback_data = sd_get_progress_callback_data();
+
+    sd_lens_transformer_runtime_result runtime_result;
+    if (!sd_lens_transformer_runtime_run_native_cuda(runtime_options,
+                                                    cond_resource->runtime_tensors,
+                                                    &runtime_result)) {
+        LOG_ERROR("sd_lens_sample_latent transformer failed: %s", runtime_result.error.c_str());
+        return false;
+    }
+    if (runtime_result.latent.shape.size() != 4 ||
+        runtime_result.latent.shape[0] != 1 ||
+        runtime_result.latent.shape[1] != 32 ||
+        runtime_result.latent.shape[2] <= 0 ||
+        runtime_result.latent.shape[3] <= 0) {
+        LOG_ERROR("sd_lens_sample_latent expected transformer latent shape 1x32xHxW");
+        return false;
+    }
+    const int latent_h = static_cast<int>(runtime_result.latent.shape[2]);
+    const int latent_w = static_cast<int>(runtime_result.latent.shape[3]);
+    const uint64_t expected_elements =
+        static_cast<uint64_t>(latent_w) * static_cast<uint64_t>(latent_h) * 32ull;
+    if (runtime_result.latent.data.size() != expected_elements) {
+        LOG_ERROR("sd_lens_sample_latent latent element count mismatch: got=%zu expected=%" PRIu64,
+                  runtime_result.latent.data.size(),
+                  expected_elements);
+        return false;
+    }
+
+    sd::Tensor<float> tensor({latent_w, latent_h, 32, 1}, std::move(runtime_result.latent.data));
+    sd_latent_t* latent = make_sd_latent(std::move(tensor), sd_latent_source_t::sampler);
+    if (latent == nullptr) {
+        LOG_ERROR("sd_lens_sample_latent failed to allocate public latent");
+        return false;
+    }
+    *out_latent = latent;
+
+    if (out_desc != nullptr) {
+        sd_lens_sample_desc_init(out_desc);
+        out_desc->width = resolved.width;
+        out_desc->height = resolved.height;
+        out_desc->latent_width = latent_w;
+        out_desc->latent_height = latent_h;
+        out_desc->latent_channels = 32;
+        out_desc->steps = resolved.steps;
+        out_desc->seed = resolved.seed;
+        out_desc->cfg = resolved.cfg;
+        out_desc->transformer_wall_seconds = runtime_result.wall_seconds;
+        out_desc->transformer_context_load_seconds = runtime_result.context_load_seconds;
+        out_desc->transformer_resident_upload_seconds = runtime_result.resident_upload_seconds;
+        out_desc->transformer_loop_seconds = runtime_result.loop_seconds;
+        out_desc->transformer_generation_seconds = runtime_result.total_generation_seconds;
+        out_desc->runner_setup_seconds = runtime_result.runner_setup_seconds;
+        out_desc->runner_alloc_compute_buffer_seconds = runtime_result.runner_alloc_compute_buffer_seconds;
+        out_desc->runner_graph_build_seconds = runtime_result.runner_graph_build_seconds;
+        out_desc->runner_graph_alloc_seconds = runtime_result.runner_graph_alloc_seconds;
+        out_desc->runner_input_copy_seconds = runtime_result.runner_input_copy_seconds;
+        out_desc->runner_compute_seconds = runtime_result.runner_compute_seconds;
+        out_desc->runner_sync_seconds = runtime_result.runner_sync_seconds;
+        out_desc->runner_output_copy_seconds = runtime_result.runner_output_copy_seconds;
+        out_desc->runner_cleanup_seconds = runtime_result.runner_cleanup_seconds;
+        out_desc->scheduler_flow_seconds = runtime_result.scheduler_flow_seconds;
+        out_desc->unpack_seconds = runtime_result.unpack_seconds;
+        out_desc->runner_input_copy_bytes = runtime_result.runner_input_copy_bytes;
+        out_desc->runner_output_copy_bytes = runtime_result.runner_output_copy_bytes;
+        out_desc->streamed_bytes = runtime_result.streamed_bytes;
+        out_desc->disk_read_bytes = runtime_result.disk_read_bytes;
+        out_desc->resident_weight_bytes = runtime_result.resident_weight_bytes;
+        out_desc->resident_static_bytes = runtime_result.resident_static_bytes;
+        out_desc->runner_count = runtime_result.runner_count;
+        out_desc->hidden_parity_exact = speed_mode != "bf16-resident";
+        out_desc->speed_mode_explicit = !speed_mode.empty();
+        out_desc->bf16_resident = transformer_residency == "gpu-full-bf16";
+        out_desc->dynamic_gpu_streams = dynamic_residency == "gpu-streams";
+        out_desc->streamed_bytes_zero = out_desc->bf16_resident && out_desc->dynamic_gpu_streams;
+        out_desc->cpu_latent_output = true;
+        out_desc->gpu_latent_output = false;
+        std::snprintf(out_desc->speed_mode, sizeof(out_desc->speed_mode), "%s", speed_mode.c_str());
+        std::snprintf(out_desc->transformer_residency, sizeof(out_desc->transformer_residency), "%s", transformer_residency.c_str());
+        std::snprintf(out_desc->dynamic_residency, sizeof(out_desc->dynamic_residency), "%s", dynamic_residency.c_str());
+    }
+    return true;
+}
+
+SD_API bool sd_lens_conditioning_detach(sd_ctx_t* sd_ctx,
+                                        sd_lens_conditioning_handle_t conditioning,
+                                        sd_lens_conditioning_handle_t* out_detached_handle,
+                                        sd_lens_conditioning_desc_t* out_desc) {
+    if (out_detached_handle != nullptr) {
+        *out_detached_handle = 0;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_conditioning_desc_init(out_desc);
+    }
+    auto resource = sd_lens_conditioning_lookup(sd_ctx, conditioning);
+    if (resource == nullptr || resource->runtime_tensors.empty()) {
+        LOG_ERROR("sd_lens_conditioning_detach requires a prompt-encoded in-memory Lens conditioning handle");
+        return false;
+    }
+    const sd_lens_conditioning_handle_t detached_handle = g_next_detached_lens_conditioning_handle++;
+    resource->refcount++;
+    g_detached_lens_conditioning_resources[detached_handle] = resource;
+    if (out_detached_handle != nullptr) {
+        *out_detached_handle = detached_handle;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_conditioning_fill_desc(*resource, out_desc);
+        out_desc->handle = detached_handle;
+    }
+    return true;
+}
+
+SD_API bool sd_lens_conditioning_detached_release(sd_lens_conditioning_handle_t detached_handle) {
+    if (detached_handle == 0) {
+        LOG_ERROR("sd_lens_conditioning_detached_release requires a non-zero detached handle");
+        return false;
+    }
+    auto it = g_detached_lens_conditioning_resources.find(detached_handle);
+    if (it == g_detached_lens_conditioning_resources.end()) {
+        return false;
+    }
+    if (it->second != nullptr && it->second->refcount > 0) {
+        it->second->refcount--;
+    }
+    g_detached_lens_conditioning_resources.erase(it);
+    return true;
+}
+
+SD_API bool sd_lens_sample_latent(sd_ctx_t* sd_ctx,
+                                  sd_lens_conditioning_handle_t conditioning,
+                                  const sd_lens_sample_options_t* options,
+                                  sd_latent_t** out_latent,
+                                  sd_lens_sample_desc_t* out_desc) {
+    if (sd_ctx == nullptr || conditioning == 0) {
+        if (out_latent != nullptr) {
+            *out_latent = nullptr;
+        }
+        if (out_desc != nullptr) {
+            sd_lens_sample_desc_init(out_desc);
+        }
+        LOG_ERROR("sd_lens_sample_latent requires context and conditioning handle");
+        return false;
+    }
+    return sd_lens_sample_latent_from_resource(
+        sd_lens_conditioning_lookup(sd_ctx, conditioning),
+        options,
+        out_latent,
+        out_desc,
+        "sd_lens_sample_latent");
+}
+
+SD_API bool sd_lens_sample_latent_detached(sd_lens_conditioning_handle_t detached_conditioning,
+                                           const sd_lens_sample_options_t* options,
+                                           sd_latent_t** out_latent,
+                                           sd_lens_sample_desc_t* out_desc) {
+    auto it = g_detached_lens_conditioning_resources.find(detached_conditioning);
+    if (it == g_detached_lens_conditioning_resources.end()) {
+        if (out_latent != nullptr) {
+            *out_latent = nullptr;
+        }
+        if (out_desc != nullptr) {
+            sd_lens_sample_desc_init(out_desc);
+        }
+        LOG_ERROR("sd_lens_sample_latent_detached requires a live detached Lens conditioning handle");
+        return false;
+    }
+    return sd_lens_sample_latent_from_resource(
+        it->second,
+        options,
+        out_latent,
+        out_desc,
+        "sd_lens_sample_latent_detached");
+}
+
+SD_API bool sd_lens_sample_packed_vae_latent_gpu_detached(sd_ctx_t* sd_ctx,
+                                                          sd_lens_conditioning_handle_t detached_conditioning,
+                                                          const sd_lens_sample_options_t* options,
+                                                          sd_gpu_handle_t* out_gpu_latent,
+                                                          sd_lens_sample_desc_t* out_desc) {
+    if (out_gpu_latent != nullptr) {
+        *out_gpu_latent = 0;
+    }
+    if (out_desc != nullptr) {
+        sd_lens_sample_desc_init(out_desc);
+    }
+    if (sd_ctx == nullptr || out_gpu_latent == nullptr) {
+        LOG_ERROR("sd_lens_sample_packed_vae_latent_gpu_detached requires a context and output GPU latent pointer");
+        return false;
+    }
+    auto it = g_detached_lens_conditioning_resources.find(detached_conditioning);
+    if (it == g_detached_lens_conditioning_resources.end() || it->second == nullptr) {
+        LOG_ERROR("sd_lens_sample_packed_vae_latent_gpu_detached requires a live detached Lens conditioning handle");
+        return false;
+    }
+
+    sd_lens_sample_options_t resolved;
+    sd_lens_sample_options_init(&resolved);
+    if (options != nullptr) {
+        resolved = *options;
+    }
+    resolved.output_packed_vae_latent = true;
+    if (resolved.transformer_dir == nullptr || resolved.transformer_dir[0] == '\0') {
+        LOG_ERROR("sd_lens_sample_packed_vae_latent_gpu_detached requires transformer_dir");
+        return false;
+    }
+    if (resolved.width <= 0 || resolved.height <= 0 || resolved.steps <= 0) {
+        LOG_ERROR("sd_lens_sample_packed_vae_latent_gpu_detached requires positive width, height, and steps");
+        return false;
+    }
+    if (std::fabs(resolved.cfg - 1.0f) > 0.000001f) {
+        LOG_ERROR("sd_lens_sample_packed_vae_latent_gpu_detached currently supports cfg=1.0 only");
+        return false;
+    }
+
+    const std::string speed_mode = resolved.speed_mode != nullptr ? resolved.speed_mode : "";
+    std::string transformer_residency = resolved.transformer_residency != nullptr ? resolved.transformer_residency : "";
+    if (speed_mode == "bf16-resident") {
+        transformer_residency = "gpu-full-bf16";
+    } else if (transformer_residency.empty()) {
+        transformer_residency = "streaming";
+    }
+    const std::string dynamic_residency = resolved.dynamic_residency != nullptr ? resolved.dynamic_residency : "none";
+
+    sd_lens_transformer_runtime_options runtime_options;
+    runtime_options.transformer_dir = resolved.transformer_dir;
+    runtime_options.latent_npy = resolved.latent_npy != nullptr ? resolved.latent_npy : "";
+    runtime_options.packed_tokens_npy = resolved.packed_tokens_npy != nullptr ? resolved.packed_tokens_npy : "";
+    runtime_options.attention_mode = resolved.attention_mode != nullptr && resolved.attention_mode[0] != '\0'
+                                         ? resolved.attention_mode
+                                         : "regular-f32";
+    runtime_options.width = resolved.width;
+    runtime_options.height = resolved.height;
+    runtime_options.steps = resolved.steps;
+    runtime_options.seed = resolved.seed;
+    runtime_options.repeat_generations = resolved.repeat_generations > 0 ? resolved.repeat_generations : 1;
+    runtime_options.use_transformer_context = resolved.use_transformer_context;
+    runtime_options.transformer_residency = transformer_residency;
+    runtime_options.dynamic_residency = dynamic_residency;
+    runtime_options.window_blocks = resolved.window_blocks;
+    runtime_options.persistent_blocks = resolved.persistent_blocks;
+    runtime_options.persistent_blocks_memory_mib = resolved.persistent_blocks_memory_mib;
+    runtime_options.keep_transformer_warm = resolved.keep_transformer_warm;
+    runtime_options.output_packed_vae_latent = true;
+    runtime_options.progress_callback = sd_get_progress_callback();
+    runtime_options.progress_callback_data = sd_get_progress_callback_data();
+
+    sd_lens_transformer_runtime_result runtime_result;
+    if (!sd_lens_transformer_runtime_run_native_cuda(runtime_options,
+                                                    it->second->runtime_tensors,
+                                                    &runtime_result)) {
+        LOG_ERROR("sd_lens_sample_packed_vae_latent_gpu_detached transformer failed: %s", runtime_result.error.c_str());
+        return false;
+    }
+    Tensor& packed = runtime_result.packed_vae_latent;
+    if (packed.shape.size() != 4 ||
+        packed.shape[0] != 1 ||
+        packed.shape[1] != 128 ||
+        packed.shape[2] <= 0 ||
+        packed.shape[3] <= 0) {
+        LOG_ERROR("sd_lens_sample_packed_vae_latent_gpu_detached expected packed latent shape 1x128xHxW");
+        return false;
+    }
+    const int64_t packed_h = packed.shape[2];
+    const int64_t packed_w = packed.shape[3];
+    const uint64_t expected_elements =
+        static_cast<uint64_t>(packed_w) * static_cast<uint64_t>(packed_h) * 128ull;
+    if (packed.data.size() != expected_elements) {
+        LOG_ERROR("sd_lens_sample_packed_vae_latent_gpu_detached packed element count mismatch: got=%zu expected=%" PRIu64,
+                  packed.data.size(),
+                  expected_elements);
+        return false;
+    }
+
+    sd::Tensor<float> packed_tensor({packed_w, packed_h, 128, 1}, std::move(packed.data));
+    auto resource = sd_upload_tensor_to_backend_resource(
+        sd_ctx,
+        packed_tensor,
+        "lens_packed_vae_latent_bridge_f32");
+    sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
+                                                       std::move(resource),
+                                                       SD_GPU_RESOURCE_LATENT,
+                                                       SD_LAYOUT_WHCN_GGML,
+                                                       SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT |
+                                                           SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD,
+                                                       "lens_packed_vae_latent_bridge_f32");
+    if (handle == 0) {
+        return false;
+    }
+    *out_gpu_latent = handle;
+
+    if (out_desc != nullptr) {
+        sd_lens_sample_desc_init(out_desc);
+        out_desc->width = resolved.width;
+        out_desc->height = resolved.height;
+        out_desc->latent_width = static_cast<int>(packed_w * 2);
+        out_desc->latent_height = static_cast<int>(packed_h * 2);
+        out_desc->latent_channels = 32;
+        out_desc->steps = resolved.steps;
+        out_desc->seed = resolved.seed;
+        out_desc->cfg = resolved.cfg;
+        out_desc->transformer_wall_seconds = runtime_result.wall_seconds;
+        out_desc->transformer_context_load_seconds = runtime_result.context_load_seconds;
+        out_desc->transformer_resident_upload_seconds = runtime_result.resident_upload_seconds;
+        out_desc->transformer_loop_seconds = runtime_result.loop_seconds;
+        out_desc->transformer_generation_seconds = runtime_result.total_generation_seconds;
+        out_desc->runner_setup_seconds = runtime_result.runner_setup_seconds;
+        out_desc->runner_alloc_compute_buffer_seconds = runtime_result.runner_alloc_compute_buffer_seconds;
+        out_desc->runner_graph_build_seconds = runtime_result.runner_graph_build_seconds;
+        out_desc->runner_graph_alloc_seconds = runtime_result.runner_graph_alloc_seconds;
+        out_desc->runner_input_copy_seconds = runtime_result.runner_input_copy_seconds;
+        out_desc->runner_compute_seconds = runtime_result.runner_compute_seconds;
+        out_desc->runner_sync_seconds = runtime_result.runner_sync_seconds;
+        out_desc->runner_output_copy_seconds = runtime_result.runner_output_copy_seconds;
+        out_desc->runner_cleanup_seconds = runtime_result.runner_cleanup_seconds;
+        out_desc->scheduler_flow_seconds = runtime_result.scheduler_flow_seconds;
+        out_desc->unpack_seconds = runtime_result.unpack_seconds;
+        out_desc->runner_input_copy_bytes = runtime_result.runner_input_copy_bytes;
+        out_desc->runner_output_copy_bytes = runtime_result.runner_output_copy_bytes;
+        out_desc->streamed_bytes = runtime_result.streamed_bytes;
+        out_desc->disk_read_bytes = runtime_result.disk_read_bytes;
+        out_desc->resident_weight_bytes = runtime_result.resident_weight_bytes;
+        out_desc->resident_static_bytes = runtime_result.resident_static_bytes;
+        out_desc->runner_count = runtime_result.runner_count;
+        out_desc->hidden_parity_exact = speed_mode != "bf16-resident";
+        out_desc->speed_mode_explicit = !speed_mode.empty();
+        out_desc->bf16_resident = transformer_residency == "gpu-full-bf16";
+        out_desc->dynamic_gpu_streams = dynamic_residency == "gpu-streams";
+        out_desc->streamed_bytes_zero = out_desc->bf16_resident && out_desc->dynamic_gpu_streams;
+        out_desc->cpu_latent_output = false;
+        out_desc->gpu_latent_output = true;
+        std::snprintf(out_desc->speed_mode, sizeof(out_desc->speed_mode), "%s", speed_mode.c_str());
+        std::snprintf(out_desc->transformer_residency, sizeof(out_desc->transformer_residency), "%s", transformer_residency.c_str());
+        std::snprintf(out_desc->dynamic_residency, sizeof(out_desc->dynamic_residency), "%s", dynamic_residency.c_str());
+    }
+    return true;
+}
+
+SD_API void sd_lens_transformer_warm_cache_clear(void) {
+    sd_lens_transformer_runtime_clear_warm_cache();
+}
+
 SD_API bool sd_gpu_latent_export_f32_nchw_debug(sd_ctx_t* sd_ctx,
                                                 sd_gpu_handle_t gpu_latent,
                                                 float* dst,
@@ -12533,15 +16170,33 @@ SD_API bool sd_cpu_latent_upload(sd_ctx_t* sd_ctx,
         return false;
     }
     const sd_latent_source_t source = sd_latent_source(cpu_latent);
-    auto resource = sd_upload_tensor_to_backend_resource(sd_ctx, *tensor, "uploaded_latent_f32");
+    sd::Tensor<float> packed_lens_latent;
+    const sd::Tensor<float>* upload_tensor = tensor;
+    const bool pack_lens_for_vae =
+        sd_ctx->sd != nullptr &&
+        sd_version_is_lens(sd_ctx->sd->version) &&
+        tensor->dim() == 4 &&
+        tensor->shape()[2] == 32;
+    if (pack_lens_for_vae) {
+        packed_lens_latent = sd_lens_pack_vae_latent_tensor(*tensor);
+        if (packed_lens_latent.empty()) {
+            LOG_ERROR("sd_cpu_latent_upload Lens path expected a batch-1 32-channel latent with even spatial dimensions");
+            return false;
+        }
+        upload_tensor = &packed_lens_latent;
+    }
+    auto resource = sd_upload_tensor_to_backend_resource(
+        sd_ctx,
+        *upload_tensor,
+        pack_lens_for_vae ? "uploaded_lens_packed_vae_latent_f32" : "uploaded_latent_f32");
     sd_gpu_handle_t handle = sd_gpu_register_resource(sd_ctx,
-                                                      std::move(resource),
-                                                      SD_GPU_RESOURCE_LATENT,
+                                                       std::move(resource),
+                                                       SD_GPU_RESOURCE_LATENT,
                                                       SD_LAYOUT_WHCN_GGML,
                                                       SD_GPU_RESOURCE_FLAG_CPU_BRIDGE_UPLOAD |
                                                           (source == sd_latent_source_t::vae_encode ? SD_GPU_RESOURCE_FLAG_VAE_ENCODE_OUTPUT : 0u) |
                                                           (source == sd_latent_source_t::sampler ? SD_GPU_RESOURCE_FLAG_SAMPLER_OUTPUT : 0u),
-                                                      "uploaded_latent_f32");
+                                                       pack_lens_for_vae ? "uploaded_lens_packed_vae_latent_f32" : "uploaded_latent_f32");
     if (handle == 0) {
         return false;
     }
@@ -13252,8 +16907,7 @@ SD_API bool sd_decode_gpu_latent_normal_gpu(sd_ctx_t* sd_ctx,
         return false;
     }
     const bool wan_qwen_gpu_vae =
-        sd_experimental_wan_qwen_vae_gpu_enabled() &&
-        (sd_version_is_qwen_image(sd_ctx->sd->version) || sd_version_is_anima(sd_ctx->sd->version)) &&
+        sd_wan_qwen_vae_gpu_decode_enabled(sd_ctx->sd->version) &&
         resolved_mode == SD_VAE_EXEC_DIRECT_GRAPH;
     if (resolved_mode != SD_VAE_EXEC_COMFY_NORMAL) {
         if (!wan_qwen_gpu_vae) {

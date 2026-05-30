@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "common_dit.hpp"
+#include "bonsai_gemlite_int1.hpp"
 #include "model.h"
 #include "rope.hpp"
 
@@ -336,6 +337,13 @@ namespace Flux {
             auto txt_norm2 = std::dynamic_pointer_cast<LayerNorm>(blocks["txt_norm2"]);
             auto txt_mlp   = std::dynamic_pointer_cast<UnaryBlock>(blocks["txt_mlp"]);
 
+            if (idx == 0) {
+                img = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img, "block00.double.img.stream.input");
+                txt = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt, "block00.double.txt.stream.input");
+                vec = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, vec, "block00.double.vec.input");
+                pe  = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, pe, "block00.double.pe.input");
+            }
+
             if (img_mods.empty()) {
                 if (prune_mod) {
                     img_mods = get_distil_img_mod(ctx, vec);
@@ -346,6 +354,14 @@ namespace Flux {
             }
             ModulationOut img_mod1 = img_mods[0];
             ModulationOut img_mod2 = img_mods[1];
+            if (idx == 0) {
+                img_mod1.shift = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img_mod1.shift, "block00.double.img.mod1.shift");
+                img_mod1.scale = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img_mod1.scale, "block00.double.img.mod1.scale");
+                img_mod1.gate  = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img_mod1.gate, "block00.double.img.mod1.gate");
+                img_mod2.shift = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img_mod2.shift, "block00.double.img.mod2.shift");
+                img_mod2.scale = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img_mod2.scale, "block00.double.img.mod2.scale");
+                img_mod2.gate  = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img_mod2.gate, "block00.double.img.mod2.gate");
+            }
             if (txt_mods.empty()) {
                 if (prune_mod) {
                     txt_mods = get_distil_txt_mod(ctx, vec);
@@ -356,10 +372,24 @@ namespace Flux {
             }
             ModulationOut txt_mod1 = txt_mods[0];
             ModulationOut txt_mod2 = txt_mods[1];
+            if (idx == 0) {
+                txt_mod1.shift = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt_mod1.shift, "block00.double.txt.mod1.shift");
+                txt_mod1.scale = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt_mod1.scale, "block00.double.txt.mod1.scale");
+                txt_mod1.gate  = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt_mod1.gate, "block00.double.txt.mod1.gate");
+                txt_mod2.shift = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt_mod2.shift, "block00.double.txt.mod2.shift");
+                txt_mod2.scale = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt_mod2.scale, "block00.double.txt.mod2.scale");
+                txt_mod2.gate  = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt_mod2.gate, "block00.double.txt.mod2.gate");
+            }
 
             // prepare image for attention
             auto img_modulated = img_norm1->forward(ctx, img);
+            if (idx == 0) {
+                img_modulated = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img_modulated, "block00.double.img.norm1.output");
+            }
             img_modulated      = Flux::modulate(ctx->ggml_ctx, img_modulated, img_mod1.shift, img_mod1.scale);
+            if (idx == 0) {
+                img_modulated = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img_modulated, "block00.double.img.qkv.input.after_modulate");
+            }
             auto img_qkv       = img_attn->pre_attention(ctx, img_modulated);  // q,k,v: [N, n_img_token, n_head, d_head]
             auto img_q         = img_qkv[0];
             auto img_k         = img_qkv[1];
@@ -367,7 +397,13 @@ namespace Flux {
 
             // prepare txt for attention
             auto txt_modulated = txt_norm1->forward(ctx, txt);
+            if (idx == 0) {
+                txt_modulated = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt_modulated, "block00.double.txt.norm1.output");
+            }
             txt_modulated      = Flux::modulate(ctx->ggml_ctx, txt_modulated, txt_mod1.shift, txt_mod1.scale);
+            if (idx == 0) {
+                txt_modulated = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt_modulated, "block00.double.txt.qkv.input.after_modulate");
+            }
             auto txt_qkv       = txt_attn->pre_attention(ctx, txt_modulated);  // q,k,v: [N, n_txt_token, n_head, d_head]
             auto txt_q         = txt_qkv[0];
             auto txt_k         = txt_qkv[1];
@@ -566,11 +602,25 @@ namespace Flux {
 
                 auto m     = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));  // [N, 2 * hidden_size]
                 auto m_vec = ggml_ext_chunk(ctx->ggml_ctx, m, 2, 0);
-                shift      = m_vec[0];  // [N, hidden_size]
-                scale      = m_vec[1];  // [N, hidden_size]
+                // Diffusers AdaLayerNormContinuous chunks final modulation as
+                // scale, shift. Reversing this corrupts the final predicted
+                // patch tensor even when all transformer blocks match.
+                scale      = m_vec[0];  // [N, hidden_size]
+                shift      = m_vec[1];  // [N, hidden_size]
             }
 
-            x = Flux::modulate(ctx->ggml_ctx, norm_final->forward(ctx, x), shift, scale);
+            if (ctx->bonsai_gemlite_runtime != nullptr) {
+                scale = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, scale, "flux2.final_layer.mod_scale");
+                shift = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, shift, "flux2.final_layer.mod_shift");
+            }
+            x = norm_final->forward(ctx, x);
+            if (ctx->bonsai_gemlite_runtime != nullptr) {
+                x = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, x, "flux2.final_layer.norm_output");
+            }
+            x = Flux::modulate(ctx->ggml_ctx, x, shift, scale);
+            if (ctx->bonsai_gemlite_runtime != nullptr) {
+                x = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, x, "flux2.final_layer.proj_input_after_modulate");
+            }
             x = linear->forward(ctx, x);
 
             return x;
@@ -861,7 +911,13 @@ namespace Flux {
             auto final_layer = std::dynamic_pointer_cast<LastLayer>(blocks["final_layer"]);
 
             if (img_in) {
+                if (ctx->bonsai_gemlite_runtime != nullptr) {
+                    img = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img, "flux2.img_in.input");
+                }
                 img = img_in->forward(ctx, img);
+                if (ctx->bonsai_gemlite_runtime != nullptr) {
+                    img = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img, "flux2.img_in.output");
+                }
             }
 
             ggml_tensor* vec;
@@ -939,6 +995,10 @@ namespace Flux {
                 auto img_txt = block->forward(ctx, img, txt, vec, pe, txt_img_mask, ds_img_mods, ds_txt_mods);
                 img          = img_txt.first;   // [N, n_img_token, hidden_size]
                 txt          = img_txt.second;  // [N, n_txt_token, hidden_size]
+                if (i == 0 && ctx->bonsai_gemlite_runtime != nullptr) {
+                    img = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img, "block00.double.img.output");
+                    txt = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt, "block00.double.txt.output");
+                }
             }
 
             auto txt_img = ggml_concat(ctx->ggml_ctx, txt, img, 1);  // [N, n_txt_token + n_img_token, hidden_size]
@@ -950,6 +1010,9 @@ namespace Flux {
 
                 txt_img = block->forward(ctx, txt_img, vec, pe, txt_img_mask, ss_mods);
             }
+            if (ctx->bonsai_gemlite_runtime != nullptr) {
+                txt_img = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, txt_img, "flux2.single_stream.after_all_blocks");
+            }
 
             img = ggml_view_3d(ctx->ggml_ctx,
                                txt_img,
@@ -959,9 +1022,15 @@ namespace Flux {
                                txt_img->nb[1],
                                txt_img->nb[2],
                                txt->ne[1] * txt_img->nb[1]);  // [N, n_img_token, hidden_size]
+            if (ctx->bonsai_gemlite_runtime != nullptr) {
+                img = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img, "flux2.final_layer.input_image_slice");
+            }
 
             if (final_layer) {
                 img = final_layer->forward(ctx, img, vec);  // (N, T, patch_size ** 2 * out_channels)
+                if (ctx->bonsai_gemlite_runtime != nullptr) {
+                    img = sd::bonsai_gemlite_debug_tensor(ctx->ggml_ctx, img, "flux2.final_layer.output");
+                }
             }
 
             return img;
@@ -1181,6 +1250,7 @@ namespace Flux {
         sd::Tensor<float> guidance_tensor;
         SDVersion version;
         bool use_mask = false;
+        std::shared_ptr<sd::BonsaiGemliteRuntime> bonsai_gemlite_runtime;
 
         FluxRunner(ggml_backend_t backend,
                    bool offload_params_to_cpu,
@@ -1278,6 +1348,29 @@ namespace Flux {
                 flux_params.chroma_radiance_params.fake_patch_size_x2 = true;
             }
 
+            if (head_dim == 0) {
+                LOG_ERROR("flux: failed to detect attention head_dim from tensor metadata for prefix '%s' (hidden_size=%" PRId64 ", depth=%d, depth_single_blocks=%d)",
+                          prefix.c_str(),
+                          flux_params.hidden_size,
+                          flux_params.depth,
+                          flux_params.depth_single_blocks);
+                for (auto pair : tensor_storage_map) {
+                    const std::string& tensor_name = pair.first;
+                    if (starts_with(tensor_name, prefix) &&
+                        (tensor_name.find("norm.key_norm.scale") != std::string::npos ||
+                         tensor_name.find("txt_in.weight") != std::string::npos ||
+                         tensor_name.find("single_blocks.0") != std::string::npos ||
+                         tensor_name.find("double_blocks.0") != std::string::npos)) {
+                        LOG_ERROR("flux: metadata candidate '%s' ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]",
+                                  tensor_name.c_str(),
+                                  pair.second.ne[0],
+                                  pair.second.ne[1],
+                                  pair.second.ne[2],
+                                  pair.second.ne[3]);
+                    }
+                }
+                GGML_ASSERT(head_dim != 0);
+            }
             flux_params.num_heads = static_cast<int>(flux_params.hidden_size / head_dim);
 
             LOG_INFO("flux: depth = %d, depth_single_blocks = %d, guidance_embed = %s, context_in_dim = %" PRId64
@@ -1298,6 +1391,19 @@ namespace Flux {
 
         std::string get_desc() override {
             return "flux";
+        }
+
+        GGMLRunnerContext get_context() override {
+            GGMLRunnerContext runner_ctx = GGMLRunner::get_context();
+            if (bonsai_gemlite_runtime) {
+                runner_ctx.bonsai_gemlite_runtime = bonsai_gemlite_runtime.get();
+                runner_ctx.bonsai_gemlite_linear_forward = sd::bonsai_gemlite_int1_linear_forward_callback;
+            }
+            return runner_ctx;
+        }
+
+        void set_bonsai_gemlite_runtime(const std::shared_ptr<sd::BonsaiGemliteRuntime>& runtime) {
+            bonsai_gemlite_runtime = runtime;
         }
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {

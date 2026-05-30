@@ -564,6 +564,8 @@ std::string convert_diffusers_dit_to_original_flux(std::string name) {
         flux_name_map["time_text_embed.timestep_embedder.linear_1.bias"]   = "time_in.in_layer.bias";
         flux_name_map["time_text_embed.timestep_embedder.linear_2.weight"] = "time_in.out_layer.weight";
         flux_name_map["time_text_embed.timestep_embedder.linear_2.bias"]   = "time_in.out_layer.bias";
+        flux_name_map["time_guidance_embed.timestep_embedder.linear_1.weight"] = "time_in.in_layer.weight";
+        flux_name_map["time_guidance_embed.timestep_embedder.linear_2.weight"] = "time_in.out_layer.weight";
 
         flux_name_map["time_text_embed.text_embedder.linear_1.weight"] = "vector_in.in_layer.weight";
         flux_name_map["time_text_embed.text_embedder.linear_1.bias"]   = "vector_in.in_layer.bias";
@@ -581,6 +583,9 @@ std::string convert_diffusers_dit_to_original_flux(std::string name) {
         flux_name_map["context_embedder.bias"]   = "txt_in.bias";
         flux_name_map["x_embedder.weight"]       = "img_in.weight";
         flux_name_map["x_embedder.bias"]         = "img_in.bias";
+        flux_name_map["double_stream_modulation_img.linear.weight"] = "double_stream_modulation_img.lin.weight";
+        flux_name_map["double_stream_modulation_txt.linear.weight"] = "double_stream_modulation_txt.lin.weight";
+        flux_name_map["single_stream_modulation.linear.weight"]     = "single_stream_modulation.lin.weight";
 
         // --- double transformer blocks ---
         for (int i = 0; i < num_layers; ++i) {
@@ -710,6 +715,52 @@ std::string convert_other_dit_to_original_anima(std::string name) {
         name = anima_net_prefix + name;
     }
     return name;
+}
+
+static bool rewrite_anima_kohya_lora_name(std::string& name) {
+    static const std::string prefix = "unet_blocks_";
+    if (!starts_with(name, prefix)) {
+        return false;
+    }
+
+    size_t block_start = prefix.size();
+    size_t block_end   = block_start;
+    while (block_end < name.size() && name[block_end] >= '0' && name[block_end] <= '9') {
+        ++block_end;
+    }
+    if (block_end == block_start || block_end >= name.size() || name[block_end] != '_') {
+        return false;
+    }
+
+    size_t suffix_pos = name.find('.', block_end + 1);
+    if (suffix_pos == std::string::npos) {
+        return false;
+    }
+
+    const std::string block  = name.substr(block_start, block_end - block_start);
+    const std::string module = name.substr(block_end + 1, suffix_pos - (block_end + 1));
+    const std::string suffix = name.substr(suffix_pos);
+
+    static const std::unordered_map<std::string, std::string> module_map = {
+        {"cross_attn_k_proj", "cross_attn.k_proj"},
+        {"cross_attn_output_proj", "cross_attn.output_proj"},
+        {"cross_attn_q_proj", "cross_attn.q_proj"},
+        {"cross_attn_v_proj", "cross_attn.v_proj"},
+        {"mlp_layer1", "mlp.layer1"},
+        {"mlp_layer2", "mlp.layer2"},
+        {"self_attn_k_proj", "self_attn.k_proj"},
+        {"self_attn_output_proj", "self_attn.output_proj"},
+        {"self_attn_q_proj", "self_attn.q_proj"},
+        {"self_attn_v_proj", "self_attn.v_proj"},
+    };
+
+    auto iter = module_map.find(module);
+    if (iter == module_map.end()) {
+        return false;
+    }
+
+    name = "diffusion_model.blocks." + block + "." + iter->second + suffix;
+    return true;
 }
 
 std::string convert_diffusion_model_name(std::string name, std::string prefix, SDVersion version) {
@@ -1057,6 +1108,11 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
     }
     // preprocess lora tensor name
     if (is_lora) {
+        const bool rewritten_anima_kohya_lora = sd_version_is_anima(version) && rewrite_anima_kohya_lora_name(name);
+        if (rewritten_anima_kohya_lora) {
+            is_underline = false;
+        }
+
         std::map<std::string, std::string> lora_suffix_map = {
             {".lora_down.weight", ".weight.lora_down"},
             {".lora_mid.weight", ".weight.lora_mid"},

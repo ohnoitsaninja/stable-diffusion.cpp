@@ -454,13 +454,10 @@ namespace Anima {
                              ggml_tensor* t5_weights   = nullptr,
                              ggml_tensor* adapter_q_pe = nullptr,
                              ggml_tensor* adapter_k_pe = nullptr) {
-            GGML_ASSERT(x->ne[3] == 1);
-
             auto x_embedder       = std::dynamic_pointer_cast<XEmbedder>(blocks["x_embedder"]);
             auto t_embedder       = std::dynamic_pointer_cast<TimestepEmbedder>(blocks["t_embedder"]);
             auto t_embedding_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["t_embedding_norm"]);
             auto final_layer      = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
-            auto llm_adapter      = std::dynamic_pointer_cast<LLMAdapter>(blocks["llm_adapter"]);
 
             int64_t W = x->ne[0];
             int64_t H = x->ne[1];
@@ -477,26 +474,12 @@ namespace Anima {
             auto embedded_timestep = t_embedding_norm->forward(ctx, timestep_proj);
 
             if (t5_ids != nullptr) {
-                auto adapted_context = llm_adapter->forward(ctx, encoder_hidden_states, t5_ids, adapter_q_pe, adapter_k_pe);
-                if (t5_weights != nullptr) {
-                    auto w = t5_weights;
-                    if (ggml_n_dims(w) == 1) {
-                        w = ggml_reshape_3d(ctx->ggml_ctx, w, 1, w->ne[0], 1);
-                    }
-                    w               = ggml_repeat_4d(ctx->ggml_ctx, w, adapted_context->ne[0], adapted_context->ne[1], adapted_context->ne[2], 1);
-                    adapted_context = ggml_mul(ctx->ggml_ctx, adapted_context, w);
-                }
-                if (adapted_context->ne[1] < 512) {
-                    auto pad_ctx    = ggml_ext_zeros(ctx->ggml_ctx,
-                                                     adapted_context->ne[0],
-                                                     512 - adapted_context->ne[1],
-                                                     adapted_context->ne[2],
-                                                     1);
-                    adapted_context = ggml_concat(ctx->ggml_ctx, adapted_context, pad_ctx, 1);
-                } else if (adapted_context->ne[1] > 512) {
-                    adapted_context = ggml_ext_slice(ctx->ggml_ctx, adapted_context, 1, 0, 512);
-                }
-                encoder_hidden_states = adapted_context;
+                encoder_hidden_states = preprocess_text_embeds(ctx,
+                                                               encoder_hidden_states,
+                                                               t5_ids,
+                                                               t5_weights,
+                                                               adapter_q_pe,
+                                                               adapter_k_pe);
             }
 
             for (int i = 0; i < num_layers; i++) {
@@ -509,6 +492,39 @@ namespace Anima {
             x = DiT::unpatchify_and_crop(ctx->ggml_ctx, x, H, W, patch_size, patch_size, false);  // [N, C, H, W]
 
             return x;
+        }
+
+        ggml_tensor* preprocess_text_embeds(GGMLRunnerContext* ctx,
+                                            ggml_tensor* encoder_hidden_states,
+                                            ggml_tensor* t5_ids,
+                                            ggml_tensor* t5_weights,
+                                            ggml_tensor* adapter_q_pe,
+                                            ggml_tensor* adapter_k_pe) {
+            if (t5_ids == nullptr) {
+                return encoder_hidden_states;
+            }
+
+            auto llm_adapter = std::dynamic_pointer_cast<LLMAdapter>(blocks["llm_adapter"]);
+            auto adapted_context = llm_adapter->forward(ctx, encoder_hidden_states, t5_ids, adapter_q_pe, adapter_k_pe);
+            if (t5_weights != nullptr) {
+                auto w = t5_weights;
+                if (ggml_n_dims(w) == 1) {
+                    w = ggml_reshape_3d(ctx->ggml_ctx, w, 1, w->ne[0], 1);
+                }
+                w               = ggml_repeat_4d(ctx->ggml_ctx, w, adapted_context->ne[0], adapted_context->ne[1], adapted_context->ne[2], 1);
+                adapted_context = ggml_mul(ctx->ggml_ctx, adapted_context, w);
+            }
+            if (adapted_context->ne[1] < 512) {
+                auto pad_ctx    = ggml_ext_zeros(ctx->ggml_ctx,
+                                                 adapted_context->ne[0],
+                                                 512 - adapted_context->ne[1],
+                                                 adapted_context->ne[2],
+                                                 1);
+                adapted_context = ggml_concat(ctx->ggml_ctx, adapted_context, pad_ctx, 1);
+            } else if (adapted_context->ne[1] > 512) {
+                adapted_context = ggml_ext_slice(ctx->ggml_ctx, adapted_context, 1, 0, 512);
+            }
+            return adapted_context;
         }
     };
 
@@ -616,7 +632,6 @@ namespace Anima {
             ggml_tensor* context    = context_resource != nullptr ? make_backend_input(*context_resource) : make_optional_input(context_tensor);
             ggml_tensor* t5_ids     = t5_ids_resource != nullptr ? make_backend_input(*t5_ids_resource) : make_optional_input(t5_ids_tensor);
             ggml_tensor* t5_weights = t5_weights_resource != nullptr ? make_backend_input(*t5_weights_resource) : make_optional_input(t5_weights_tensor);
-            GGML_ASSERT(x->ne[3] == 1);
             ggml_cgraph* gf = new_graph_custom(ANIMA_GRAPH_SIZE);
 
             int64_t pad_h = (net.patch_size - x->ne[1] % net.patch_size) % net.patch_size;
@@ -670,6 +685,46 @@ namespace Anima {
             return gf;
         }
 
+        ggml_cgraph* build_text_preprocess_graph(const sd::Tensor<float>& context_tensor = {},
+                                                 const sd::Tensor<int32_t>& t5_ids_tensor = {},
+                                                 const sd::Tensor<float>& t5_weights_tensor = {},
+                                                 const GgmlBackendTensorResource* context_resource = nullptr,
+                                                 const GgmlBackendTensorResource* t5_ids_resource = nullptr,
+                                                 const GgmlBackendTensorResource* t5_weights_resource = nullptr) {
+            ggml_tensor* context    = context_resource != nullptr ? make_backend_input(*context_resource) : make_optional_input(context_tensor);
+            ggml_tensor* t5_ids     = t5_ids_resource != nullptr ? make_backend_input(*t5_ids_resource) : make_optional_input(t5_ids_tensor);
+            ggml_tensor* t5_weights = t5_weights_resource != nullptr ? make_backend_input(*t5_weights_resource) : make_optional_input(t5_weights_tensor);
+            if (context == nullptr || t5_ids == nullptr) {
+                return nullptr;
+            }
+
+            ggml_cgraph* gf = new_graph_custom(ANIMA_GRAPH_SIZE);
+
+            int64_t target_len = t5_ids->ne[0];
+            int64_t source_len = context->ne[1];
+
+            adapter_q_pe_vec = gen_1d_rope_pe_vec(target_len, 64, 10000.f);
+            adapter_k_pe_vec = gen_1d_rope_pe_vec(source_len, 64, 10000.f);
+
+            int64_t target_pos_len = static_cast<int64_t>(adapter_q_pe_vec.size()) / (2 * 2 * 32);
+            int64_t source_pos_len = static_cast<int64_t>(adapter_k_pe_vec.size()) / (2 * 2 * 32);
+
+            auto adapter_q_pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, 32, target_pos_len);
+            auto adapter_k_pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, 32, source_pos_len);
+            set_backend_tensor_data(adapter_q_pe, adapter_q_pe_vec.data());
+            set_backend_tensor_data(adapter_k_pe, adapter_k_pe_vec.data());
+
+            auto runner_ctx = get_context();
+            auto out = net.preprocess_text_embeds(&runner_ctx,
+                                                  context,
+                                                  t5_ids,
+                                                  t5_weights,
+                                                  adapter_q_pe,
+                                                  adapter_k_pe);
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        }
+
         sd::Tensor<float> compute(int n_threads,
                                   const sd::Tensor<float>& x,
                                   const sd::Tensor<float>& timesteps,
@@ -704,6 +759,25 @@ namespace Anima {
                                    t5_weights_resource);
             };
             return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "anima_backend_output");
+        }
+
+        std::unique_ptr<GgmlBackendTensorResource> preprocess_text_embeds_to_backend_resource(
+            int n_threads,
+            const sd::Tensor<float>& context = {},
+            const GgmlBackendTensorResource* context_resource = nullptr,
+            const sd::Tensor<int32_t>& t5_ids = {},
+            const GgmlBackendTensorResource* t5_ids_resource = nullptr,
+            const sd::Tensor<float>& t5_weights = {},
+            const GgmlBackendTensorResource* t5_weights_resource = nullptr) {
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_text_preprocess_graph(context,
+                                                   t5_ids,
+                                                   t5_weights,
+                                                   context_resource,
+                                                   t5_ids_resource,
+                                                   t5_weights_resource);
+            };
+            return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "anima_preprocessed_context");
         }
     };
 }  // namespace Anima

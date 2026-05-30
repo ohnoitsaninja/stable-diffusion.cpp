@@ -3,6 +3,10 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include "flux.hpp"
 #include "ggml_extend.hpp"
@@ -30,6 +34,133 @@ namespace ZImage {
             return value[0] != '0';
         }
         return true;
+    }
+
+    __STATIC_INLINE__ bool z_image_transformer_profile_enabled() {
+        const char* value = std::getenv("SDCPP_PROFILE_Z_IMAGE_TRANSFORMER");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }
+
+    __STATIC_INLINE__ std::string z_image_shape_str(const ggml_tensor* t) {
+        if (t == nullptr) {
+            return "<null>";
+        }
+        std::ostringstream oss;
+        oss << "[" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << "]";
+        return oss.str();
+    }
+
+    __STATIC_INLINE__ const char* z_image_op_category(enum ggml_op op) {
+        switch (op) {
+            case GGML_OP_FLASH_ATTN_EXT:
+            case GGML_OP_SOFT_MAX:
+            case GGML_OP_DIAG_MASK_INF:
+                return "attention";
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_OUT_PROD:
+                return "matmul_projection_mlp";
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_CONT:
+            case GGML_OP_CPY:
+            case GGML_OP_CONCAT:
+                return "layout_copy";
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_NORM:
+            case GGML_OP_MUL:
+            case GGML_OP_ADD:
+            case GGML_OP_SUB:
+            case GGML_OP_SCALE:
+            case GGML_OP_UNARY:
+            case GGML_OP_GLU:
+                return "pointwise_norm";
+            default:
+                return "other";
+        }
+    }
+
+    __STATIC_INLINE__ void z_image_profile_graph(ggml_cgraph* gf,
+                                                 const char* label,
+                                                 int64_t pe_ms,
+                                                 const ggml_tensor* x,
+                                                 const ggml_tensor* context,
+                                                 const ggml_tensor* out) {
+        if (!z_image_transformer_profile_enabled() || gf == nullptr) {
+            return;
+        }
+        struct Entry {
+            int index = -1;
+            size_t bytes = 0;
+            const ggml_tensor* tensor = nullptr;
+        };
+        std::map<std::string, std::pair<int, size_t>> by_op;
+        std::map<std::string, std::pair<int, size_t>> by_category;
+        std::vector<Entry> entries;
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        entries.reserve(static_cast<size_t>(n_nodes));
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor* node = ggml_graph_node(gf, i);
+            if (node == nullptr) {
+                continue;
+            }
+            size_t bytes = ggml_nbytes(node);
+            std::string op = ggml_op_name(node->op);
+            auto& op_entry = by_op[op];
+            op_entry.first += 1;
+            op_entry.second += bytes;
+            auto& cat_entry = by_category[z_image_op_category(node->op)];
+            cat_entry.first += 1;
+            cat_entry.second += bytes;
+            entries.push_back({i, bytes, node});
+        }
+        std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+            return a.bytes > b.bytes;
+        });
+
+        LOG_INFO("[ZProfile] graph label=%s nodes=%d pe_ms=%" PRId64 " x=%s context=%s out=%s",
+                 label != nullptr ? label : "z_image",
+                 n_nodes,
+                 pe_ms,
+                 z_image_shape_str(x).c_str(),
+                 z_image_shape_str(context).c_str(),
+                 z_image_shape_str(out).c_str());
+        for (const auto& kv : by_category) {
+            LOG_INFO("[ZProfileCategory] label=%s category=%s nodes=%d tensor_bytes=%.2fMB",
+                     label != nullptr ? label : "z_image",
+                     kv.first.c_str(),
+                     kv.second.first,
+                     kv.second.second / 1048576.0);
+        }
+
+        std::vector<std::pair<std::string, std::pair<int, size_t>>> op_entries(by_op.begin(), by_op.end());
+        std::sort(op_entries.begin(), op_entries.end(), [](const auto& a, const auto& b) {
+            return a.second.second > b.second.second;
+        });
+        int op_limit = std::min<int>(20, static_cast<int>(op_entries.size()));
+        for (int i = 0; i < op_limit; ++i) {
+            LOG_INFO("[ZProfileOp] rank=%d label=%s op=%s nodes=%d tensor_bytes=%.2fMB",
+                     i + 1,
+                     label != nullptr ? label : "z_image",
+                     op_entries[i].first.c_str(),
+                     op_entries[i].second.first,
+                     op_entries[i].second.second / 1048576.0);
+        }
+        int node_limit = std::min<int>(20, static_cast<int>(entries.size()));
+        for (int i = 0; i < node_limit; ++i) {
+            const ggml_tensor* node = entries[i].tensor;
+            LOG_INFO("[ZProfileNode] rank=%d label=%s index=%d op=%s type=%s bytes=%.2fMB shape=%s name=%s",
+                     i + 1,
+                     label != nullptr ? label : "z_image",
+                     entries[i].index,
+                     ggml_op_name(node->op),
+                     ggml_type_name(node->type),
+                     entries[i].bytes / 1048576.0,
+                     z_image_shape_str(node).c_str(),
+                     ggml_get_name(node));
+        }
     }
 
     struct JointAttention : public GGMLBlock {
@@ -375,6 +506,7 @@ namespace ZImage {
                                   ggml_tensor* timestep,
                                   ggml_tensor* context,
                                   ggml_tensor* pe) {
+            const bool profile = z_image_transformer_profile_enabled();
             auto x_embedder     = std::dynamic_pointer_cast<Linear>(blocks["x_embedder"]);
             auto t_embedder     = std::dynamic_pointer_cast<TimestepEmbedder>(blocks["t_embedder"]);
             auto cap_embedder_0 = std::dynamic_pointer_cast<RMSNorm>(blocks["cap_embedder.0"]);
@@ -389,10 +521,21 @@ namespace ZImage {
             int64_t n_img_token = x->ne[1];
             int64_t n_txt_token = context->ne[1];
 
+            int64_t stage_start_us = profile ? ggml_time_us() : 0;
             auto t_emb = t_embedder->forward(ctx, timestep);
 
             auto txt = cap_embedder_1->forward(ctx, cap_embedder_0->forward(ctx, context));  // [N, n_txt_token, hidden_size]
             auto img = x_embedder->forward(ctx, x);                                          // [N, n_img_token, hidden_size]
+            if (profile) {
+                int64_t now_us = ggml_time_us();
+                LOG_INFO("[ZProfileBlock] stage=embed build_ms=%.3f x=%s txt=%s img=%s timestep=%s",
+                         (now_us - stage_start_us) / 1000.0,
+                         z_image_shape_str(x).c_str(),
+                         z_image_shape_str(txt).c_str(),
+                         z_image_shape_str(img).c_str(),
+                         z_image_shape_str(timestep).c_str());
+                stage_start_us = now_us;
+            }
 
             int64_t n_txt_pad_token = Rope::bound_mod(static_cast<int>(n_txt_token), SEQ_MULTI_OF);
             if (n_txt_pad_token > 0) {
@@ -414,26 +557,62 @@ namespace ZImage {
             for (int i = 0; i < z_image_params.num_refiner_layers; i++) {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["context_refiner." + std::to_string(i)]);
 
+                int64_t block_start_us = profile ? ggml_time_us() : 0;
                 txt = block->forward(ctx, txt, txt_pe, nullptr, nullptr);
+                if (profile) {
+                    LOG_INFO("[ZProfileBlock] stage=context_refiner block=%d build_ms=%.3f out=%s",
+                             i,
+                             (ggml_time_us() - block_start_us) / 1000.0,
+                             z_image_shape_str(txt).c_str());
+                }
             }
 
             for (int i = 0; i < z_image_params.num_refiner_layers; i++) {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["noise_refiner." + std::to_string(i)]);
 
+                int64_t block_start_us = profile ? ggml_time_us() : 0;
                 img = block->forward(ctx, img, img_pe, nullptr, t_emb);
+                if (profile) {
+                    LOG_INFO("[ZProfileBlock] stage=noise_refiner block=%d build_ms=%.3f out=%s",
+                             i,
+                             (ggml_time_us() - block_start_us) / 1000.0,
+                             z_image_shape_str(img).c_str());
+                }
             }
 
+            int64_t concat_start_us = profile ? ggml_time_us() : 0;
             auto txt_img = ggml_concat(ctx->ggml_ctx, txt, img, 1);  // [N, n_txt_token + n_txt_pad_token + n_img_token + n_img_pad_token, hidden_size]
+            if (profile) {
+                LOG_INFO("[ZProfileBlock] stage=concat build_ms=%.3f txt_img=%s txt=%s img=%s",
+                         (ggml_time_us() - concat_start_us) / 1000.0,
+                         z_image_shape_str(txt_img).c_str(),
+                         z_image_shape_str(txt).c_str(),
+                         z_image_shape_str(img).c_str());
+            }
 
             for (int i = 0; i < z_image_params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["layers." + std::to_string(i)]);
 
+                int64_t block_start_us = profile ? ggml_time_us() : 0;
                 txt_img = block->forward(ctx, txt_img, pe, nullptr, t_emb);
+                if (profile) {
+                    LOG_INFO("[ZProfileBlock] stage=layer block=%d build_ms=%.3f out=%s",
+                             i,
+                             (ggml_time_us() - block_start_us) / 1000.0,
+                             z_image_shape_str(txt_img).c_str());
+                }
             }
 
+            int64_t final_start_us = profile ? ggml_time_us() : 0;
             txt_img = final_layer->forward(ctx, txt_img, t_emb);  // [N, n_txt_token + n_txt_pad_token + n_img_token + n_img_pad_token, ph*pw*C]
 
             img = ggml_ext_slice(ctx->ggml_ctx, txt_img, 1, n_txt_token + n_txt_pad_token, n_txt_token + n_txt_pad_token + n_img_token);  // [N, n_img_token, ph*pw*C]
+            if (profile) {
+                LOG_INFO("[ZProfileBlock] stage=final build_ms=%.3f txt_img=%s img=%s",
+                         (ggml_time_us() - final_start_us) / 1000.0,
+                         z_image_shape_str(txt_img).c_str(),
+                         z_image_shape_str(img).c_str());
+            }
 
             return img;
         }
@@ -516,9 +695,10 @@ namespace ZImage {
             ggml_cgraph* gf        = new_graph_custom(Z_IMAGE_GRAPH_SIZE);
             ggml_tensor* x         = x_resource != nullptr ? make_backend_input(*x_resource) : make_input(x_tensor);
             ggml_tensor* timesteps = make_input(timesteps_tensor);
-            GGML_ASSERT(x->ne[3] == 1);
+            GGML_ASSERT(x->ne[3] >= 1);
             GGML_ASSERT(context_resource != nullptr || !context_tensor.empty());
             ggml_tensor* context = context_resource != nullptr ? make_backend_input(*context_resource) : make_input(context_tensor);
+            GGML_ASSERT(context->ne[2] == 1 || context->ne[2] == x->ne[3]);
             std::vector<ggml_tensor*> ref_latents;
             if (ref_latents_resources != nullptr) {
                 ref_latents.reserve(ref_latents_resources->size());
@@ -534,10 +714,12 @@ namespace ZImage {
                 }
             }
 
+            const int64_t pe_start_ms = z_image_transformer_profile_enabled() ? ggml_time_ms() : 0;
+            const int pe_batch = x->ne[3] > 1 ? 1 : static_cast<int>(x->ne[3]);
             pe_vec      = Rope::gen_z_image_pe(static_cast<int>(x->ne[1]),
                                                static_cast<int>(x->ne[0]),
                                                z_image_params.patch_size,
-                                               static_cast<int>(x->ne[3]),
+                                               pe_batch,
                                                static_cast<int>(context->ne[1]),
                                                SEQ_MULTI_OF,
                                                ref_latents,
@@ -546,6 +728,7 @@ namespace ZImage {
                                                circular_y_enabled,
                                                circular_x_enabled,
                                                z_image_params.axes_dim);
+            const int64_t pe_ms = z_image_transformer_profile_enabled() ? (ggml_time_ms() - pe_start_ms) : 0;
             int pos_len = static_cast<int>(pe_vec.size() / z_image_params.axes_dim_sum / 2);
             // LOG_DEBUG("pos_len %d", pos_len);
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, z_image_params.axes_dim_sum / 2, pos_len);
@@ -563,6 +746,7 @@ namespace ZImage {
                                                ref_latents);
 
             ggml_build_forward_expand(gf, out);
+            z_image_profile_graph(gf, "z_image_forward", pe_ms, x, context, out);
 
             return gf;
         }
@@ -602,8 +786,22 @@ namespace ZImage {
                                    context_resource,
                                    ref_latents_resources);
             };
-
-            return GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "z_image_backend_output");
+            auto output = GGMLRunner::compute_to_backend_resource_handle(get_graph, n_threads, "z_image_backend_output");
+            if (z_image_transformer_profile_enabled()) {
+                const auto& timing = GGMLRunner::get_last_timing_profile();
+                LOG_INFO("[ZProfileRunner] graph_build_ms=%.3f graph_alloc_ms=%.3f input_copy_ms=%.3f backend_compute_ms=%.3f backend_submit_ms=%.3f backend_sync_ms=%.3f output_copy_ms=%.3f cleanup_ms=%.3f input_copy_bytes=%" PRIu64 " output_copy_bytes=%" PRIu64,
+                         timing.graph_build_seconds * 1000.0,
+                         timing.graph_alloc_seconds * 1000.0,
+                         timing.input_copy_seconds * 1000.0,
+                         timing.backend_compute_seconds * 1000.0,
+                         timing.backend_compute_submit_seconds * 1000.0,
+                         timing.backend_sync_seconds * 1000.0,
+                         timing.output_copy_seconds * 1000.0,
+                         timing.cleanup_seconds * 1000.0,
+                         timing.input_copy_bytes,
+                         timing.output_copy_bytes);
+            }
+            return output;
         }
 
         void test() {

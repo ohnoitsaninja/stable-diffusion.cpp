@@ -17,10 +17,6 @@ namespace WAN {
     constexpr int WAN_GRAPH_SIZE = 10240;
 
     static bool wan_qwen_vae_direct_conv3d_enabled() {
-        const char* enabled = std::getenv("SDCPP_EXPERIMENTAL_WAN_QWEN_VAE_GPU");
-        if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0') {
-            return false;
-        }
         const char* disabled = std::getenv("SDCPP_DISABLE_WAN_QWEN_VAE_DIRECT_CONV3D");
         return disabled == nullptr || disabled[0] == '\0' || disabled[0] == '0';
     }

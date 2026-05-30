@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -371,7 +372,7 @@ bool is_zip_file(const std::string& file_path) {
 }
 
 bool is_gguf_file(const std::string& file_path) {
-    std::ifstream file(file_path, std::ios::binary);
+    std::ifstream file(std::filesystem::u8path(file_path), std::ios::binary);
     if (!file.is_open()) {
         return false;
     }
@@ -392,7 +393,7 @@ bool is_gguf_file(const std::string& file_path) {
 }
 
 bool is_safetensors_file(const std::string& file_path) {
-    std::ifstream file(file_path, std::ios::binary);
+    std::ifstream file(std::filesystem::u8path(file_path), std::ios::binary);
     if (!file.is_open()) {
         return false;
     }
@@ -570,6 +571,9 @@ ggml_type str_to_ggml_type(const std::string& dtype) {
         ttype = GGML_TYPE_F16;
     } else if (dtype == "I64") {
         ttype = GGML_TYPE_I32;
+    } else if (dtype == "I32") {
+        // Lens conditioning bundles may store attention masks as safetensors I32.
+        ttype = GGML_TYPE_I32;
     }
     return ttype;
 }
@@ -579,7 +583,7 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
     LOG_DEBUG("init from '%s', prefix = '%s'", file_path.c_str(), prefix.c_str());
     file_paths_.push_back(file_path);
     size_t file_index = file_paths_.size() - 1;
-    std::ifstream file(file_path, std::ios::binary);
+    std::ifstream file(std::filesystem::u8path(file_path), std::ios::binary);
     if (!file.is_open()) {
         LOG_ERROR("failed to open '%s'", file_path.c_str());
         file_paths_.pop_back();
@@ -957,6 +961,24 @@ struct PickleTensorReader {
                 read_global_type = false;
             }
             tensor_storage.type = GGML_TYPE_F16;
+        } else if (str == "BFloat16Storage") {
+            if (read_global_type) {
+                global_type      = GGML_TYPE_BF16;
+                read_global_type = false;
+            }
+            tensor_storage.type = GGML_TYPE_BF16;
+        } else if (str == "ByteStorage") {
+            if (read_global_type) {
+                global_type      = GGML_TYPE_I8;
+                read_global_type = false;
+            }
+            tensor_storage.type = GGML_TYPE_I8;
+        } else if (str == "IntStorage") {
+            if (read_global_type) {
+                global_type      = GGML_TYPE_I32;
+                read_global_type = false;
+            }
+            tensor_storage.type = GGML_TYPE_I32;
         }
     }
 
@@ -1093,7 +1115,19 @@ bool ModelLoader::parse_data_pkl(uint8_t* buffer,
                     memset(string_buffer, 0, MAX_STRING_BUFFER);
                     memcpy(string_buffer, buffer, len);
                     buffer += len;
-                    // printf("String: '%s'\n", string_buffer);
+                    reader.read_string(string_buffer, zip, dir);
+                } break;
+                case 0x8D:  // BINUNICODE8 = b'\x8d'  # push UTF-8 string with 8-byte length
+                {
+                    const uint64_t len = read_u64(buffer);
+                    buffer += 8;
+                    memset(string_buffer, 0, MAX_STRING_BUFFER);
+                    if (len > MAX_STRING_BUFFER) {
+                        LOG_WARN("tensor name very large");
+                    }
+                    memcpy(string_buffer, buffer, len < MAX_STRING_BUFFER ? len : (MAX_STRING_BUFFER - 1));
+                    buffer += len;
+                    reader.read_string(string_buffer, zip, dir);
                 } break;
                 case 'c':  // GLOBAL         = b'c'   # push self.find_class(modname, name); 2 string args
                 {
@@ -1191,6 +1225,10 @@ SDVersion ModelLoader::get_sd_version() {
     bool has_output_block_311        = false;
     bool has_output_block_71         = false;
     TensorStorage output_block_weight;
+
+    if (version_ != VERSION_COUNT) {
+        return version_;
+    }
 
     for (auto& [name, tensor_storage] : tensor_storage_map) {
         if (!(is_xl)) {
@@ -1598,7 +1636,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                         return;
                     }
                 } else if (!mmapped) {
-                    file.open(file_path, std::ios::binary);
+                    file.open(std::filesystem::u8path(file_path), std::ios::binary);
                     if (!file.is_open()) {
                         LOG_ERROR("failed to open '%s'", file_path.c_str());
                         failed = true;
@@ -1949,6 +1987,17 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
     bool some_tensor_not_init = false;
 
     for (auto pair : tensors) {
+        bool ignored_missing_tensor = false;
+        for (auto& ignore_tensor : ignore_tensors) {
+            if (starts_with(pair.first, ignore_tensor)) {
+                ignored_missing_tensor = true;
+                break;
+            }
+        }
+        if (ignored_missing_tensor) {
+            continue;
+        }
+
         if (pair.first.find("cond_stage_model.transformer.text_model.encoder.layers.23") != std::string::npos) {
             continue;
         }

@@ -9,6 +9,8 @@ test/
 *.bin
 *.exe
 *.gguf
+__pycache__/
+*.pyc
 output*.png
 models*
 *.log

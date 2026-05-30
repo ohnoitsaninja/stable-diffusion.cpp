@@ -64,6 +64,9 @@ option(SD_MUSA                       "sd: musa backend" OFF)
 option(SD_BUILD_SHARED_LIBS          "sd: build shared libs" OFF)
 option(SD_BUILD_SHARED_GGML_LIB      "sd: build ggml as a separate shared lib" OFF)
 option(SD_USE_SYSTEM_GGML            "sd: use system-installed GGML library" OFF)
+option(SD_LENS_EXPERIMENTAL_RUNTIME  "sd: build experimental Lens staged runtime into the library" ON)
+option(SD_BONSAI_GEMLITE_INT1_SPIKE  "sd: build experimental Bonsai GemLite INT1 CUDA spike helpers" OFF)
+option(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS "sd: experimental Bonsai INT1 CUTLASS/CuTe runtime helpers" OFF)
 #option(SD_BUILD_SERVER               "sd: build server example"                           ON)
 
 if(SD_CUDA)
@@ -76,8 +79,20 @@ if(SD_CUDA_THREADED_WEIGHT_LOADER AND NOT SD_CUDA)
     message(STATUS "SD_CUDA_THREADED_WEIGHT_LOADER requested without SD_CUDA; CUDA threaded weight loader will not be built")
 endif()
 
-if(SD_CUDA AND SD_CUDA_THREADED_WEIGHT_LOADER)
+if(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS AND NOT SD_CUDA)
+    message(FATAL_ERROR "SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS requires SD_CUDA")
+endif()
+
+if(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include/cute/tensor.hpp")
+    message(FATAL_ERROR "SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS requires third_party/cutlass")
+endif()
+
+if(SD_CUDA AND (SD_CUDA_THREADED_WEIGHT_LOADER OR SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS))
     find_package(CUDAToolkit REQUIRED)
+endif()
+
+if(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS)
+    enable_language(CUDA)
 endif()
 
 if(SD_METAL)
@@ -168,6 +183,22 @@ file(GLOB SD_LIB_SOURCES
     "src/vocab/*.h"
     "src/vocab/*.cpp"
 )
+list(REMOVE_ITEM SD_LIB_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/lens_gptoss_text_encoder.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/lens_gptoss_tokenizer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/lens_staged_pipeline.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/lens_transformer_runtime.cpp"
+)
+
+if(SD_LENS_EXPERIMENTAL_RUNTIME)
+    list(APPEND SD_LIB_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/lens_gptoss_text_encoder.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/lens_gptoss_tokenizer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/lens_staged_pipeline.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/lens_transformer_runtime.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/examples/lens-transformer-smoke/main.cpp"
+    )
+endif()
 
 if(SD_CUDA AND SD_CUDA_THREADED_WEIGHT_LOADER)
     file(GLOB SD_CUDA_THREADED_WEIGHT_LOADER_SOURCES
@@ -277,6 +308,62 @@ target_link_libraries(${SD_LIB} PUBLIC ggml zip)
 target_include_directories(${SD_LIB} PUBLIC . include)
 target_include_directories(${SD_LIB} PUBLIC . thirdparty)
 target_compile_features(${SD_LIB} PUBLIC c_std_11 cxx_std_17)
+
+if(SD_LENS_EXPERIMENTAL_RUNTIME)
+    target_compile_definitions(${SD_LIB} PRIVATE
+        SD_LENS_STAGED_PIPELINE_ENABLE_IMPL=1
+        SD_LENS_TRANSFORMER_SMOKE_NO_MAIN=1
+        SD_LENS_TRANSFORMER_SMOKE_RUNTIME=1
+        SD_LENS_TRANSFORMER_SMOKE_INSIDE_STABLE_DIFFUSION_LIB=1
+    )
+    if(SD_CUDA)
+        find_package(CUDAToolkit QUIET)
+        if(CUDAToolkit_FOUND)
+            enable_language(CUDA)
+            target_compile_definitions(${SD_LIB} PRIVATE SD_LENS_TEXT_ENCODER_USE_CUBLAS=1)
+            target_sources(${SD_LIB} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/examples/lens-text-encoder-smoke/mxfp4_dequant_cuda.cu")
+            set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/examples/lens-text-encoder-smoke/mxfp4_dequant_cuda.cu" PROPERTIES LANGUAGE CUDA)
+            set_property(TARGET ${SD_LIB} PROPERTY CUDA_ARCHITECTURES 89)
+            target_link_libraries(${SD_LIB} PRIVATE CUDA::cublas CUDA::cudart)
+            if(TARGET CUDA::cublasLt)
+                target_compile_definitions(${SD_LIB} PRIVATE
+                    SD_LENS_TEXT_ENCODER_USE_CUBLASLT=1
+                    SD_LENS_TRANSFORMER_USE_CUBLASLT=1
+                )
+                target_link_libraries(${SD_LIB} PRIVATE CUDA::cublasLt)
+            endif()
+        endif()
+    endif()
+endif()
+
+if(SD_BONSAI_GEMLITE_INT1_SPIKE AND SD_CUDA)
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        enable_language(CUDA)
+        target_compile_definitions(${SD_LIB} PRIVATE SD_BONSAI_GEMLITE_INT1_SPIKE=1)
+        target_sources(${SD_LIB} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/bonsai_gemlite_int1_cuda.cu")
+        set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/bonsai_gemlite_int1_cuda.cu" PROPERTIES LANGUAGE CUDA)
+        set_property(TARGET ${SD_LIB} PROPERTY CUDA_ARCHITECTURES 89)
+        target_link_libraries(${SD_LIB} PRIVATE CUDA::cudart)
+    else()
+        message(STATUS "SD_BONSAI_GEMLITE_INT1_SPIKE requested, but CUDAToolkit was not found")
+    endif()
+endif()
+
+if(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS)
+    target_compile_definitions(${SD_LIB} PRIVATE SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS=1)
+    target_include_directories(${SD_LIB} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/tools/util/include")
+    target_sources(${SD_LIB} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/bonsai_cutlass_int1_runtime.cu")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/bonsai_cutlass_int1_runtime.cu" PROPERTIES LANGUAGE CUDA)
+    set_property(TARGET ${SD_LIB} PROPERTY CUDA_ARCHITECTURES 89)
+    target_compile_options(${SD_LIB} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/Zc:preprocessor>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/Zc:preprocessor>)
+    target_link_libraries(${SD_LIB} PRIVATE CUDA::cudart)
+endif()
 
 
 if (SD_BUILD_EXAMPLES)

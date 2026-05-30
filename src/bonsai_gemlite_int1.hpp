@@ -53,6 +53,13 @@ struct BonsaiGemliteRuntimeSummary {
     int unique_linears_executed = 0;
     int missing_linear_calls = 0;
     std::string first_missing_linear;
+    bool cute_cache_built = false;
+    int cute_blocks = 0;
+    uint64_t cute_linear1_calls = 0;
+    uint64_t cute_linear2_calls = 0;
+    uint64_t cute_fallback_calls = 0;
+    uint64_t cute_prepack_bytes = 0;
+    bool full_fp16_weight_expansion = false;
 };
 
 struct BonsaiGemliteLinearCustomUserdata {

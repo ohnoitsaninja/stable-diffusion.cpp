@@ -536,6 +536,257 @@ typedef struct sd_conditioning_desc_t {
     uint32_t reserved[16];
 } sd_conditioning_desc_t;
 
+typedef uint64_t sd_lens_conditioning_handle_t;
+typedef uint64_t sd_lens_transformer_handle_t;
+
+typedef enum sd_lens_conditioning_storage_flags_t {
+    SD_LENS_COND_STORAGE_FLAG_CPU = 1u << 0,
+    SD_LENS_COND_STORAGE_FLAG_CUDA = 1u << 1,
+    SD_LENS_COND_STORAGE_FLAG_QUANTIZED = 1u << 2,
+} sd_lens_conditioning_storage_flags_t;
+
+typedef struct sd_lens_conditioning_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    uint32_t expected_schema_version;
+    int64_t expected_batch;
+    int64_t expected_seq_len;
+    int64_t expected_hidden_size;
+    int64_t expected_selected_layer_count;
+    int64_t expected_tensor_count;
+    enum sd_tensor_dtype_t expected_dtype;
+    uint32_t expected_storage_flags;
+    uint64_t expected_shape_hash;
+    uint64_t expected_dtype_hash;
+    uint64_t expected_config_hash;
+    uint32_t reserved[8];
+} sd_lens_conditioning_options_t;
+
+typedef struct sd_lens_conditioning_desc_t {
+    uint32_t struct_size;
+    uint32_t version;
+    sd_lens_conditioning_handle_t handle;
+    uint32_t flags;
+    uint32_t refcount;
+    uint32_t schema_version;
+    int64_t tensor_count;
+    int64_t batch;
+    int64_t seq_len;
+    int64_t hidden_size;
+    int64_t selected_layer_count;
+    int64_t feature_shapes[4][4];
+    int64_t mask_shape[4];
+    enum sd_tensor_dtype_t dtype;
+    uint32_t storage_flags;
+    enum sd_backend_kind_t backend;
+    uint64_t estimated_bytes;
+    uint64_t shape_hash;
+    uint64_t dtype_hash;
+    uint64_t config_hash;
+    bool device_resident;
+    bool copy_safe;
+    char debug_name[64];
+    uint32_t reserved[16];
+} sd_lens_conditioning_desc_t;
+
+typedef struct sd_lens_transformer_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    uint32_t expected_layers;
+    uint32_t expected_num_attention_heads;
+    uint32_t expected_attention_head_dim;
+    uint32_t expected_inner_dim;
+    uint32_t expected_in_channels;
+    uint32_t expected_out_channels;
+    uint32_t expected_enc_hidden_dim;
+    uint32_t max_loaded_layers;
+    uint64_t max_resident_weight_bytes;
+    uint64_t min_free_system_memory_bytes;
+    bool metadata_only;
+    bool allow_unsafe_large_allocations;
+    uint32_t reserved[11];
+} sd_lens_transformer_options_t;
+
+typedef struct sd_lens_transformer_desc_t {
+    uint32_t struct_size;
+    uint32_t version;
+    sd_lens_transformer_handle_t handle;
+    uint32_t refcount;
+    uint32_t shard_count;
+    uint32_t tensor_count;
+    uint64_t estimated_bytes;
+    uint32_t layers;
+    uint32_t num_attention_heads;
+    uint32_t attention_head_dim;
+    uint32_t inner_dim;
+    uint32_t in_channels;
+    uint32_t out_channels;
+    uint32_t enc_hidden_dim;
+    bool metadata_only;
+    bool weights_loaded;
+    bool forward_supported;
+    bool host_cached;
+    bool gpu_resident;
+    uint64_t host_cached_bytes;
+    char debug_name[64];
+    uint32_t reserved[12];
+} sd_lens_transformer_desc_t;
+
+typedef struct sd_lens_schedule_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    int steps;
+    int image_seq_len;
+    int num_train_timesteps;
+    int base_image_seq_len;
+    int max_image_seq_len;
+    float base_shift;
+    float max_shift;
+    float shift;
+    float mu;
+    bool has_mu;
+    bool use_dynamic_shifting;
+    uint32_t reserved[8];
+} sd_lens_schedule_options_t;
+
+typedef struct sd_lens_schedule_desc_t {
+    uint32_t struct_size;
+    uint32_t version;
+    int steps;
+    int sigma_count;
+    int timestep_count;
+    int image_seq_len;
+    float mu;
+    bool use_dynamic_shifting;
+    uint32_t reserved[8];
+} sd_lens_schedule_desc_t;
+
+typedef struct sd_lens_external_flow_loop_desc_t {
+    uint32_t struct_size;
+    uint32_t version;
+    int steps;
+    int image_seq_len;
+    uint32_t in_channels;
+    uint64_t packed_token_elements;
+    uint64_t model_output_elements;
+    float first_sigma;
+    float last_sigma;
+    float max_abs;
+    float mean_abs;
+    bool used_precomputed_conditioning;
+    bool used_external_model_output;
+    bool native_transformer_forward;
+    bool cpu_only;
+    uint32_t reserved[12];
+} sd_lens_external_flow_loop_desc_t;
+
+typedef struct sd_lens_vae_latent_desc_t {
+    uint32_t struct_size;
+    uint32_t version;
+    int64_t input_n;
+    int64_t input_c;
+    int64_t input_h;
+    int64_t input_w;
+    int64_t output_n;
+    int64_t output_c;
+    int64_t output_h;
+    int64_t output_w;
+    uint64_t input_elements;
+    uint64_t output_elements;
+    uint32_t patch_size_h;
+    uint32_t patch_size_w;
+    enum sd_tensor_dtype_t dtype;
+    enum sd_tensor_layout_t layout;
+    uint32_t reserved[8];
+} sd_lens_vae_latent_desc_t;
+
+typedef struct sd_lens_conditioning_encode_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    const char* text_encoder_dir;
+    const char* tokenizer_dir;
+    const char* chat_current_date;
+    const char* bootstrap_oracle_dir;
+    const char* optional_cond_out;
+    const char* cache_key_hint;
+    int txt_offset;
+    int max_seq_len;
+    bool allow_bootstrap_oracle;
+    uint32_t reserved[11];
+} sd_lens_conditioning_encode_options_t;
+
+typedef struct sd_lens_sample_options_t {
+    uint32_t struct_size;
+    uint32_t version;
+    const char* transformer_dir;
+    const char* speed_mode;
+    const char* transformer_residency;
+    const char* dynamic_residency;
+    const char* attention_mode;
+    const char* latent_npy;
+    const char* packed_tokens_npy;
+    int width;
+    int height;
+    int steps;
+    int seed;
+    float cfg;
+    int repeat_generations;
+    int window_blocks;
+    int persistent_blocks;
+    uint64_t persistent_blocks_memory_mib;
+    bool use_transformer_context;
+    bool keep_transformer_warm;
+    bool output_packed_vae_latent;
+    uint32_t reserved[6];
+} sd_lens_sample_options_t;
+
+typedef struct sd_lens_sample_desc_t {
+    uint32_t struct_size;
+    uint32_t version;
+    int width;
+    int height;
+    int latent_width;
+    int latent_height;
+    int latent_channels;
+    int steps;
+    int seed;
+    float cfg;
+    double transformer_wall_seconds;
+    double transformer_context_load_seconds;
+    double transformer_resident_upload_seconds;
+    double transformer_loop_seconds;
+    double transformer_generation_seconds;
+    double runner_setup_seconds;
+    double runner_alloc_compute_buffer_seconds;
+    double runner_graph_build_seconds;
+    double runner_graph_alloc_seconds;
+    double runner_input_copy_seconds;
+    double runner_compute_seconds;
+    double runner_sync_seconds;
+    double runner_output_copy_seconds;
+    double runner_cleanup_seconds;
+    double scheduler_flow_seconds;
+    double unpack_seconds;
+    uint64_t runner_input_copy_bytes;
+    uint64_t runner_output_copy_bytes;
+    uint64_t streamed_bytes;
+    uint64_t disk_read_bytes;
+    uint64_t resident_weight_bytes;
+    uint64_t resident_static_bytes;
+    uint64_t runner_count;
+    bool hidden_parity_exact;
+    bool speed_mode_explicit;
+    bool bf16_resident;
+    bool dynamic_gpu_streams;
+    bool streamed_bytes_zero;
+    bool cpu_latent_output;
+    bool gpu_latent_output;
+    char speed_mode[32];
+    char transformer_residency[32];
+    char dynamic_residency[32];
+    uint32_t reserved[12];
+} sd_lens_sample_desc_t;
+
 typedef struct sd_conditioning_encode_options_t {
     uint32_t struct_size;
     uint32_t version;
@@ -564,8 +815,11 @@ typedef struct sd_conditioning_capabilities_t {
     bool supports_z_image_qwen_conditioning_gpu_resident;
     bool supports_qwen_image_qwen_conditioning;
     bool supports_qwen_image_qwen_conditioning_gpu_resident;
+    bool supports_lens_text_conditioning;
+    bool supports_lens_conditioning_handles;
+    bool supports_lens_conditioning_gpu_resident;
     bool supports_conditioning_per_step_upload_fallback;
-    uint32_t reserved[12];
+    uint32_t reserved[11];
 } sd_conditioning_capabilities_t;
 
 enum sd_model_family_t {
@@ -581,6 +835,7 @@ enum sd_model_family_t {
     SD_MODEL_FAMILY_QWEN_IMAGE = 9,
     SD_MODEL_FAMILY_ANIMA = 10,
     SD_MODEL_FAMILY_MARIGOLD_IID = 11,
+    SD_MODEL_FAMILY_LENS = 12,
 };
 
 typedef struct sd_model_pipeline_capabilities_t {
@@ -653,6 +908,21 @@ typedef struct sd_model_pipeline_capabilities_t {
     bool supports_gpu_image_output_bridge;
     bool supports_qwen_image_vae_decode_bridge;
     bool supports_anima_vae_decode_bridge;
+    bool supports_lens_model_load;
+    bool supports_lens_text_conditioning;
+    bool supports_lens_conditioning_handles;
+    bool supports_lens_conditioning_gpu_resident;
+    bool supports_lens_flow_sampler;
+    bool supports_lens_gpu_latent_output;
+    bool supports_lens_vae_decode_gpu;
+    bool supports_lens_external_flow_replay;
+    bool supports_lens_speed_mode_bf16_resident;
+    bool supports_lens_i2i;
+    bool supports_lens_controlnet;
+    bool supports_lens_masks;
+    bool supports_lens_reference;
+    bool supports_lens_edit;
+    bool supports_lens_multibatch;
 } sd_model_pipeline_capabilities_t;
 
 typedef struct sd_marigold_iid_options_t {
@@ -877,6 +1147,16 @@ typedef struct {
 
 typedef struct sd_ctx_t sd_ctx_t;
 
+typedef struct sd_bonsai_generation_timing_t {
+    uint32_t struct_size;
+    uint32_t version;
+    double latent_prepare_ms;
+    double text_encode_ms;
+    double transformer_denoise_ms;
+    double vae_decode_ms;
+    double total_without_png_ms;
+} sd_bonsai_generation_timing_t;
+
 typedef void (*sd_log_cb_t)(enum sd_log_level_t level, const char* text, void* data);
 typedef void (*sd_progress_cb_t)(int step, int steps, float time, void* data);
 typedef void (*sd_preview_cb_t)(int step, int frame_count, sd_image_t* frames, bool is_noisy, void* data);
@@ -919,6 +1199,8 @@ SD_API void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params);
 SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
 
 SD_API sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
+// Creates a no-model context for loading and validating precomputed Lens conditioning only.
+SD_API sd_ctx_t* new_sd_ctx_lens_conditioning_only(void);
 SD_API void free_sd_ctx(sd_ctx_t* sd_ctx);
 
 SD_API void sd_sample_params_init(sd_sample_params_t* sample_params);
@@ -930,6 +1212,7 @@ SD_API enum scheduler_t sd_get_default_scheduler(const sd_ctx_t* sd_ctx, enum sa
 SD_API void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params);
 SD_API char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params);
 SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params);
+SD_API bool sd_bonsai_get_last_generation_timing(sd_ctx_t* sd_ctx, sd_bonsai_generation_timing_t* out_timing);
 SD_API sd_latent_t* sd_encode_image(sd_ctx_t* sd_ctx,
                                     const sd_image_t* image,
                                     const sd_tiling_params_t* vae_tiling_params);
@@ -1073,6 +1356,127 @@ SD_API bool sd_gpu_latent_export_f32_nchw_debug(sd_ctx_t* sd_ctx,
                                                 uint64_t dst_elements,
                                                 sd_latent_view_t* out_view,
                                                 const sd_download_options_t* options);
+SD_API void sd_lens_conditioning_options_init(sd_lens_conditioning_options_t* options);
+SD_API void sd_lens_conditioning_desc_init(sd_lens_conditioning_desc_t* desc);
+SD_API bool sd_lens_conditioning_load(sd_ctx_t* sd_ctx,
+                                      const char* file_path,
+                                      const sd_lens_conditioning_options_t* options,
+                                      sd_lens_conditioning_handle_t* out_handle,
+                                      sd_lens_conditioning_desc_t* out_desc);
+SD_API bool sd_lens_conditioning_release(sd_ctx_t* sd_ctx, sd_lens_conditioning_handle_t handle);
+SD_API bool sd_lens_conditioning_get_desc(sd_ctx_t* sd_ctx,
+                                          sd_lens_conditioning_handle_t handle,
+                                          sd_lens_conditioning_desc_t* out_desc);
+SD_API void sd_lens_transformer_options_init(sd_lens_transformer_options_t* options);
+SD_API void sd_lens_transformer_desc_init(sd_lens_transformer_desc_t* desc);
+SD_API bool sd_lens_transformer_load(sd_ctx_t* sd_ctx,
+                                     const char* transformer_path,
+                                     const sd_lens_transformer_options_t* options,
+                                     sd_lens_transformer_handle_t* out_handle,
+                                     sd_lens_transformer_desc_t* out_desc);
+SD_API bool sd_lens_transformer_get_desc(sd_ctx_t* sd_ctx,
+                                         sd_lens_transformer_handle_t handle,
+                                         sd_lens_transformer_desc_t* out_desc);
+SD_API bool sd_lens_transformer_release(sd_ctx_t* sd_ctx, sd_lens_transformer_handle_t handle);
+SD_API bool sd_lens_transformer_copy_tensor_f32(sd_ctx_t* sd_ctx,
+                                                sd_lens_transformer_handle_t handle,
+                                                const char* tensor_name,
+                                                int64_t* out_shape,
+                                                uint32_t shape_capacity,
+                                                uint32_t* out_rank,
+                                                float* out_data,
+                                                uint64_t out_data_capacity,
+                                                uint64_t* out_elements);
+// Borrowed pointer remains valid until the Lens transformer handle is released
+// or the owning sd_ctx_t is freed. This is intended for staged in-process
+// runners that stream weights to a backend without duplicating the host cache.
+SD_API bool sd_lens_transformer_borrow_tensor_f32(sd_ctx_t* sd_ctx,
+                                                  sd_lens_transformer_handle_t handle,
+                                                  const char* tensor_name,
+                                                  int64_t* out_shape,
+                                                  uint32_t shape_capacity,
+                                                  uint32_t* out_rank,
+                                                  const float** out_data,
+                                                  uint64_t* out_elements);
+SD_API bool sd_lens_transformer_borrow_tensor_data(sd_ctx_t* sd_ctx,
+                                                   sd_lens_transformer_handle_t handle,
+                                                   const char* tensor_name,
+                                                   int64_t* out_shape,
+                                                   uint32_t shape_capacity,
+                                                   uint32_t* out_rank,
+                                                   const void** out_data,
+                                                   uint64_t* out_elements,
+                                                   sd_tensor_dtype_t* out_dtype);
+SD_API void sd_lens_schedule_options_init(sd_lens_schedule_options_t* options);
+SD_API void sd_lens_schedule_desc_init(sd_lens_schedule_desc_t* desc);
+SD_API bool sd_lens_turbo_build_schedule(const sd_lens_schedule_options_t* options,
+                                         float* out_sigmas,
+                                         uint32_t sigmas_capacity,
+                                         float* out_timesteps,
+                                         uint32_t timesteps_capacity,
+                                         sd_lens_schedule_desc_t* out_desc);
+SD_API void sd_lens_external_flow_loop_desc_init(sd_lens_external_flow_loop_desc_t* desc);
+// CPU-only Lens precomputed-conditioning flow loop. Buffers are flat BSC
+// tensors: [batch=1, image_seq_len, transformer.in_channels]. Model outputs
+// are step-major: [steps, image_seq_len, transformer.in_channels].
+SD_API bool sd_lens_run_external_flow_loop_f32(sd_ctx_t* sd_ctx,
+                                              sd_lens_conditioning_handle_t conditioning,
+                                              sd_lens_transformer_handle_t transformer,
+                                              const sd_lens_schedule_options_t* schedule_options,
+                                              const float* initial_packed_tokens_bsc,
+                                              uint64_t initial_packed_token_elements,
+                                              const float* model_outputs_bsc_by_step,
+                                              uint64_t model_output_elements,
+                                              float* out_packed_tokens_bsc,
+                                              uint64_t out_packed_token_capacity,
+                                              sd_lens_external_flow_loop_desc_t* out_desc);
+SD_API void sd_lens_vae_latent_desc_init(sd_lens_vae_latent_desc_t* desc);
+SD_API bool sd_lens_pack_vae_latent_f32(const float* lens_latent_nchw,
+                                        uint64_t lens_latent_elements,
+                                        int64_t n,
+                                        int64_t c,
+                                        int64_t h,
+                                        int64_t w,
+                                        float* packed_latent_nchw,
+                                        uint64_t packed_latent_capacity,
+                                        sd_lens_vae_latent_desc_t* out_desc);
+SD_API bool sd_lens_unpack_vae_latent_f32(const float* packed_tokens_bsc,
+                                          uint64_t packed_token_elements,
+                                          int64_t n,
+                                          int64_t c,
+                                          int64_t h,
+                                          int64_t w,
+                                          float* lens_latent_nchw,
+                                          uint64_t lens_latent_capacity,
+                                          sd_lens_vae_latent_desc_t* out_desc);
+SD_API void sd_lens_conditioning_encode_options_init(sd_lens_conditioning_encode_options_t* options);
+SD_API bool sd_lens_conditioning_encode_prompt(sd_ctx_t* sd_ctx,
+                                               const char* prompt,
+                                               const sd_lens_conditioning_encode_options_t* options,
+                                               sd_lens_conditioning_handle_t* out_handle,
+                                               sd_lens_conditioning_desc_t* out_desc);
+SD_API bool sd_lens_conditioning_detach(sd_ctx_t* sd_ctx,
+                                        sd_lens_conditioning_handle_t conditioning,
+                                        sd_lens_conditioning_handle_t* out_detached_handle,
+                                        sd_lens_conditioning_desc_t* out_desc);
+SD_API bool sd_lens_conditioning_detached_release(sd_lens_conditioning_handle_t detached_handle);
+SD_API void sd_lens_sample_options_init(sd_lens_sample_options_t* options);
+SD_API void sd_lens_sample_desc_init(sd_lens_sample_desc_t* desc);
+SD_API bool sd_lens_sample_latent(sd_ctx_t* sd_ctx,
+                                  sd_lens_conditioning_handle_t conditioning,
+                                  const sd_lens_sample_options_t* options,
+                                  sd_latent_t** out_latent,
+                                  sd_lens_sample_desc_t* out_desc);
+SD_API bool sd_lens_sample_latent_detached(sd_lens_conditioning_handle_t detached_conditioning,
+                                           const sd_lens_sample_options_t* options,
+                                           sd_latent_t** out_latent,
+                                           sd_lens_sample_desc_t* out_desc);
+SD_API bool sd_lens_sample_packed_vae_latent_gpu_detached(sd_ctx_t* sd_ctx,
+                                                          sd_lens_conditioning_handle_t detached_conditioning,
+                                                          const sd_lens_sample_options_t* options,
+                                                          sd_gpu_handle_t* out_gpu_latent,
+                                                          sd_lens_sample_desc_t* out_desc);
+SD_API void sd_lens_transformer_warm_cache_clear(void);
 SD_API void sd_conditioning_encode_options_init(sd_conditioning_encode_options_t* options);
 SD_API bool sd_conditioning_encode_text(sd_ctx_t* sd_ctx,
                                         const char* text,

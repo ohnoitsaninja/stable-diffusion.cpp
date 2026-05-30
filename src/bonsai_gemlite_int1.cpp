@@ -1,11 +1,16 @@
 #include "bonsai_gemlite_int1.hpp"
 
+#if defined(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS)
+#include "bonsai_cutlass_int1_runtime.hpp"
+#endif
+
 #include "ggml.h"
 #include "zip.h"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -16,6 +21,11 @@
 
 namespace sd {
 namespace {
+
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 bool ends_with(const std::string& value, const std::string& suffix) {
     return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
@@ -229,6 +239,7 @@ bool tensor_entry(const std::map<std::string, std::string>& index,
 
 }  // namespace
 
+#if defined(SD_BONSAI_GEMLITE_INT1_SPIKE)
 extern "C" bool sd_bonsai_gemlite_int1_device_linear_create(const uint8_t* wq,
                                                              size_t wq_bytes,
                                                              const float* scales,
@@ -243,6 +254,74 @@ extern "C" void sd_bonsai_gemlite_int1_device_linear_destroy(void* ptr);
 extern "C" void sd_bonsai_gemlite_int1_ggml_custom_forward(ggml_tensor* dst, int ith, int nth, void* userdata);
 extern "C" void sd_bonsai_gemlite_int1_ggml_custom_qkv_forward(ggml_tensor* dst, int ith, int nth, void* userdata);
 extern "C" void sd_bonsai_gemlite_int1_ggml_debug_identity_forward(ggml_tensor* dst, int ith, int nth, void* userdata);
+#else
+extern "C" bool sd_bonsai_gemlite_int1_device_linear_create(const uint8_t*,
+                                                             size_t,
+                                                             const float*,
+                                                             const float*,
+                                                             int,
+                                                             int,
+                                                             void** out,
+                                                             uint64_t* device_bytes,
+                                                             char* error,
+                                                             size_t error_size) {
+    if (out != nullptr) {
+        *out = nullptr;
+    }
+    if (device_bytes != nullptr) {
+        *device_bytes = 0;
+    }
+    if (error != nullptr && error_size > 0) {
+        std::snprintf(error, error_size, "Bonsai GemLite INT1 CUDA spike was not enabled at build time");
+    }
+    return false;
+}
+extern "C" void sd_bonsai_gemlite_int1_device_linear_destroy(void*) {}
+extern "C" void sd_bonsai_gemlite_int1_ggml_custom_forward(ggml_tensor*, int, int, void*) {}
+extern "C" void sd_bonsai_gemlite_int1_ggml_custom_qkv_forward(ggml_tensor*, int, int, void*) {}
+extern "C" void sd_bonsai_gemlite_int1_ggml_debug_identity_forward(ggml_tensor*, int, int, void*) {}
+#endif
+
+#if defined(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS)
+extern "C" cudaStream_t ggml_cuda_get_current_custom_op_stream(void);
+
+struct BonsaiCuteSingleLinearCustomUserdata {
+    const bonsai_cute::BonsaiCuteLinearLaunchDesc* desc = nullptr;
+    bool linear1 = false;
+    const char* debug_name = nullptr;
+};
+
+static void sd_bonsai_cute_single_linear_ggml_custom_forward(ggml_tensor* dst, int ith, int nth, void* userdata) {
+    if (ith != 0) {
+        return;
+    }
+    (void)nth;
+    if (dst == nullptr || dst->src[0] == nullptr || userdata == nullptr) {
+        return;
+    }
+    const ggml_tensor* x = dst->src[0];
+    auto* custom = reinterpret_cast<BonsaiCuteSingleLinearCustomUserdata*>(userdata);
+    if (custom->desc == nullptr) {
+        fprintf(stderr, "Bonsai CuTe custom op failed: missing descriptor\n");
+        return;
+    }
+    const int k = static_cast<int>(x->ne[0]);
+    const int m = static_cast<int>(ggml_nelements(x) / k);
+    std::string error;
+    const bool ok = custom->linear1 ?
+        bonsai_cute::bonsai_cute_launch_single_linear1(*custom->desc, x->data, dst->data, m, ggml_cuda_get_current_custom_op_stream(), &error) :
+        bonsai_cute::bonsai_cute_launch_single_linear2(*custom->desc, x->data, dst->data, m, ggml_cuda_get_current_custom_op_stream(), &error);
+    if (!ok) {
+        fprintf(stderr,
+                "Bonsai CuTe custom op failed: %s name=%s m=%d k=%d n=%d\n",
+                error.c_str(),
+                custom->debug_name != nullptr ? custom->debug_name : "single_linear",
+                m,
+                k,
+                static_cast<int>(dst->ne[0]));
+    }
+}
+#endif
 
 struct BonsaiGemliteRuntime::Impl {
     struct DeviceLinear {
@@ -261,6 +340,11 @@ struct BonsaiGemliteRuntime::Impl {
     std::unordered_map<std::string, DeviceLinear> by_internal_name;
     std::unordered_map<std::string, std::unique_ptr<BonsaiGemliteLinearCustomUserdata>> linear_userdata;
     std::unordered_map<std::string, std::unique_ptr<BonsaiGemliteQkvCustomUserdata>> qkv_userdata;
+#if defined(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS)
+    std::unique_ptr<bonsai_cute::BonsaiCuteSingleBlockCache> cute_single_blocks;
+    std::unordered_map<std::string, std::unique_ptr<BonsaiCuteSingleLinearCustomUserdata>> cute_userdata;
+    std::unordered_set<std::string> cute_fallback_logged;
+#endif
     BonsaiGemliteRuntimeSummary summary;
 
     ~Impl() {
@@ -373,6 +457,50 @@ static ggml_tensor* bonsai_custom_qkv_linear_node(ggml_context* ctx,
                           qkv_userdata);
 }
 
+#if defined(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS)
+static int parse_single_block_id(const std::string& internal_weight_name) {
+    const std::string marker = "model.diffusion_model.single_blocks.";
+    const size_t pos = internal_weight_name.find(marker);
+    if (pos == std::string::npos) {
+        return -1;
+    }
+    const size_t start = pos + marker.size();
+    const size_t end = internal_weight_name.find('.', start);
+    if (end == std::string::npos) {
+        return -1;
+    }
+    return std::atoi(internal_weight_name.substr(start, end - start).c_str());
+}
+
+static const bonsai_cute::BonsaiCuteLinearLaunchDesc* find_cute_desc(const std::vector<bonsai_cute::BonsaiCuteLinearLaunchDesc>& descs,
+                                                                     int block_id) {
+    for (const auto& desc : descs) {
+        if (desc.block_id == block_id) {
+            return &desc;
+        }
+    }
+    return nullptr;
+}
+
+static ggml_tensor* bonsai_cute_custom_linear_node(ggml_context* ctx,
+                                                   ggml_tensor* x,
+                                                   int64_t out_features,
+                                                   BonsaiCuteSingleLinearCustomUserdata* userdata) {
+    ggml_tensor* args[] = {x};
+    return ggml_custom_4d(ctx,
+                          GGML_TYPE_F16,
+                          out_features,
+                          x->ne[1],
+                          x->ne[2],
+                          x->ne[3],
+                          args,
+                          1,
+                          sd_bonsai_cute_single_linear_ggml_custom_forward,
+                          1,
+                          userdata);
+}
+#endif
+
 static bool bonsai_dump_tensors_enabled() {
     const char* value = std::getenv("SDCPP_BONSAI_DUMP_TENSORS");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
@@ -400,7 +528,21 @@ BonsaiGemliteRuntime::BonsaiGemliteRuntime()
     : impl_(new Impl()) {
 }
 
-BonsaiGemliteRuntime::~BonsaiGemliteRuntime() = default;
+BonsaiGemliteRuntime::~BonsaiGemliteRuntime() {
+#if defined(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS)
+    if (impl_ && impl_->summary.cute_cache_built) {
+        std::cout << "[BonsaiCuTeINT1] final_counters"
+                  << " cute_cache_built=true"
+                  << " cute_blocks=" << impl_->summary.cute_blocks
+                  << " cute_linear1_calls=" << impl_->summary.cute_linear1_calls
+                  << " cute_linear2_calls=" << impl_->summary.cute_linear2_calls
+                  << " cute_fallback_calls=" << impl_->summary.cute_fallback_calls
+                  << " cute_prepack_mib=" << (double)impl_->summary.cute_prepack_bytes / (1024.0 * 1024.0)
+                  << " full_fp16_weight_expansion=false"
+                  << " b_dequantized_shared_half_tile=false\n";
+    }
+#endif
+}
 
 std::shared_ptr<BonsaiGemliteRuntime> BonsaiGemliteRuntime::load_from_pack(const std::string& pack_path,
                                                                            std::string& error) {
@@ -465,6 +607,27 @@ std::shared_ptr<BonsaiGemliteRuntime> BonsaiGemliteRuntime::load_from_pack(const
               << " zero_mb=" << (double)runtime->impl_->summary.zero_bytes / (1024.0 * 1024.0)
               << " device_mb=" << (double)runtime->impl_->summary.device_bytes / (1024.0 * 1024.0)
               << " full_fp16_weight_expansion=false\n";
+#if defined(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS)
+    if (env_flag_enabled("SDCPP_BONSAI_CUTE_SINGLE_BLOCKS")) {
+        std::unique_ptr<bonsai_cute::BonsaiCuteSingleBlockCache> cute_cache(new bonsai_cute::BonsaiCuteSingleBlockCache());
+        std::string cute_error;
+        if (!cute_cache->load_from_pack(pack_path, cute_error)) {
+            error = "CuTe single-block cache build failed: " + cute_error;
+            return nullptr;
+        }
+        const auto& stats = cute_cache->stats();
+        runtime->impl_->summary.cute_cache_built = true;
+        runtime->impl_->summary.cute_blocks = static_cast<int>(cute_cache->num_single_blocks());
+        runtime->impl_->summary.cute_prepack_bytes = stats.linear1.prepack_bytes + stats.linear2.prepack_bytes;
+        runtime->impl_->summary.full_fp16_weight_expansion = false;
+        runtime->impl_->cute_single_blocks = std::move(cute_cache);
+        std::cout << "[BonsaiCuTeINT1] cute_cache_built=true"
+                  << " cute_blocks=" << runtime->impl_->summary.cute_blocks
+                  << " cute_prepack_mib=" << (double)runtime->impl_->summary.cute_prepack_bytes / (1024.0 * 1024.0)
+                  << " full_fp16_weight_expansion=false"
+                  << " b_dequantized_shared_half_tile=false\n";
+    }
+#endif
     return runtime;
 }
 
@@ -519,6 +682,58 @@ ggml_tensor* BonsaiGemliteRuntime::linear_forward(ggml_context* ctx, ggml_tensor
     if (x->type == GGML_TYPE_F32) {
         linear_input = ggml_cast(ctx, x, GGML_TYPE_F16);
     }
+#if defined(SD_BONSAI_CUTLASS_CUTE_EXPERIMENTS)
+    if (impl_->cute_single_blocks) {
+        const std::string requested = internal_weight_name;
+        const int block_id = parse_single_block_id(requested);
+        const bool wants_linear1 = ends_with(requested, ".linear1.weight");
+        const bool wants_linear2 = ends_with(requested, ".linear2.weight");
+        if (block_id >= 0 && (wants_linear1 || wants_linear2)) {
+            const auto* desc = wants_linear1 ?
+                find_cute_desc(impl_->cute_single_blocks->linear1_descs(), block_id) :
+                find_cute_desc(impl_->cute_single_blocks->linear2_descs(), block_id);
+            const int64_t m = linear_input->ne[0] > 0 ? ggml_nelements(linear_input) / linear_input->ne[0] : 0;
+            const bool shape_ok = desc != nullptr &&
+                                  linear_input->type == GGML_TYPE_F16 &&
+                                  linear_input->ne[0] == desc->in_features &&
+                                  m > 0 &&
+                                  (m % bonsai_cute::kBlockM) == 0;
+            if (shape_ok) {
+                auto& userdata = impl_->cute_userdata[requested];
+                if (!userdata) {
+                    userdata.reset(new BonsaiCuteSingleLinearCustomUserdata{desc, wants_linear1, desc->name.c_str()});
+                }
+                if (wants_linear1) {
+                    impl_->summary.cute_linear1_calls++;
+                } else {
+                    impl_->summary.cute_linear2_calls++;
+                }
+                std::cout << "[BonsaiCuTeINT1] cute_single_linear_call name=" << requested
+                          << " block=" << block_id
+                          << " M=" << m
+                          << " K=" << desc->in_features
+                          << " N=" << desc->out_features
+                          << " kernel=" << (wants_linear1 ? "cute-linear1-bfrag-prepack-smem" : "cute-linear2-bfrag-prepack-smem")
+                          << " full_fp16_weight_expansion=false"
+                          << " b_dequantized_shared_half_tile=false\n";
+                ggml_tensor* out = bonsai_cute_custom_linear_node(ctx, linear_input, desc->out_features, userdata.get());
+                return cast_output_to_f32 ? ggml_cast(ctx, out, GGML_TYPE_F32) : out;
+            }
+            impl_->summary.cute_fallback_calls++;
+            if (impl_->cute_fallback_logged.insert(requested).second) {
+                std::cout << "[BonsaiCuTeINT1] cute_single_linear_fallback name=" << requested
+                          << " block=" << block_id
+                          << " reason=unsupported_shape_or_missing_desc"
+                          << " input_type=" << linear_input->type
+                          << " M=" << m
+                          << " K=" << linear_input->ne[0]
+                          << "\n";
+            }
+        } else if (bonsai_replaces_internal_weight_name(requested)) {
+            impl_->summary.cute_fallback_calls++;
+        }
+    }
+#endif
     auto it = impl_->by_internal_name.find(internal_weight_name);
     if (it == impl_->by_internal_name.end()) {
         const std::string requested = internal_weight_name;
@@ -746,10 +961,14 @@ void bonsai_gemlite_int1_print_summary(std::ostream& os,
        << "zero_mb=" << (double)summary.zero_bytes / (1024.0 * 1024.0) << "\n";
 }
 
-#ifndef SD_USE_CUDA
+#if !defined(SD_USE_CUDA) || !defined(SD_BONSAI_GEMLITE_INT1_SPIKE)
 BonsaiGemliteCudaProbeResult bonsai_gemlite_int1_cuda_probe(const BonsaiGemliteLinear&, int64_t) {
     BonsaiGemliteCudaProbeResult result;
+#ifndef SD_USE_CUDA
     result.error = "stable-diffusion.cpp was built without CUDA";
+#else
+    result.error = "Bonsai GemLite INT1 CUDA spike was not enabled at build time";
+#endif
     return result;
 }
 #else

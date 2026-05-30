@@ -85,13 +85,35 @@ int round_up_to(int value, int base) {
 #define NOMINMAX
 #include <windows.h>
 
+static std::wstring utf8_to_wide_path(const std::string& path) {
+    if (path.empty()) {
+        return {};
+    }
+    int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, nullptr, 0);
+    if (needed <= 0) {
+        needed = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+        if (needed <= 0) {
+            return {};
+        }
+        std::wstring wide(static_cast<size_t>(needed - 1), L'\0');
+        MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wide.data(), needed);
+        return wide;
+    }
+
+    std::wstring wide(static_cast<size_t>(needed - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, wide.data(), needed);
+    return wide;
+}
+
 bool file_exists(const std::string& filename) {
-    DWORD attributes = GetFileAttributesA(filename.c_str());
+    const std::wstring wide = utf8_to_wide_path(filename);
+    DWORD attributes = wide.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(wide.c_str());
     return (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY));
 }
 
 bool is_directory(const std::string& path) {
-    DWORD attributes = GetFileAttributesA(path.c_str());
+    const std::wstring wide = utf8_to_wide_path(path);
+    DWORD attributes = wide.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(wide.c_str());
     return (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY));
 }
 
@@ -114,9 +136,13 @@ private:
 std::unique_ptr<MmapWrapper> MmapWrapper::create(const std::string& filename) {
     void* mapped_data = nullptr;
     size_t file_size  = 0;
+    const std::wstring wide = utf8_to_wide_path(filename);
+    if (wide.empty()) {
+        return nullptr;
+    }
 
-    HANDLE file_handle = CreateFileA(
-        filename.c_str(),
+    HANDLE file_handle = CreateFileW(
+        wide.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ,
         NULL,

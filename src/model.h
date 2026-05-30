@@ -51,6 +51,7 @@ enum SDVersion {
     VERSION_Z_IMAGE,
     VERSION_OVIS_IMAGE,
     VERSION_MARIGOLD_IID,
+    VERSION_LENS,
     VERSION_COUNT,
 };
 
@@ -131,6 +132,13 @@ static inline bool sd_version_is_qwen_image(SDVersion version) {
 
 static inline bool sd_version_is_anima(SDVersion version) {
     if (version == VERSION_ANIMA) {
+        return true;
+    }
+    return false;
+}
+
+static inline bool sd_version_is_lens(SDVersion version) {
+    if (version == VERSION_LENS) {
         return true;
     }
     return false;
@@ -319,6 +327,7 @@ protected:
 
 public:
     bool init_from_file(const std::string& file_path, const std::string& prefix = "");
+    void force_version(SDVersion version) { version_ = version; }
     void convert_tensors_name();
     bool init_from_file_and_convert_name(const std::string& file_path,
                                          const std::string& prefix = "",
