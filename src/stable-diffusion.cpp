@@ -12982,8 +12982,15 @@ SD_API bool sd_get_conditioning_capabilities(sd_ctx_t* sd_ctx, sd_conditioning_c
     capabilities->supports_qwen_image_qwen_conditioning_gpu_resident =
         capabilities->supports_qwen_image_qwen_conditioning &&
         capabilities->supports_conditioning_gpu_resident;
-    capabilities->supports_lens_text_conditioning = sd_ctx == nullptr || sd_ctx->lens_conditioning_only || sd_ctx->sd == nullptr;
-    capabilities->supports_lens_conditioning_handles = sd_ctx != nullptr;
+    const bool lens_conditioning_supported =
+        sd_ctx == nullptr ||
+        sd_ctx->sd == nullptr ||
+        sd_ctx->lens_conditioning_only ||
+        sd_version_is_lens(sd_ctx->sd->version);
+    capabilities->supports_lens_text_conditioning = lens_conditioning_supported;
+    capabilities->supports_lens_conditioning_handles =
+        sd_ctx != nullptr &&
+        lens_conditioning_supported;
     capabilities->supports_lens_conditioning_gpu_resident = false;
     capabilities->supports_conditioning_per_step_upload_fallback =
         capabilities->supports_conditioning_handles &&
