@@ -179,7 +179,9 @@ typedef struct sd_preview_options_t {
     bool include_final_step;
     bool denoised;
     bool noisy;
-    uint32_t reserved[8];
+    uint32_t max_width;
+    uint32_t max_height;
+    uint32_t reserved[6];
 } sd_preview_options_t;
 
 enum lora_apply_mode_t {

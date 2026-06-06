@@ -2725,6 +2725,7 @@ public:
                        const sd::Tensor<float>& latents,
                        enum SDVersion version,
                        preview_t preview_mode,
+                       const sd_preview_options_t* preview_options,
                        std::function<void(int, int, sd_image_t*, bool, void*)> step_callback,
                        void* step_callback_data,
                        bool is_noisy) {
@@ -2801,11 +2802,50 @@ public:
             sd::Tensor<float> vae_latents;
             sd::Tensor<float> decoded;
             bool is_video = preview_latent_tensor_is_video(latents);
+            const sd::Tensor<float>* decode_latents = &latents;
+            sd::Tensor<float> bounded_latents;
+            if (preview_options != nullptr &&
+                (preview_options->max_width > 0 || preview_options->max_height > 0) &&
+                latents.dim() >= 2 &&
+                latents.shape()[0] > 0 &&
+                latents.shape()[1] > 0) {
+                constexpr double kPreviewLatentDecodeScale = 8.0;
+                const double max_width = preview_options->max_width > 0
+                    ? static_cast<double>(preview_options->max_width)
+                    : static_cast<double>(latents.shape()[0]) * kPreviewLatentDecodeScale;
+                const double max_height = preview_options->max_height > 0
+                    ? static_cast<double>(preview_options->max_height)
+                    : static_cast<double>(latents.shape()[1]) * kPreviewLatentDecodeScale;
+                const double scale = std::min(
+                    1.0,
+                    std::min(
+                        max_width / (static_cast<double>(latents.shape()[0]) * kPreviewLatentDecodeScale),
+                        max_height / (static_cast<double>(latents.shape()[1]) * kPreviewLatentDecodeScale)));
+                if (scale < 0.999) {
+                    std::vector<int64_t> preview_shape = latents.shape();
+                    preview_shape[0] = std::max<int64_t>(1, static_cast<int64_t>(std::floor(static_cast<double>(latents.shape()[0]) * scale)));
+                    preview_shape[1] = std::max<int64_t>(1, static_cast<int64_t>(std::floor(static_cast<double>(latents.shape()[1]) * scale)));
+                    bounded_latents = sd::ops::interpolate(
+                        latents,
+                        preview_shape,
+                        sd::ops::InterpolateMode::NearestAvg,
+                        false);
+                    decode_latents = &bounded_latents;
+                    LOG_INFO("[Preview] bounded latent preview step=%d original_latent=%" PRId64 "x%" PRId64 " bounded_latent=%" PRId64 "x%" PRId64 " max=%ux%u",
+                             step,
+                             latents.shape()[0],
+                             latents.shape()[1],
+                             preview_shape[0],
+                             preview_shape[1],
+                             preview_options->max_width,
+                             preview_options->max_height);
+                }
+            }
             if (preview_vae) {
-                vae_latents = preview_vae->diffusion_to_vae_latents(latents);
+                vae_latents = preview_vae->diffusion_to_vae_latents(*decode_latents);
                 decoded     = preview_vae->decode(n_threads, vae_latents, vae_tiling_params, is_video, circular_x, circular_y, true);
             } else {
-                vae_latents = first_stage_model->diffusion_to_vae_latents(latents);
+                vae_latents = first_stage_model->diffusion_to_vae_latents(*decode_latents);
                 decoded     = first_stage_model->decode(n_threads, vae_latents, vae_tiling_params, is_video, circular_x, circular_y, true);
             }
             if (decoded.empty()) {
@@ -3256,14 +3296,14 @@ public:
                     denoised = denoised * denoise_mask + init_latent * (1.0f - denoise_mask);
                 }
                 if (should_emit_preview(&preview, step, steps, false)) {
-                    preview_image(step, denoised, version, preview.options.mode, preview.callback, preview.data, false);
+                    preview_image(step, denoised, version, preview.options.mode, &preview.options, preview.callback, preview.data, false);
                 }
                 report_sample_progress(step, steps, t0);
                 return denoised;
             }
 
             if (should_emit_preview(&preview, step, steps, true)) {
-                preview_image(step, noised_input, version, preview.options.mode, preview.callback, preview.data, true);
+                preview_image(step, noised_input, version, preview.options.mode, &preview.options, preview.callback, preview.data, true);
             }
 
             sd::Tensor<float> cond_out;
@@ -3449,7 +3489,7 @@ public:
                 denoised = denoised * denoise_mask + init_latent * (1.0f - denoise_mask);
             }
             if (should_emit_preview(&preview, step, steps, false)) {
-                preview_image(step, denoised, version, preview.options.mode, preview.callback, preview.data, false);
+                preview_image(step, denoised, version, preview.options.mode, &preview.options, preview.callback, preview.data, false);
             }
             if (trace_controlnet) {
                 LOG_INFO("[Denoise] step=%d total=%" PRId64 "ms", step, ggml_time_ms() - step_start_ms);
@@ -4207,6 +4247,7 @@ public:
                           preview_latents,
                           version,
                           preview.options.mode,
+                          &preview.options,
                           preview.callback,
                           preview.data,
                           is_noisy);

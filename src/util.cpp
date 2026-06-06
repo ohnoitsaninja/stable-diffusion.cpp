@@ -513,6 +513,8 @@ void sd_preview_options_init(sd_preview_options_t* options) {
     options->include_final_step  = true;
     options->denoised            = true;
     options->noisy               = false;
+    options->max_width           = 0;
+    options->max_height          = 0;
 }
 
 static sd_preview_options_t normalize_preview_options(const sd_preview_options_t* options) {
@@ -541,6 +543,12 @@ static sd_preview_options_t normalize_preview_options(const sd_preview_options_t
     }
     if (normalized.percent_point_count > SD_PREVIEW_MAX_PERCENT_POINTS) {
         normalized.percent_point_count = SD_PREVIEW_MAX_PERCENT_POINTS;
+    }
+    if (normalized.max_width > 16384) {
+        normalized.max_width = 16384;
+    }
+    if (normalized.max_height > 16384) {
+        normalized.max_height = 16384;
     }
     for (uint32_t i = 0; i < normalized.percent_point_count; ++i) {
         if (normalized.percent_points[i] < 0.0f) {
